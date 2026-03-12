@@ -8,168 +8,238 @@
 import type { GmConfig, ExtractionResult, FinalizeResult, Signal } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
 
-// ─── 提取 Prompt ──────────────────────────────────────────────
+// ─── 节点/边合法值 ──────────────────────────────────────────────
 
-const EXTRACT_SYS = `你是知识图谱提取引擎。从对话中提取结构化的知识三元组（实体+关系）。
+const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT"]);
+const VALID_EDGE_TYPES = new Set(["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"]);
 
-## 输出格式
+/** 边类型 → 合法的 from 节点类型 */
+const EDGE_FROM_CONSTRAINT: Record<string, Set<string>> = {
+  USED_SKILL:     new Set(["TASK"]),
+  SOLVED_BY:      new Set(["EVENT", "SKILL"]),
+  REQUIRES:       new Set(["SKILL"]),
+  PATCHES:        new Set(["SKILL"]),
+  CONFLICTS_WITH: new Set(["SKILL"]),
+};
 
-严格 JSON，禁止任何额外文字。
+/** 边类型 → 合法的 to 节点类型 */
+const EDGE_TO_CONSTRAINT: Record<string, Set<string>> = {
+  USED_SKILL:     new Set(["SKILL"]),
+  SOLVED_BY:      new Set(["SKILL"]),
+  REQUIRES:       new Set(["SKILL"]),
+  PATCHES:        new Set(["SKILL"]),
+  CONFLICTS_WITH: new Set(["SKILL"]),
+};
 
-{
-  "nodes": [ ... ],
-  "edges": [ ... ]
-}
+// ─── 提取 System Prompt ─────────────────────────────────────────
 
-## 实体 Schema
+const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent 对话中提取可复用的结构化知识三元组（节点 + 关系）。
+提取的知识将在未来对话中被召回，帮助 Agent 避免重复犯错、复用已验证方案。
+输出严格 JSON：{"nodes":[...],"edges":[...]}，不包含任何额外文字。
 
-每个 node 必须包含以下 4 个字段，缺一不可：
+1. 节点提取：
+   1.1 从对话中识别三类知识节点：
+       - TASK：用户要求 Agent 完成的具体任务，有明确的目标和结果
+       - SKILL：可复用的操作技能，有具体工具/命令/API，有明确触发条件，步骤可直接执行
+       - EVENT：一次性的报错或异常，记录现象、原因和解决方法
+   1.2 每个节点必须包含 4 个字段，缺一不可：
+       - type：节点类型，只允许 TASK / SKILL / EVENT
+       - name：全小写连字符命名，确保整个提取过程命名一致
+       - description：一句话说明什么场景触发
+       - content：SKILL.md 格式的知识内容（见 1.4 的模板）
+   1.3 name 命名规范：
+       - TASK：动词-对象格式，如 deploy-bilibili-mcp、extract-pdf-tables
+       - SKILL：工具-操作格式，如 conda-env-create、docker-port-expose
+       - EVENT：现象-工具格式，如 importerror-libgl1、timeout-paddleocr
+       - 已有节点列表会提供，相同事物必须复用已有 name，不得创建重复节点
+   1.4 content 模板（按 type 选用）：
+       TASK → "## [name]\\n### 目标\\n...\\n### 执行步骤\\n1. ...\\n### 结果\\n..."
+       SKILL → "## [name]\\n### 触发条件\\n...\\n### 执行步骤\\n1. ...\\n### 常见错误\\n- ... → ..."
+       EVENT → "## [name]\\n### 现象\\n...\\n### 原因\\n...\\n### 解决方法\\n..."
 
-{
-  "type": "TASK 或 SKILL 或 EVENT",
-  "name": "全小写连字符，3-5个词",
-  "description": "一句话，说明什么场景触发",
-  "content": "markdown 格式的知识内容（见模板）"
-}
+2. 关系提取：
+   2.1 识别节点之间直接、明确的关系，只允许以下 5 种边类型。
+   2.2 每条边必须包含 from、to、type、instruction 四个字段，缺一不可。
+   2.3 边类型定义与方向约束（严格遵守，不得混用）：
 
-### TASK content 模板
-## [名称]
-### 目标
-### 执行步骤
-1. ...
-### 结果
+       USED_SKILL
+         方向：TASK → SKILL（且仅限此方向）
+         含义：任务执行过程中使用了该技能
+         instruction：写第几步用的、怎么调用的、传了什么参数
+         判定：from 节点是 TASK，to 节点是 SKILL
 
-### SKILL content 模板
-## [名称]
-### 触发条件
-### 执行步骤
-1. ...
-### 常见错误
-- ... → ...
+       SOLVED_BY
+         方向：EVENT → SKILL 或 SKILL → SKILL
+         含义：该报错/问题被该技能解决
+         instruction：写具体执行了什么命令/操作来解决
+         condition（必填）：写什么错误或条件触发了这个解决方案
+         判定：from 节点是 EVENT 或 SKILL，to 节点是 SKILL
+         注意：TASK 节点不能作为 SOLVED_BY 的 from，TASK 使用技能必须用 USED_SKILL
 
-### EVENT content 模板
-## [名称]
-### 现象
-### 原因
-### 解决方法
+       REQUIRES
+         方向：SKILL → SKILL
+         含义：执行该技能前必须先完成另一个技能
+         instruction：写为什么依赖、怎么判断前置条件是否已满足
 
-### name 命名规范
-TASK：动词-对象（extract-bilibili-danmaku）
-SKILL：工具-操作（conda-env-create）
-EVENT：现象-工具（importerror-libgl1）
+       PATCHES
+         方向：SKILL → SKILL（新 → 旧）
+         含义：新技能修正/替代了旧技能的做法
+         instruction：写旧方案有什么问题、新方案改了什么
 
-## 关系 Schema
+       CONFLICTS_WITH
+         方向：SKILL ↔ SKILL（双向）
+         含义：两个技能在同一场景互斥
+         instruction：写冲突的具体表现、应该选哪个
 
-每条 edge 必须包含 from、to、type、instruction 四个字段，缺一不可。
-type 只允许以下 5 种，方向和 instruction 内容严格按照定义。
+   2.4 关系方向选择决策树（按此顺序判定）：
+       a. from 是 TASK，to 是 SKILL → 必须用 USED_SKILL
+       b. from 是 EVENT，to 是 SKILL → 必须用 SOLVED_BY
+       c. from 和 to 都是 SKILL → 根据语义选 SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
+       d. 不存在其他合法组合，不符合以上任何一条的关系不要提取
 
-### USED_SKILL
-方向：TASK → SKILL
-含义：任务执行过程中使用了该技能
-instruction 写：第几步用的、怎么调用的、传了什么参数
+3. 信号优先级：
+   3.1 优先提取有信号标记的时刻：tool_error（报错）、tool_success（成功）、user_correction（纠正）、task_completed（完成）
+   3.2 用户纠正 AI 的错误时，旧做法和新做法都要提取，用 PATCHES 边关联
+   3.3 纯讨论、解释、理论说明（未实际执行）不提取
 
-### SOLVED_BY
-方向：EVENT → SKILL 或 SKILL → SKILL
-含义：该问题/错误被该技能解决
-instruction 写：具体执行了什么命令/操作来解决
-condition 写：什么错误或条件触发了这个解决方案（必填）
+4. 输出规范：
+   4.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
+   4.2 禁止 markdown 代码块包裹，禁止解释文字，禁止额外字段
+   4.3 没有知识产出时返回 {"nodes":[],"edges":[]}
+   4.4 每条 edge 的 instruction 必须写具体可执行的内容，不能为空或写"见上文"
 
-### REQUIRES
-方向：SKILL → SKILL
-含义：执行该技能前必须先完成另一个技能
-instruction 写：为什么依赖、怎么判断前置条件是否已满足
+示例 1（TASK + SKILL + USED_SKILL 边）：
 
-### PATCHES
-方向：SKILL → SKILL（新 → 旧）
-含义：新技能修正/替代了旧技能
-instruction 写：旧方案有什么问题、新方案改了什么
+信号：[{"type":"task_completed","turnIndex":8,"data":{"snippet":"弹幕抓取完成，共 2341 条"}}]
 
-### CONFLICTS_WITH
-方向：SKILL ↔ SKILL（双向）
-含义：两个技能在同一场景互斥，不能同时使用
-instruction 写：冲突的表现、应该选哪个
+对话摘要：用户要求抓取B站弹幕，Agent 使用 bili-tool 的 danmaku 子命令完成。
 
-## 提取规则
+输出：
+{"nodes":[{"type":"TASK","name":"extract-bilibili-danmaku","description":"从B站视频中批量抓取弹幕数据","content":"## extract-bilibili-danmaku\\n### 目标\\n从指定B站视频抓取全部弹幕\\n### 执行步骤\\n1. 获取视频 BV 号\\n2. 调用 bili-tool danmaku --bv BVxxx\\n3. 输出 JSON 格式弹幕列表\\n### 结果\\n成功抓取 2341 条弹幕"},{"type":"SKILL","name":"bili-tool-danmaku","description":"使用 bili-tool 抓取B站视频弹幕","content":"## bili-tool-danmaku\\n### 触发条件\\n需要抓取B站视频弹幕时\\n### 执行步骤\\n1. pip install bilibili-api-python\\n2. python bili_tool.py danmaku --bv BVxxx --output danmaku.json\\n### 常见错误\\n- cookie 过期 → 重新获取 SESSDATA"}],"edges":[{"from":"extract-bilibili-danmaku","to":"bili-tool-danmaku","type":"USED_SKILL","instruction":"第 2 步调用 bili-tool danmaku 子命令，传入 --bv 和 --output 参数"}]}
 
-1. 有信号的时刻（报错、纠正、工具调用、任务完成）优先提取
-2. 用户纠正 AI 的错误也要提取
-3. 已有节点列表会提供，相同事物使用已有 name
-4. 没有知识产出时返回 {"nodes":[],"edges":[]}
-5. 每条 edge 的 instruction 不能为空，必须写具体内容
-
-只返回 JSON。禁止 markdown 包裹、禁止解释、禁止额外字段。`;
-
-const EXTRACT_USER = (msgs: string, signals: Signal[], existing: string) => `## 对话记录
-${msgs}
-
-## 检测到的信号
-${JSON.stringify(signals, null, 2)}
-
-## 已有图谱节点
-${existing || "（无）"}
-
-## 提取示例
+示例 2（EVENT + SKILL + SOLVED_BY 边）：
 
 信号：[{"type":"tool_error","turnIndex":3,"data":{"snippet":"ImportError: libGL.so.1"}}]
 
+对话摘要：执行 PaddleOCR 时报 libGL 缺失，通过 apt 安装解决。
+
 输出：
-{
-  "nodes": [
-    {
-      "type": "EVENT",
-      "name": "importerror-libgl1",
-      "description": "Python 导入 cv2/paddleocr 时报 libGL.so.1 缺失",
-      "content": "## importerror-libgl1\\n### 现象\\nImportError: libGL.so.1: cannot open shared object file\\n### 原因\\nOpenCV 依赖系统级 libGL 库，conda/pip 不自动安装\\n### 解决方法\\napt install -y libgl1-mesa-glx"
-    },
-    {
-      "type": "SKILL",
-      "name": "apt-install-libgl1",
-      "description": "安装 libgl1 解决 OpenCV 系统依赖缺失",
-      "content": "## apt-install-libgl1\\n### 触发条件\\nImportError: libGL.so.1: cannot open shared object file\\n### 执行步骤\\n1. sudo apt update\\n2. sudo apt install -y libgl1-mesa-glx\\n### 常见错误\\n- Permission denied → 加 sudo"
-    }
-  ],
-  "edges": [
-    {
-      "from": "importerror-libgl1",
-      "to": "apt-install-libgl1",
-      "type": "SOLVED_BY",
-      "instruction": "执行 apt install -y libgl1-mesa-glx 即可解决",
-      "condition": "报 ImportError: libGL.so.1 时"
-    }
-  ]
-}
+{"nodes":[{"type":"EVENT","name":"importerror-libgl1","description":"导入 cv2/paddleocr 时报 libGL.so.1 缺失","content":"## importerror-libgl1\\n### 现象\\nImportError: libGL.so.1: cannot open shared object file\\n### 原因\\nOpenCV 依赖系统级 libGL 库，conda/pip 不自动安装\\n### 解决方法\\napt install -y libgl1-mesa-glx"},{"type":"SKILL","name":"apt-install-libgl1","description":"安装 libgl1 解决 OpenCV 系统依赖缺失","content":"## apt-install-libgl1\\n### 触发条件\\nImportError: libGL.so.1\\n### 执行步骤\\n1. sudo apt update\\n2. sudo apt install -y libgl1-mesa-glx\\n### 常见错误\\n- Permission denied → 加 sudo"}],"edges":[{"from":"importerror-libgl1","to":"apt-install-libgl1","type":"SOLVED_BY","instruction":"执行 sudo apt install -y libgl1-mesa-glx","condition":"报 ImportError: libGL.so.1 时"}]}`;
 
-现在请根据上方的对话记录和信号提取知识图谱。`;
+// ─── 提取 User Prompt ───────────────────────────────────────────
 
-// ─── 整理 Prompt ──────────────────────────────────────────────
+const EXTRACT_USER = (msgs: string, signals: Signal[], existing: string) =>
+`<Signals>
+${JSON.stringify(signals, null, 2)}
 
-const FINALIZE_SYS = `你是知识库维护专家，对本次对话产生的节点做最终整理。
+<Existing Nodes>
+${existing || "（无）"}
 
-任务：
-1. 有通用价值的 EVENT → 升级为 SKILL（改名+完善 content）
-2. 发现节点间新的关系（整体回顾才能看到的）
-3. 因本次对话失效的旧节点 → 填入 invalidations（填 node_id）
+<Conversation>
+${msgs}`;
 
-关系只能是：USED_SKILL、SOLVED_BY、REQUIRES、PATCHES、CONFLICTS_WITH
+// ─── 整理 System Prompt ─────────────────────────────────────────
 
-没有需要处理的返回空数组。只返回 JSON。`;
+const FINALIZE_SYS = `你是图谱节点整理引擎，对本次对话产生的节点做 session 结束前的最终审查。
+审查本次对话所有节点，执行以下三项操作，输出严格 JSON。
+
+1. EVENT 升级为 SKILL：
+   1.1 如果某个 EVENT 节点具有通用复用价值（不限于特定场景），将其升级为 SKILL
+   1.2 升级时需要：改名为 SKILL 命名规范（工具-操作）、完善 content 为 SKILL 模板格式
+   1.3 写入 promotedSkills 数组
+
+2. 补充遗漏关系：
+   2.1 整体回顾所有节点，发现单次提取时难以察觉的跨节点关系
+   2.2 关系类型只允许：USED_SKILL、SOLVED_BY、REQUIRES、PATCHES、CONFLICTS_WITH
+   2.3 严格遵守方向约束：TASK→SKILL 用 USED_SKILL，EVENT→SKILL 用 SOLVED_BY
+   2.4 写入 newEdges 数组
+
+3. 标记失效节点：
+   3.1 因本次对话中的新发现而失效的旧节点，将其 node_id 写入 invalidations 数组
+
+没有需要处理的项返回空数组。只返回 JSON，禁止额外文字。
+格式：{"promotedSkills":[{"type":"SKILL","name":"...","description":"...","content":"..."}],"newEdges":[{"from":"...","to":"...","type":"...","instruction":"..."}],"invalidations":["node-id"]}`;
+
+// ─── 整理 User Prompt ───────────────────────────────────────────
 
 const FINALIZE_USER = (nodes: any[], summary: string) =>
-  `## 本次对话节点
+`<Session Nodes>
 ${JSON.stringify(nodes.map(n => ({
   id: n.id, type: n.type, name: n.name,
   description: n.description, v: n.validatedCount
 })), null, 2)}
 
-## 图谱摘要
-${summary}
+<Graph Summary>
+${summary}`;
 
-返回：
-{
-  "promotedSkills": [{"type":"SKILL","name":"...","description":"...","content":"..."}],
-  "newEdges": [{"from":"...","to":"...","type":"...","instruction":"..."}],
-  "invalidations": ["node-id"]
-}`;
+// ─── 名称标准化（与 store.ts 一致）────────────────────────────
+
+function normalizeName(name: string): string {
+  return name.trim().toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9\u4e00-\u9fff\-]/g, "")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+// ─── 边类型自动修正 ─────────────────────────────────────────────
+
+/**
+ * 根据 from/to 节点类型修正 LLM 输出的边类型
+ *
+ * 修正规则：
+ *   TASK → SKILL + 任何非 USED_SKILL → 修正为 USED_SKILL
+ *   EVENT → SKILL + 任何非 SOLVED_BY → 修正为 SOLVED_BY
+ *   方向约束不满足 → 丢弃该边
+ */
+function correctEdgeType(
+  edge: { from: string; to: string; type: string; instruction: string; condition?: string },
+  nameToType: Map<string, string>,
+): typeof edge | null {
+  const fromType = nameToType.get(normalizeName(edge.from));
+  const toType = nameToType.get(normalizeName(edge.to));
+
+  // 无法确定节点类型时原样返回
+  if (!fromType || !toType) return edge;
+
+  let type = edge.type;
+
+  // TASK → SKILL 必须是 USED_SKILL
+  if (fromType === "TASK" && toType === "SKILL" && type !== "USED_SKILL") {
+    if (process.env.GM_DEBUG) {
+      console.log(`  [DEBUG] edge corrected: ${edge.from} →[${type}]→ ${edge.to} => USED_SKILL`);
+    }
+    type = "USED_SKILL";
+  }
+
+  // EVENT → SKILL 必须是 SOLVED_BY
+  if (fromType === "EVENT" && toType === "SKILL" && type !== "SOLVED_BY") {
+    if (process.env.GM_DEBUG) {
+      console.log(`  [DEBUG] edge corrected: ${edge.from} →[${type}]→ ${edge.to} => SOLVED_BY`);
+    }
+    type = "SOLVED_BY";
+  }
+
+  // 验证修正后的类型是否合法
+  if (!VALID_EDGE_TYPES.has(type)) {
+    if (process.env.GM_DEBUG) {
+      console.log(`  [DEBUG] edge dropped: invalid type "${type}"`);
+    }
+    return null;
+  }
+
+  // 验证方向约束
+  const fromOk = EDGE_FROM_CONSTRAINT[type]?.has(fromType) ?? false;
+  const toOk = EDGE_TO_CONSTRAINT[type]?.has(toType) ?? false;
+  if (!fromOk || !toOk) {
+    if (process.env.GM_DEBUG) {
+      console.log(`  [DEBUG] edge dropped: ${fromType}→[${type}]→${toType} violates direction constraint`);
+    }
+    return null;
+  }
+
+  return { ...edge, type };
+}
 
 // ─── Extractor ────────────────────────────────────────────────
 
@@ -208,10 +278,34 @@ export class Extractor {
     try {
       const json = extractJson(raw);
       const p = JSON.parse(json);
-      return {
-        nodes: (p.nodes ?? []).filter((n: any) => n.name && n.type && n.content),
-        edges: (p.edges ?? []).filter((e: any) => e.from && e.to && e.type),
-      };
+
+      // ── 节点验证 ──
+      const nodes = (p.nodes ?? []).filter((n: any) => {
+        if (!n.name || !n.type || !n.content) return false;
+        if (!VALID_NODE_TYPES.has(n.type)) {
+          if (process.env.GM_DEBUG) console.log(`  [DEBUG] node dropped: invalid type "${n.type}"`);
+          return false;
+        }
+        if (!n.description) n.description = "";
+        n.name = normalizeName(n.name);
+        return true;
+      });
+
+      // ── 构建 name→type 索引 ──
+      const nameToType = new Map<string, string>();
+      for (const n of nodes) nameToType.set(n.name, n.type);
+
+      // ── 边验证 + 自动修正 ──
+      const edges = (p.edges ?? [])
+        .filter((e: any) => e.from && e.to && e.type && e.instruction)
+        .map((e: any) => {
+          e.from = normalizeName(e.from);
+          e.to = normalizeName(e.to);
+          return correctEdgeType(e, nameToType);
+        })
+        .filter((e: any) => e !== null);
+
+      return { nodes, edges };
     } catch (err) {
       if (process.env.GM_DEBUG) {
         console.log(`  [DEBUG] JSON parse failed: ${err}`);
@@ -226,13 +320,15 @@ export class Extractor {
       const json = extractJson(raw);
       const p = JSON.parse(json);
       return {
-        promotedSkills: p.promotedSkills ?? [],
-        newEdges: p.newEdges ?? [],
+        promotedSkills: (p.promotedSkills ?? []).filter((n: any) => n.name && n.content),
+        newEdges: (p.newEdges ?? []).filter((e: any) => e.from && e.to && e.type && VALID_EDGE_TYPES.has(e.type)),
         invalidations: p.invalidations ?? [],
       };
     } catch { return { promotedSkills: [], newEdges: [], invalidations: [] }; }
   }
 }
+
+// ─── JSON 提取 ───────────────────────────────────────────────
 
 function extractJson(raw: string): string {
   let s = raw.trim();
