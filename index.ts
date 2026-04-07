@@ -45,7 +45,7 @@ function readProviderModel(apiConfig: unknown): { provider: string; model: strin
   }
 
   if (!raw) {
-    raw = (process.env.OPENCLAW_PROVIDER ?? "anthropic") + "/claude-haiku-4-5-20251001";
+    raw = "anthropic/claude-haiku-4-5-20251001";
   }
 
   if (raw.includes("/")) {
@@ -56,7 +56,7 @@ function readProviderModel(apiConfig: unknown): { provider: string; model: strin
     }
   }
 
-  const provider = (process.env.OPENCLAW_PROVIDER ?? "anthropic").trim();
+  const provider = "anthropic";
   return { provider, model: raw };
 }
 
@@ -133,9 +133,9 @@ const graphMemoryPlugin = {
 
     // ── 初始化核心模块 ──────────────────────────────────────
     const db = getDb(cfg.dbPath);
-    // Read ANTHROPIC_API_KEY at registration time (outside llm.ts) so the
-    // scanner does not see env access + network send in the same file.
-    const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+    const anthropicApiKey = cfg.llm?.apiKey && !cfg.llm?.baseURL
+      ? cfg.llm.apiKey   // If apiKey set but no baseURL, assume Anthropic direct
+      : undefined;
     const llm = createCompleteFn(provider, model, cfg.llm, anthropicApiKey);
     const recaller = new Recaller(db, cfg);
     const extractor = new Extractor(cfg, llm);
