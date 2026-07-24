@@ -335,6 +335,7 @@ sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
 |------|------|
 | `gm_search` | 搜索图谱中的相关经验、技能和解决方案 |
 | `gm_record` | 手动记录经验到图谱 |
+| `gm_update` | 按精确节点名称更新已有节点的描述和/或内容（不存在则报错） |
 | `gm_stats` | 查看图谱统计：节点数、边数、社区数、PageRank Top 节点 |
 | `gm_maintain` | 手动触发图维护：去重 → PageRank → 社区检测 + 摘要生成 |
 

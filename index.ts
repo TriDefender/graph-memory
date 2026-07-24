@@ -15,7 +15,7 @@ import { getDb } from "./src/store/db.ts";
 import {
   saveMessage, getUnextracted,
   markExtracted,
-  upsertNode, upsertEdge, findByName,
+  upsertNode, upsertEdge, findByName, updateNode,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats,
 } from "./src/store/store.ts";
@@ -44,10 +44,6 @@ function readProviderModel(apiConfig: unknown): { provider: string; model: strin
     }
   }
 
-  if (!raw) {
-    raw = "anthropic/claude-haiku-4-5-20251001";
-  }
-
   if (raw.includes("/")) {
     const [provider, ...rest] = raw.split("/");
     const model = rest.join("/").trim();
@@ -56,8 +52,11 @@ function readProviderModel(apiConfig: unknown): { provider: string; model: strin
     }
   }
 
-  const provider = "anthropic";
-  return { provider, model: raw };
+  if (raw) {
+    return { provider: "anthropic", model: raw };
+  }
+
+  return { provider: "", model: "" };
 }
 
 // ─── 清洗 OpenClaw metadata 包装 ─────────────────────────────
@@ -130,6 +129,14 @@ const graphMemoryPlugin = {
         : {};
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     const { provider, model } = readProviderModel(api.config);
+
+    const effectiveModel = cfg.llm?.model ?? model;
+    if (!effectiveModel) {
+      api.logger.warn(
+        "[graph-memory] No LLM model configured. Set agents.defaults.model in openclaw.json " +
+        "or config.llm.model in graph-memory plugin config — extraction and community summaries will fail.",
+      );
+    }
 
     // ── 初始化核心模块 ──────────────────────────────────────
     const db = getDb(cfg.dbPath);
@@ -682,6 +689,62 @@ const graphMemoryPlugin = {
     );
 
     api.registerTool(
+      (ctx: any) => ({
+        name: "gm_update",
+        label: "Update Graph Memory Node",
+        description:
+          "更新知识图谱中已存在的节点。必须提供精确的节点名称（不存在会报错）。用于 refine 已有经验的描述或内容，避免重复创建节点。",
+        parameters: Type.Object({
+          name: Type.String({ description: "要更新的节点名称（必须精确匹配已有节点；名称会被标准化：全小写、空格/下划线转连字符）" }),
+          description: Type.Optional(
+            Type.String({ description: "新的一句话说明（one-line summary）。不传则保留原值" }),
+          ),
+          content: Type.Optional(
+            Type.String({ description: "新的知识内容（纯文本）。不传则保留原值" }),
+          ),
+        }),
+        async execute(
+          _toolCallId: string,
+          p: { name: string; description?: string; content?: string },
+        ) {
+          if (p.description === undefined && p.content === undefined) {
+            throw new Error(
+              "[graph-memory] gm_update 至少需要提供 description 或 content 中的一个",
+            );
+          }
+          const updated = updateNode(db, p.name, {
+            description: p.description,
+            content: p.content,
+          });
+          if (!updated) {
+            throw new Error(
+              `[graph-memory] 未找到名称为 "${p.name}" 的节点。` +
+              `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
+              `或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。`,
+            );
+          }
+          recaller.syncEmbed(updated).catch(() => {});
+          const changes: string[] = [];
+          if (p.description !== undefined) changes.push(`description="${updated.description}"`);
+          if (p.content !== undefined) changes.push(`content (${updated.content.length} chars)`);
+          return {
+            content: [{
+              type: "text",
+              text: `已更新：${updated.name} (${updated.type})\n变更：${changes.join("，")}`,
+            }],
+            details: {
+              name: updated.name,
+              type: updated.type,
+              description: updated.description,
+              contentLength: updated.content.length,
+            },
+          };
+        },
+      }),
+      { name: "gm_update" },
+    );
+
+    api.registerTool(
       (_ctx: any) => ({
         name: "gm_stats",
         label: "Graph Memory Stats",
@@ -745,7 +808,7 @@ const graphMemoryPlugin = {
     );
 
     api.logger.info(
-      `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${model}`,
+      `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${effectiveModel || "(none)"}`,
     );
   },
 };
