@@ -91,6 +91,22 @@ export function upsertNode(
   return { node: findByName(db, name)!, isNew: true };
 }
 
+/** 按 name 精确更新 description / content；找不到返回 null（调用方决定报错语义） */
+export function updateNode(
+  db: DatabaseSyncInstance,
+  name: string,
+  patch: { description?: string; content?: string },
+): GmNode | null {
+  const ex = findByName(db, name);
+  if (!ex) return null;
+  const now = Date.now();
+  const description = patch.description ?? ex.description;
+  const content = patch.content ?? ex.content;
+  db.prepare("UPDATE gm_nodes SET description=?, content=?, updated_at=? WHERE id=?")
+    .run(description, content, now, ex.id);
+  return { ...ex, description, content, updatedAt: now };
+}
+
 export function deprecate(db: DatabaseSyncInstance, nodeId: string): void {
   db.prepare("UPDATE gm_nodes SET status='deprecated', updated_at=? WHERE id=?")
     .run(Date.now(), nodeId);
