@@ -62,7 +62,7 @@ export class Recaller {
 
     if (this.embed) {
       try {
-        const vec = await this.embed(query);
+        const vec = await this.embed(query, "query");
         const scored = vectorSearchWithScore(this.db, vec, Math.ceil(limit / 2));
         seeds = scored.map(s => s.node);
 
@@ -137,7 +137,7 @@ export class Recaller {
     // 优先用社区向量搜索
     if (this.embed) {
       try {
-        const vec = await this.embed(query);
+        const vec = await this.embed(query, "query");
         const scoredCommunities = communityVectorSearch(this.db, vec);
 
         if (scoredCommunities.length > 0) {
@@ -236,7 +236,7 @@ export class Recaller {
     if (getVectorHash(this.db, node.id) === hash) return;
     try {
       const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
-      const vec = await this.embed(text);
+      const vec = await this.embed(text, "db");
       if (vec.length) saveVector(this.db, node.id, node.content, vec);
     } catch { /* 不影响主流程 */ }
   }
