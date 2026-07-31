@@ -10,7 +10,7 @@ import { Type } from "@sinclair/typebox";
 import { getDriver, initSchema, getSession, closeDriver } from "./src/store/db.ts";
 import {
   saveMessage, getUnextracted,
-  markExtracted,
+  markExtracted, isTurnExtracted,
   upsertNode, upsertEdge, findByName, updateNode,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats,
@@ -66,6 +66,137 @@ export function cleanPrompt(raw: string): string {
   prompt = prompt.replace(/^\/\w+\s+/, "").trim();
   prompt = prompt.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
   return prompt;
+}
+
+// ─── 规范化消息 content，防 OpenClaw content.filter() 崩溃 ────
+
+export function normalizeMessageContent(messages: any[]): any[] {
+  return messages.map((msg: any) => {
+    if (!msg || typeof msg !== "object") return msg;
+    const c = msg.content;
+    // 数组 → 修复畸形 block（如 { type: "text" } 缺 text 属性）
+    if (Array.isArray(c)) {
+      const fixed = c.map((block: any) => {
+        if (block && typeof block === "object" && block.type === "text" && !("text" in block)) {
+          return { ...block, text: "" };
+        }
+        return block;
+      });
+      if (fixed !== c) return { ...msg, content: fixed };
+      return msg;
+    }
+    // string → 包装成标准 content block 数组
+    if (typeof c === "string") {
+      return { ...msg, content: [{ type: "text", text: c }] };
+    }
+    // undefined/null → 空 text block
+    if (c == null) {
+      return { ...msg, content: [{ type: "text", text: "" }] };
+    }
+    return msg;
+  });
+}
+
+// ─── assemble 消息裁剪：保留最近 N 轮，旧轮只留文本 ──────────
+
+const KEEP_TURNS = 5;
+
+function estimateMsgTokens(msg: any): number {
+  const text = typeof msg.content === "string"
+    ? msg.content
+    : JSON.stringify(msg.content ?? "");
+  return Math.ceil(text.length / 3);
+}
+
+export function extractAssistantText(msg: any): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return "";
+  return msg.content
+    .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text)
+    .join("\n")
+    .trim();
+}
+
+export function extractUserText(msg: any): string {
+  let raw: string;
+  if (typeof msg.content === "string") {
+    raw = msg.content;
+  } else if (!Array.isArray(msg.content)) {
+    raw = String(msg.content ?? "");
+  } else {
+    raw = msg.content
+      .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+      .map((b: any) => b.text)
+      .join("\n")
+      .trim();
+  }
+  // 去掉 OpenClaw metadata（Sender JSON block、命令前缀、时间戳）
+  const fenceEnd = raw.lastIndexOf("```");
+  if (fenceEnd >= 0 && raw.includes("Sender")) {
+    raw = raw.slice(fenceEnd + 3).trim();
+  }
+  raw = raw.replace(/^\/\w+\s+/, "").trim();
+  raw = raw.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
+  return raw;
+}
+
+export function sliceLastTurn(
+  messages: any[],
+): { messages: any[]; tokens: number; dropped: number } {
+  if (!messages.length) {
+    return { messages: [], tokens: 0, dropped: 0 };
+  }
+
+  // 找到最近 N 个 user 消息的位置
+  const userIndices: number[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      userIndices.push(i);
+      if (userIndices.length >= KEEP_TURNS) break;
+    }
+  }
+  if (!userIndices.length) {
+    return { messages: [], tokens: 0, dropped: messages.length };
+  }
+
+  const lastTurnUserIdx = userIndices[0];
+
+  // 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果），但截断超长 tool_result
+  let lastTurnMsgs = messages.slice(lastTurnUserIdx);
+  const TOOL_MAX = 6000;
+  lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
+    if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
+    if (typeof msg.content !== "string") return msg;
+    if (msg.content.length <= TOOL_MAX) return msg;
+    const head = Math.floor(TOOL_MAX * 0.6);
+    const tail = Math.floor(TOOL_MAX * 0.3);
+    return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
+  });
+
+  // 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）
+  const prevTurnMsgs: any[] = [];
+  if (userIndices.length > 1) {
+    const earliestIdx = userIndices[userIndices.length - 1];
+    for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
+      const msg = messages[i];
+      if (!msg) continue;
+      if (msg.role === "user") {
+        const text = extractUserText(msg);
+        if (text) prevTurnMsgs.push({ role: "user", content: text });
+      } else if (msg.role === "assistant") {
+        const text = extractAssistantText(msg);
+        if (text) prevTurnMsgs.push({ role: "assistant", content: text });
+      }
+    }
+  }
+
+  // 合并：前 N-1 轮摘要 + 最后 1 轮完整
+  const kept = [...prevTurnMsgs, ...lastTurnMsgs];
+  const dropped = messages.length - kept.length;
+  let tokens = 0;
+  for (const msg of kept) tokens += estimateMsgTokens(msg);
+  return { messages: kept, tokens, dropped };
 }
 
 // ─── 插件对象 ─────────────────────────────────────────────────
@@ -130,6 +261,10 @@ const graphMemoryProPlugin = {
      */
     async function extractTurnKnowledge(sessionId: string, turnNum: number, rawMessages: any[]): Promise<void> {
       try {
+        if (await isTurnExtracted(driver, sessionId, turnNum)) {
+          api.logger.info(`[graph-memory-pro] turn ${turnNum}: already extracted (compact), skipping`);
+          return;
+        }
         const existing = (await getBySession(driver, sessionId)).map(n => n.name);
         const result = await extractor.extract({
           messages: rawMessages,
@@ -137,7 +272,8 @@ const graphMemoryProPlugin = {
         });
 
         if (!result.nodes.length && !result.edges.length) {
-          api.logger.info(`[graph-memory-pro] turn ${turnNum}: no knowledge extracted`);
+          await markExtracted(driver, sessionId, turnNum);
+          api.logger.info(`[graph-memory-pro] turn ${turnNum}: no knowledge extracted (marked extracted)`);
           return;
         }
 
@@ -177,86 +313,6 @@ const graphMemoryProPlugin = {
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
 
-    // ── Compact 中断机制 ────────────────────────────────────
-    const compactAbort = new Map<string, boolean>();
-    const compactRunning = new Map<string, boolean>();
-
-    function interruptCompact(sessionId: string): void {
-      if (compactRunning.get(sessionId)) {
-        compactAbort.set(sessionId, true);
-      }
-    }
-
-    async function runCompactBackground(sessionId: string): Promise<void> {
-      if (compactRunning.get(sessionId)) return;
-      compactRunning.set(sessionId, true);
-      compactAbort.set(sessionId, false);
-
-      try {
-        let batchNum = 0;
-        const MAX_BATCHES = 10;
-        let remaining = await getUnextracted(driver, sessionId, 20);
-
-        // 每轮摘要存为一条消息，有未提取的就触发
-        while (remaining.length > 0 && batchNum < MAX_BATCHES) {
-          if (compactAbort.get(sessionId)) {
-            api.logger.info(`[graph-memory-pro] compact interrupted (after ${batchNum} batches)`);
-            break;
-          }
-
-          batchNum++;
-
-          api.logger.info(`[graph-memory-pro] compact batch ${batchNum}: ${remaining.length} unextracted msgs`);
-
-          const existing = (await getBySession(driver, sessionId)).map(n => n.name);
-          const result = await extractor.extract({
-            messages: remaining,
-            existingNames: existing,
-          });
-
-          if (compactAbort.get(sessionId)) {
-            api.logger.info(`[graph-memory-pro] compact interrupted after LLM (batch ${batchNum})`);
-            break;
-          }
-
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = await upsertNode(driver, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromNode = await findByName(driver, ec.from);
-            const toNode = await findByName(driver, ec.to);
-            const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-            const toId = nameToId.get(ec.to) ?? toNode?.id;
-            if (fromId && toId) {
-              await upsertEdge(driver, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
-            }
-          }
-
-          const maxTurn = Math.max(...remaining.map((m: any) => m.turn_index));
-          await markExtracted(driver, sessionId, maxTurn);
-
-          api.logger.info(`[graph-memory-pro] batch ${batchNum}: ${result.nodes.length} nodes, ${result.edges.length} edges`);
-
-          remaining = await getUnextracted(driver, sessionId, 20);
-        }
-      } catch (err) {
-        api.logger.error(`[graph-memory-pro] compact failed: ${err}`);
-      } finally {
-        compactRunning.set(sessionId, false);
-        compactAbort.set(sessionId, false);
-      }
-    }
-
     async function ingestMessage(sessionId: string, message: any): Promise<void> {
       const seq = (msgSeq.get(sessionId) ?? 0) + 1;
       msgSeq.set(sessionId, seq);
@@ -271,9 +327,6 @@ const graphMemoryProPlugin = {
         const prompt = cleanPrompt(rawPrompt);
         if (!prompt) return;
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
-
-        const sid = ctx?.sessionId ?? ctx?.sessionKey;
-        if (sid) interruptCompact(sid);
 
         api.logger.info(`[graph-memory-pro] recall query: "${prompt.slice(0, 80)}"`);
 
@@ -309,7 +362,9 @@ const graphMemoryProPlugin = {
         return { ingested: true };
       },
 
-      async assemble({ sessionId, messages, tokenBudget }: { sessionId: string; messages: any[]; tokenBudget?: number }) {
+      async assemble({ sessionId, messages, tokenBudget, prompt }: {
+        sessionId: string; messages: any[]; tokenBudget?: number; prompt?: string;
+      }) {
         const budget = tokenBudget ?? 128_000;
 
         const activeNodes = await getBySession(driver, sessionId);
@@ -319,14 +374,28 @@ const graphMemoryProPlugin = {
           activeEdges.push(...await edgesTo(driver, n.id));
         }
 
-        const rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+        // prompt-aware recall：优先用当前 prompt 做新鲜召回，回退到 before_agent_start 缓存
+        let rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
+        if (prompt) {
+          const cleaned = cleanPrompt(prompt);
+          if (cleaned) {
+            try {
+              const freshRec = await recaller.recall(cleaned);
+              if (freshRec.nodes.length) {
+                rec = freshRec;
+                recalled.set(sessionId, freshRec);
+              }
+            } catch (err) {
+              api.logger.warn(`[graph-memory-pro] assemble recall failed: ${err}`);
+            }
+          }
+        }
         const totalGmNodes = activeNodes.length + rec.nodes.length;
 
         if (totalGmNodes === 0) {
-          return { messages, estimatedTokens: 0 };
+          return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
         }
 
-        // assembleContext 保持不变（纯内存操作，传入 driver 给 getCommunitySummary）
         const { xml, systemPrompt, tokens: gmTokens } = await assembleContext(driver, {
           tokenBudget: budget,
           activeNodes,
@@ -335,33 +404,24 @@ const graphMemoryProPlugin = {
           recalledEdges: rec.edges,
         });
 
-        const freshTailCount = cfg.freshTailCount ?? 10;
-        let assembled: any[];
+        const lastTurn = sliceLastTurn(messages);
+        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
 
-        if (messages.length <= freshTailCount) {
-          assembled = messages;
-        } else {
-          assembled = messages.slice(-freshTailCount);
-          const trimmed = messages.length - freshTailCount;
-          api.logger.info(`[graph-memory-pro] assemble: trimmed ${trimmed} msgs → kept ${freshTailCount} tail`);
+        if (lastTurn.dropped > 0) {
+          api.logger.info(
+            `[graph-memory-pro] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
+            `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok`,
+          );
         }
-
-        const repaired = sanitizeToolUseResultPairing(assembled);
 
         let systemPromptAddition: string | undefined;
         if (xml) {
           systemPromptAddition = systemPrompt ? `${systemPrompt}\n\n${xml}` : xml;
         }
 
-        let tailTokens = 0;
-        for (const msg of repaired) {
-          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) ?? "";
-          tailTokens += Math.ceil(content.length / 3);
-        }
-
         return {
-          messages: repaired,
-          estimatedTokens: gmTokens + tailTokens,
+          messages: normalizeMessageContent(repaired),
+          estimatedTokens: gmTokens + lastTurn.tokens,
           ...(systemPromptAddition ? { systemPromptAddition } : {}),
         };
       },

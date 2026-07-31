@@ -770,6 +770,20 @@ export async function markExtracted(driver: Driver, sid: string, upToTurn: numbe
   }
 }
 
+export async function isTurnExtracted(driver: Driver, sid: string, turn: number): Promise<boolean> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      `MATCH (m:GmMessage {sessionId: $sid, turnIndex: $turn, extracted: true})
+       RETURN count(m) AS c`,
+      { sid, turn },
+    );
+    return toInt(result.records[0].get("c")) > 0;
+  } finally {
+    await session.close();
+  }
+}
+
 // ─── 信号 CRUD ───────────────────────────────────────────────
 
 // ─── 统计 ────────────────────────────────────────────────────
@@ -783,11 +797,6 @@ export async function getStats(driver: Driver): Promise<{
 }> {
   const session = getSession(driver);
   try {
-    const nodeStats = await session.run(`
-      MATCH (n:Task|Skill|Event {status: 'active'})
-      RETURN count(n) AS total, n.type AS type
-    `);
-    // 重新查询分组
     const byTypeResult = await session.run(`
       MATCH (n:Task|Skill|Event {status: 'active'})
       RETURN n.type AS type, count(n) AS c
