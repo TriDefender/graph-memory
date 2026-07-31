@@ -7,6 +7,9 @@
   "license": "MIT",
   "main": "index.ts",
   "slots": ["contextEngine"],
+  "contracts": {
+    "tools": ["gm_search", "gm_record", "gm_update", "gm_stats", "gm_maintain"]
+  },
   "configSchema": {
     "type": "object",
     "properties": {

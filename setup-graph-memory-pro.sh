@@ -133,8 +133,14 @@ jq_safe_write() {
 # 下载校验（失败即中止）
 dl() { # dl <url> <out>
   if $DRY_RUN; then dry "curl -fL $1 -o $2"; return 0; fi
+  mkdir -p "$(dirname "$2")"
+  # 优先用本地暂存（绕过代理下载大文件失败 / bypass proxy for large files）
+  local staged="$GMP_HOME/staging/$(basename "$2")"
+  if [[ -f "$staged" && -s "$staged" ]]; then
+    cp "$staged" "$2"; success "使用本地暂存 / using staged: $(basename "$2")"; return 0
+  fi
   info "下载 / Download: $1"
-  curl -fL --connect-timeout 20 --retry 3 --retry-delay 3 "$1" -o "$2" \
+  curl -fL --connect-timeout 20 --retry 5 --retry-delay 3 "$1" -o "$2" \
     || fail "下载失败 / Download failed: $1"
 }
 
