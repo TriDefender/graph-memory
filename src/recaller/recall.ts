@@ -46,11 +46,6 @@ export class Recaller {
     // ── 合并去重（全部保留，只去重复节点） ────────────────
     const merged = this.mergeResults(precise, generalized);
 
-    if (process.env.GM_DEBUG) {
-      const communities = new Set(merged.nodes.map(n => n.communityId).filter(Boolean));
-      console.log(`  [DEBUG] recall merged: precise=${precise.nodes.length}, generalized=${generalized.nodes.length} → final=${merged.nodes.length} nodes, ${merged.edges.length} edges, ${communities.size} communities`);
-    }
-
     return merged;
   }
 
@@ -65,10 +60,6 @@ export class Recaller {
         const vec = await this.embed(query, "query");
         const scored = vectorSearchWithScore(this.db, vec, Math.ceil(limit / 2));
         seeds = scored.map(s => s.node);
-
-        if (process.env.GM_DEBUG && scored.length > 0) {
-          console.log(`  [DEBUG] precise: bestScore=${scored[0].score.toFixed(3)}, seeds=${seeds.length}`);
-        }
 
         // 向量结果不足时补 FTS5
         if (seeds.length < 2) {
@@ -144,9 +135,6 @@ export class Recaller {
           const communityIds = scoredCommunities.map(c => c.id);
           seeds = nodesByCommunityIds(this.db, communityIds, 3);
 
-          if (process.env.GM_DEBUG) {
-            console.log(`  [DEBUG] generalized: community vector matched ${scoredCommunities.length} communities: ${scoredCommunities.map(c => `${c.id}(${c.score.toFixed(2)})`).join(", ")}`);
-          }
         }
       } catch {
         // embedding 失败，fallback
@@ -178,11 +166,6 @@ export class Recaller {
       .slice(0, limit);
 
     const ids = new Set(filtered.map(n => n.id));
-
-    if (process.env.GM_DEBUG) {
-      const communities = new Set(filtered.map(n => n.communityId).filter(Boolean));
-      console.log(`  [DEBUG] generalized: ${filtered.length} nodes from ${communities.size} communities`);
-    }
 
     return {
       nodes: filtered,

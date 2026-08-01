@@ -170,7 +170,7 @@ session_end
 
 ### 前置条件
 
-- [OpenClaw](https://github.com/openclaw/openclaw)（v2026.3.x+）
+- [OpenClaw](https://github.com/openclaw/openclaw)（v2026.4.2+）
 - Node.js 22+
 
 ### Windows 用户
@@ -272,7 +272,7 @@ pnpm openclaw plugins install .
 
 > **⚠️ 注意**：`pnpm openclaw plugins install` 可能会重置你的配置。每次重装插件后请检查 `config.llm` 和 `config.embedding` 是否还在。
 
-如果不配 `config.llm`，graph-memory 会回退到环境变量 `ANTHROPIC_API_KEY` + Anthropic API。
+Anthropic 直连可只配置 `config.llm.apiKey` 而不配置 `baseUrl`；graph-memory 不会从环境变量读取凭证。
 
 ### 支持的 Embedding 服务商
 
@@ -285,6 +285,7 @@ pnpm openclaw plugins install .
 | llama.cpp | `http://127.0.0.1:8080/v1` | 你的模型名 | 视模型而定 |
 
 模型不支持 `dimensions` 参数时，设为 `0` 或直接不填。
+`baseUrl` 和旧拼写 `baseURL` 均受支持。本地 Ollama、llama.cpp 等无需鉴权的兼容端点可以省略 `apiKey`。
 
 ### 重启并验证
 
@@ -325,8 +326,8 @@ sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
 | `recall` 正常但 `gm_messages` 为空 | 没设置 `plugins.slots.contextEngine` | 在 `plugins.slots` 中添加 `"contextEngine": "graph-memory"` |
 | 显示 `FTS5 search mode` | Embedding 未配置或 API Key 无效 | 检查 `config.embedding` 的密钥和地址 |
 | `No LLM available` 错误 | 重装插件后 LLM 配置丢失 | 重新添加 `config.llm` 到 `plugins.entries.graph-memory` |
-| `afterTurn` 后没有 `extracted` 日志 | 重启导致 turn_index 重叠 | 升级到 v2.0（修复了 msgSeq 持久化） |
-| `content.filter is not a function` | OpenClaw 要求 content 为数组 | 升级到 v2.0（添加了 content 规范化） |
+| `afterTurn` 后没有 `extracted` 日志 | Gateway 跳过了 `ingest`，或旧版本复用了 turn_index | 升级到最新插件版 |
+| `content.filter is not a function` | OpenClaw 要求 content 为数组 | 升级到最新插件版（已添加 content 规范化） |
 | 对话很多轮但节点为空 | 消息数未达到提取阈值 | 默认需要积累消息。继续对话或调低 `compactTurnCount` |
 
 ## Agent 工具

@@ -115,6 +115,8 @@ export interface RecallResult {
 export interface EmbeddingConfig {
   apiKey?: string;
   baseURL?: string;
+  /** Alias used by OpenClaw and several OpenAI-compatible providers. */
+  baseUrl?: string;
   model?: string;
   dimensions?: number;
 }
@@ -131,6 +133,8 @@ export interface GmConfig {
   llm?: {
     apiKey?: string;
     baseURL?: string;
+    /** Alias used by OpenClaw and several OpenAI-compatible providers. */
+    baseUrl?: string;
     model?: string;
   };
   /** 向量去重阈值，余弦相似度超过此值视为重复 (0-1) */

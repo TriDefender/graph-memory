@@ -113,7 +113,15 @@ function normalizeMessageContent(messages: any[]): any[] {
   });
 }
 
+/** Return only the completed-turn messages not already delivered by ingest(). */
+export function missingIngestMessages(messages: any[], ingestedCount: number): any[] {
+  const delivered = Math.max(0, Math.min(messages.length, ingestedCount));
+  return messages.slice(delivered);
+}
+
 // ─── 插件对象 ─────────────────────────────────────────────────
+
+let activeEngine: any | null = null;
 
 const graphMemoryPlugin = {
   id: "graph-memory",
@@ -122,6 +130,16 @@ const graphMemoryPlugin = {
     "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
 
   register(api: OpenClawPluginApi) {
+    // Some host builds have called register() repeatedly without disposing the
+    // previous engine. Re-registering every hook/tool retains native SQLite
+    // statements and multiplies work for every turn. Rebind only the engine
+    // factory until OpenClaw calls dispose() for a genuine reload.
+    if (activeEngine) {
+      api.registerContextEngine("graph-memory", () => activeEngine);
+      api.logger.warn("[graph-memory] duplicate register() ignored; reusing active engine");
+      return;
+    }
+
     // ── 读配置 ──────────────────────────────────────────────
     const raw =
       api.pluginConfig && typeof api.pluginConfig === "object"
@@ -140,7 +158,8 @@ const graphMemoryPlugin = {
 
     // ── 初始化核心模块 ──────────────────────────────────────
     const db = getDb(cfg.dbPath);
-    const anthropicApiKey = cfg.llm?.apiKey && !cfg.llm?.baseURL
+    const configuredLlmBaseURL = cfg.llm?.baseURL ?? cfg.llm?.baseUrl;
+    const anthropicApiKey = cfg.llm?.apiKey && !configuredLlmBaseURL
       ? cfg.llm.apiKey   // If apiKey set but no baseURL, assume Anthropic direct
       : undefined;
     const llm = createCompleteFn(provider, model, cfg.llm, anthropicApiKey);
@@ -165,6 +184,7 @@ const graphMemoryPlugin = {
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
     const turnCounter = new Map<string, number>(); // 社区维护计数器
+    const ingestedSinceTurn = new Map<string, number>();
 
     // ── 提取串行化（同 session Promise chain，不同 session 并行）────
     const extractChain = new Map<string, Promise<void>>();
@@ -294,6 +314,7 @@ const graphMemoryPlugin = {
       }) {
         if (isHeartbeat) return { ingested: false };
         ingestMessage(sessionId, message);
+        ingestedSinceTurn.set(sessionId, (ingestedSinceTurn.get(sessionId) ?? 0) + 1);
         return { ingested: true };
       },
 
@@ -452,9 +473,21 @@ const graphMemoryPlugin = {
       }) {
         if (isHeartbeat) return;
 
-        // Messages are already persisted by ingest() — only slice to
-        // determine the new-message count for extraction triggering.
+        // Official OpenClaw calls ingest() and afterTurn() as separate lifecycle
+        // phases. A few downstream builds incorrectly treat them as mutually
+        // exclusive. Backfill only the messages that ingest() did not deliver.
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
+        const ingestedCount = ingestedSinceTurn.get(sessionId) ?? 0;
+        const missingMessages = missingIngestMessages(newMessages, ingestedCount);
+        if (missingMessages.length > 0) {
+          for (const message of missingMessages) {
+            ingestMessage(sessionId, message);
+          }
+          api.logger.warn(
+            `[graph-memory] afterTurn backfilled ${missingMessages.length} message(s) missing from ingest lifecycle`,
+          );
+        }
+        ingestedSinceTurn.delete(sessionId);
 
         const totalMsgs = msgSeq.get(sessionId) ?? 0;
         api.logger.info(
@@ -524,9 +557,13 @@ const graphMemoryPlugin = {
         extractChain.clear();
         msgSeq.clear();
         recalled.clear();
+        turnCounter.clear();
+        ingestedSinceTurn.clear();
+        if (activeEngine === engine) activeEngine = null;
       },
     };
 
+    activeEngine = engine;
     api.registerContextEngine("graph-memory", () => engine);
 
     // ── session_end：finalize + 图维护 ──────────────────────
@@ -592,6 +629,7 @@ const graphMemoryPlugin = {
         msgSeq.delete(sid);
         recalled.delete(sid);
         turnCounter.delete(sid);
+        ingestedSinceTurn.delete(sid);
       }
     });
 
@@ -801,7 +839,7 @@ const graphMemoryPlugin = {
     );
 
     api.logger.info(
-      `[graph-memory] ready | db=${cfg.dbPath} | provider=${provider} | model=${effectiveModel || "(none)"}`,
+      `[graph-memory] ready | db=${cfg.dbPath} | provider=${configuredLlmBaseURL ? "custom" : provider} | model=${effectiveModel || "(none)"}`,
     );
   },
 };

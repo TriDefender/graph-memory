@@ -3,6 +3,9 @@
   "name": "Graph Memory",
   "version": "1.5.8",
   "description": "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+  "contracts": {
+    "tools": ["gm_search", "gm_record", "gm_update", "gm_stats", "gm_maintain"]
+  },
   "configSchema": {
     "type": "object",
     "properties": {
@@ -51,9 +54,10 @@
         "description": "可选：向量搜索配置。配了用语义搜索+去重，没配用 FTS5 全文搜索",
         "properties": {
           "apiKey": { "type": "string", "description": "Embedding API Key" },
-          "baseURL": { "type": "string", "default": "https://api.openai.com/v1", "description": "API 地址" },
+          "baseURL": { "type": "string", "description": "API 地址（兼容旧配置；不填时默认 OpenAI）" },
+          "baseUrl": { "type": "string", "description": "API 地址（OpenClaw 标准拼写；与 baseURL 二选一）" },
           "model": { "type": "string", "default": "text-embedding-3-small", "description": "模型名" },
-          "dimensions": { "type": "integer", "default": 512, "description": "向量维度" }
+          "dimensions": { "type": "integer", "minimum": 1, "description": "可选向量维度；仅在服务明确支持时设置" }
         }
       },
       "llm": {
@@ -61,7 +65,8 @@
         "description": "可选：LLM 配置。不配则用 OpenClaw 全局 provider",
         "properties": {
           "apiKey": { "type": "string" },
-          "baseURL": { "type": "string" },
+          "baseURL": { "type": "string", "description": "API 地址（兼容旧配置）" },
+          "baseUrl": { "type": "string", "description": "API 地址（OpenClaw 标准拼写；与 baseURL 二选一）" },
           "model": { "type": "string" }
         }
       }

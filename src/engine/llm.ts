@@ -19,6 +19,7 @@ import { LlmFailureGuard } from "./llm-guard.ts";
 export interface LlmConfig {
   apiKey?: string;
   baseURL?: string;
+  baseUrl?: string;
   model?: string;
 }
 
@@ -66,14 +67,16 @@ export function createCompleteFn(
 
     try {
       // ── 路径 A（优先）：pluginConfig.llm 直接调 OpenAI 兼容 API ──
-      if (llmConfig?.apiKey && llmConfig?.baseURL) {
-        const baseURL = llmConfig.baseURL.replace(/\/+$/, "");
-        const llmModel = llmConfig.model ?? model;
+      const configuredBaseURL = llmConfig?.baseURL ?? llmConfig?.baseUrl;
+      if (configuredBaseURL) {
+        const config = llmConfig!;
+        const baseURL = configuredBaseURL.replace(/\/+$/, "");
+        const llmModel = config.model ?? model;
         const res = await fetchRetry(`${baseURL}/chat/completions`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": `Bearer ${llmConfig.apiKey}`,
+            ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
           },
           body: JSON.stringify({
             model: llmModel,
@@ -98,7 +101,7 @@ export function createCompleteFn(
       // ── 路径 B：Anthropic API ──────────────────────────────
       if (!anthropicApiKey) {
         throw new Error(
-          "[graph-memory] No LLM available. 在 openclaw.json 的 graph-memory config 中配置 llm.apiKey + llm.baseURL",
+          "[graph-memory] No LLM available. 在 openclaw.json 的 graph-memory config 中配置 llm.baseURL（远程服务同时配置 apiKey）",
         );
       }
       const res = await fetchRetry("https://api.anthropic.com/v1/messages", {

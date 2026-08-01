@@ -56,14 +56,7 @@ export async function runMaintenance(
   if (llm && communityResult.communities.size > 0) {
     try {
       communitySummaries = await summarizeCommunities(db, communityResult.communities, llm, embedFn);
-      if (process.env.GM_DEBUG) {
-        console.log(`  [DEBUG] maintenance: generated ${communitySummaries} community summaries`);
-      }
-    } catch (err) {
-      if (process.env.GM_DEBUG) {
-        console.log(`  [DEBUG] maintenance: community summarization failed: ${err}`);
-      }
-    }
+    } catch { /* summaries are best-effort and must not fail maintenance */ }
   }
 
   return {

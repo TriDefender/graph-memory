@@ -75,11 +75,15 @@ export function isMinimaxEndpoint(baseURL: string): boolean {
 // ─── EmbedFn 工厂 ───────────────────────────────────────────
 
 export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<EmbedFn | null> {
-  if (!cfg?.apiKey) return null;
+  // Local OpenAI-compatible servers commonly do not require a key. A key by
+  // itself still selects the default OpenAI endpoint; a URL by itself selects
+  // an unauthenticated local/custom endpoint.
+  if (!cfg || (!cfg.apiKey && !cfg.baseURL && !cfg.baseUrl)) return null;
+  const config = cfg;
 
-  const baseURL    = (cfg.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
-  const model      = cfg.model ?? "text-embedding-3-small";
-  const dimensions = cfg.dimensions && cfg.dimensions > 0 ? cfg.dimensions : undefined;
+  const baseURL    = (config.baseURL ?? config.baseUrl ?? "https://api.openai.com/v1").replace(/\/+$/, "");
+  const model      = config.model ?? "text-embedding-3-small";
+  const dimensions = config.dimensions && config.dimensions > 0 ? config.dimensions : undefined;
   const minimax    = isMinimaxEndpoint(baseURL);
 
   /**
@@ -105,7 +109,7 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${cfg!.apiKey}`,
+        ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
       },
       body: JSON.stringify(buildBody(input, mode)),
     });

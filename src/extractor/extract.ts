@@ -190,32 +190,20 @@ function correctEdgeType(
   let type = edge.type;
 
   if (fromType === "TASK" && toType === "SKILL" && type !== "USED_SKILL") {
-    if (process.env.GM_DEBUG) {
-      console.log(`  [DEBUG] edge corrected: ${edge.from} ->[${type}]-> ${edge.to} => USED_SKILL`);
-    }
     type = "USED_SKILL";
   }
 
   if (fromType === "EVENT" && toType === "SKILL" && type !== "SOLVED_BY") {
-    if (process.env.GM_DEBUG) {
-      console.log(`  [DEBUG] edge corrected: ${edge.from} ->[${type}]-> ${edge.to} => SOLVED_BY`);
-    }
     type = "SOLVED_BY";
   }
 
   if (!VALID_EDGE_TYPES.has(type)) {
-    if (process.env.GM_DEBUG) {
-      console.log(`  [DEBUG] edge dropped: invalid type "${type}"`);
-    }
     return null;
   }
 
   const fromOk = EDGE_FROM_CONSTRAINT[type]?.has(fromType) ?? false;
   const toOk = EDGE_TO_CONSTRAINT[type]?.has(toType) ?? false;
   if (!fromOk || !toOk) {
-    if (process.env.GM_DEBUG) {
-      console.log(`  [DEBUG] edge dropped: ${fromType}->[${type}]->${toType} violates direction constraint`);
-    }
     return null;
   }
 
@@ -241,11 +229,6 @@ export class Extractor {
       EXTRACT_USER(msgs, params.existingNames.join(", ")),
     );
 
-    if (process.env.GM_DEBUG) {
-      console.log("\n  [DEBUG] LLM raw response (first 2000 chars):");
-      console.log("  " + raw.slice(0, 2000).replace(/\n/g, "\n  "));
-    }
-
     return this.parseExtract(raw);
   }
 
@@ -262,7 +245,6 @@ export class Extractor {
       const nodes = (p.nodes ?? []).filter((n: any) => {
         if (!n.name || !n.type || !n.content) return false;
         if (!VALID_NODE_TYPES.has(n.type)) {
-          if (process.env.GM_DEBUG) console.log(`  [DEBUG] node dropped: invalid type "${n.type}"`);
           return false;
         }
         if (!n.description) n.description = "";

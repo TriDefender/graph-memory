@@ -73,4 +73,35 @@ describe("MiniMax embedding adapter", () => {
       { model: "text-embedding-test", input: "hello", dimensions: 512 },
     ]);
   });
+
+  it("supports baseUrl and an unauthenticated local endpoint without forcing dimensions", async () => {
+    const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({
+        url: String(input),
+        headers: new Headers(init?.headers),
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+      });
+      return new Response(JSON.stringify({ data: [{ embedding: [3, 4] }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+
+    const embed = await createEmbedFn({
+      baseUrl: "http://127.0.0.1:11434/v1/",
+      model: "nomic-embed-text",
+    });
+
+    expect(await embed!("hello", "query")).toEqual([3, 4]);
+    expect(requests.map((request) => request.url)).toEqual([
+      "http://127.0.0.1:11434/v1/embeddings",
+      "http://127.0.0.1:11434/v1/embeddings",
+    ]);
+    expect(requests[0].headers.has("Authorization")).toBe(false);
+    expect(requests.map((request) => request.body)).toEqual([
+      { model: "nomic-embed-text", input: "ping" },
+      { model: "nomic-embed-text", input: "hello" },
+    ]);
+  });
 });

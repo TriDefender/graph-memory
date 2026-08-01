@@ -168,7 +168,7 @@ Unlike global PageRank, PPR ranks nodes **relative to your current query**:
 
 ### Prerequisites
 
-- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.3.x+)
+- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.4.2+)
 - Node.js 22+
 
 ### Windows users
@@ -270,7 +270,7 @@ Add your API credentials inside `plugins.entries.graph-memory.config`:
 
 > **⚠️ Important**: `pnpm openclaw plugins install` may reset your config. Always verify `config.llm` and `config.embedding` are present after reinstalling.
 
-If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` environment variable + Anthropic API.
+For Anthropic direct access, set `config.llm.apiKey` without `baseUrl`; graph-memory does not read credentials from environment variables.
 
 ### Supported embedding providers
 
@@ -283,6 +283,7 @@ If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` e
 | llama.cpp | `http://127.0.0.1:8080/v1` | your model name | varies |
 
 Set `dimensions: 0` or omit it entirely if the model doesn't support the `dimensions` parameter.
+Both `baseUrl` and the legacy spelling `baseURL` are supported. Local compatible endpoints such as Ollama and llama.cpp may omit `apiKey` when authentication is disabled.
 
 ### Restart and verify
 
@@ -323,8 +324,8 @@ sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
 | `recall` works but `gm_messages` is empty | `plugins.slots.contextEngine` not set | Add `"contextEngine": "graph-memory"` to `plugins.slots` |
 | `FTS5 search mode` instead of `vector search ready` | Embedding not configured or API key invalid | Check `config.embedding` credentials |
 | `No LLM available` error | LLM config missing after plugin reinstall | Re-add `config.llm` to `plugins.entries.graph-memory` |
-| No `extracted` log after `afterTurn` | Gateway restart caused turn_index overlap | Update to v2.0 (fixes msgSeq persistence) |
-| `content.filter is not a function` | OpenClaw expects array content | Update to v2.0 (adds content normalization) |
+| No `extracted` log after `afterTurn` | Gateway skipped `ingest` or an older build reused turn indexes | Update to the latest plugin release |
+| `content.filter is not a function` | OpenClaw expects array content | Update to the latest plugin release (includes content normalization) |
 | Nodes are empty after many messages | `compactTurnCount` not reached | Default is 7 messages. Keep chatting or set a lower value |
 
 ## Agent tools
