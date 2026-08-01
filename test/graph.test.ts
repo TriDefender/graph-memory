@@ -214,6 +214,28 @@ describe("Community Detection", () => {
     expect(second).toBe(0);
     expect(llmCalls).toBe(1);
   });
+
+  it("reuses a summary when the community id changes but members do not", async () => {
+    const a = insertNode(db, { name: "docker-build" });
+    const b = insertNode(db, { name: "docker-push" });
+    db.prepare("UPDATE gm_nodes SET community_id='old-community' WHERE id IN (?, ?)").run(a, b);
+
+    let llmCalls = 0;
+    const llm = async () => {
+      llmCalls += 1;
+      return "docker deployment skills";
+    };
+
+    const members = [a, b];
+    expect(await summarizeCommunities(db, new Map([["old-community", members]]), llm)).toBe(1);
+
+    db.prepare("UPDATE gm_nodes SET community_id='new-community' WHERE id IN (?, ?)").run(a, b);
+    expect(await summarizeCommunities(db, new Map([["new-community", members]]), llm)).toBe(0);
+
+    expect(llmCalls).toBe(1);
+    expect(db.prepare("SELECT summary FROM gm_communities WHERE id='new-community'").get()).toBeTruthy();
+    expect(db.prepare("SELECT summary FROM gm_communities WHERE id='old-community'").get()).toBeUndefined();
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════

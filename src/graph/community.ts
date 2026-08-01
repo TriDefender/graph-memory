@@ -197,7 +197,6 @@ export async function summarizeCommunities(
   llm: CompleteFn,
   embedFn?: EmbedFn,
 ): Promise<number> {
-  pruneCommunitySummaries(db);
   let generated = 0;
 
   for (const [communityId, memberIds] of communities) {
@@ -274,5 +273,8 @@ export async function summarizeCommunities(
     }
   }
 
+  // Keep summaries from previous community ids available during the loop so
+  // an unchanged member set can reuse them. Remove obsolete ids afterwards.
+  pruneCommunitySummaries(db);
   return generated;
 }
