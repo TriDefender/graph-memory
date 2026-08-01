@@ -14,7 +14,7 @@ import {
   searchNodes, topNodes, graphWalk, getBySession,
   saveMessage, getMessages, getUnextracted, markExtracted,
   saveSignal, pendingSignals, markSignalsDone,
-  getStats, saveVector, vectorSearch, getAllVectors,
+  getStats, saveVector, vectorSearch, getAllVectors, upsertCommunitySummary,
 } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
@@ -147,6 +147,21 @@ describe("node CRUD", () => {
     expect(updated!.sourceSessions).toEqual(["s1", "s2"]);
     expect(updated!.content).toBe("refined");
     expect(updated!.updatedAt).toBeGreaterThanOrEqual(before.updatedAt);
+  });
+});
+
+describe("community summary CRUD", () => {
+  it("clears a stale embedding when a changed summary cannot be re-embedded", () => {
+    upsertCommunitySummary(db, "c1", "old summary", 2, [1, 0], "old-signature");
+    upsertCommunitySummary(db, "c1", "new summary", 3, undefined, "new-signature");
+
+    const row = db.prepare(
+      "SELECT summary, node_count, embedding, member_signature FROM gm_communities WHERE id=?",
+    ).get("c1") as any;
+    expect(row.summary).toBe("new summary");
+    expect(row.node_count).toBe(3);
+    expect(row.embedding).toBeNull();
+    expect(row.member_signature).toBe("new-signature");
   });
 });
 

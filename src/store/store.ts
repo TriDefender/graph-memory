@@ -568,13 +568,10 @@ export function upsertCommunitySummary(
     : null;
   const ex = db.prepare("SELECT id FROM gm_communities WHERE id=?").get(id) as any;
   if (ex) {
-    if (blob) {
-      db.prepare("UPDATE gm_communities SET summary=?, node_count=?, embedding=?, member_signature=?, updated_at=? WHERE id=?")
-        .run(summary, nodeCount, blob, memberSignature ?? null, now, id);
-    } else {
-      db.prepare("UPDATE gm_communities SET summary=?, node_count=?, member_signature=?, updated_at=? WHERE id=?")
-        .run(summary, nodeCount, memberSignature ?? null, now, id);
-    }
+    // A summary/member change invalidates the previous embedding. Persist null
+    // when regeneration is unavailable instead of retaining a stale vector.
+    db.prepare("UPDATE gm_communities SET summary=?, node_count=?, embedding=?, member_signature=?, updated_at=? WHERE id=?")
+      .run(summary, nodeCount, blob, memberSignature ?? null, now, id);
   } else {
     db.prepare("INSERT INTO gm_communities (id, summary, node_count, embedding, member_signature, created_at, updated_at) VALUES (?,?,?,?,?,?,?)")
       .run(id, summary, nodeCount, blob, memberSignature ?? null, now, now);

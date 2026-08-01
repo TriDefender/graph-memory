@@ -11,9 +11,9 @@
  * 可选模块：配了 embedding.apiKey 才启用，否则返回 null → 降级 FTS5
  *
  * 使用 fetch 直接调 OpenAI 兼容 /embeddings 接口（不依赖 openai SDK），
- * 兼容 OpenAI、阿里云 DashScope、MiniMax(MiniMax CodePlan)、Jina、Ollama、llama.cpp 等。
+ * 兼容 OpenAI、阿里云 DashScope、MiniMax CodePlan、Jina、Ollama、llama.cpp 等。
  *
- * MiniMax(MiniMax) 是特例：
+ * MiniMax CodePlan 是特例：
  *   - 端点走 anthropic 协议但 embeddings 用 OpenAI 风格变体
  *   - 请求体用 `texts: [...]` + `type: "db" | "query"`（不是 OpenAI 的 `input`）
  *   - 响应字段是 `data[0].vector`（不是 `data[0].embedding`）
@@ -52,11 +52,24 @@ async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs
 // ─── Provider 识别 ───────────────────────────────────────────
 
 /**
- * 识别 MiniMax(MiniMax CodePlan) 端点。
+ * 识别 MiniMax CodePlan 端点。
  * 海外 minimax.io 国内打不开，所以 baseURL 主要是 api.minimaxi.com / minimax.chat。
  */
-function isMinimax(baseURL: string): boolean {
-  return /minimaxi\.com|minimax\.chat|minimax\.io/i.test(baseURL);
+export function isMinimaxEndpoint(baseURL: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(baseURL).hostname.toLowerCase();
+  } catch {
+    try {
+      hostname = new URL(`https://${baseURL}`).hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
+  return ["minimaxi.com", "minimax.chat", "minimax.io"].some(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
 }
 
 // ─── EmbedFn 工厂 ───────────────────────────────────────────
@@ -67,7 +80,7 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   const baseURL    = (cfg.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
   const model      = cfg.model ?? "text-embedding-3-small";
   const dimensions = cfg.dimensions && cfg.dimensions > 0 ? cfg.dimensions : undefined;
-  const minimax    = isMinimax(baseURL);
+  const minimax    = isMinimaxEndpoint(baseURL);
 
   /**
    * 构造请求 body。MiniMax 走 texts+type 分支，其他 OpenAI 兼容端点维持原行为。
