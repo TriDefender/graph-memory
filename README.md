@@ -333,6 +333,7 @@ sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
 |------|-------------|
 | `gm_search` | Search the knowledge graph for relevant skills, events, and solutions |
 | `gm_record` | Manually record knowledge to the graph |
+| `gm_update` | Update an existing node's description and/or content by exact name (throws if not found) |
 | `gm_stats` | View graph statistics: nodes, edges, communities, PageRank top nodes |
 | `gm_maintain` | Manually trigger graph maintenance: dedup → PageRank → community detection + summaries |
 

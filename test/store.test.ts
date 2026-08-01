@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
 import {
-  findByName, findById, upsertNode, upsertEdge, deprecate,
+  findByName, findById, upsertNode, upsertEdge, updateNode, deprecate,
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
   searchNodes, topNodes, graphWalk, getBySession,
   saveMessage, getMessages, getUnextracted, markExtracted,
@@ -82,6 +82,71 @@ describe("node CRUD", () => {
 
   it("findByName 找不到返回 null", () => {
     expect(findByName(db, "not-exist")).toBeNull();
+  });
+
+  it("updateNode 找不到节点返回 null", () => {
+    expect(updateNode(db, "ghost", { description: "x" })).toBeNull();
+    expect(updateNode(db, "ghost", { content: "y" })).toBeNull();
+  });
+
+  it("updateNode 只更新 description，保留 content", () => {
+    const { node } = upsertNode(db, {
+      type: "SKILL", name: "docker-build",
+      description: "旧描述", content: "原内容保持不变",
+    }, "s1");
+
+    const updated = updateNode(db, "docker-build", { description: "新描述" });
+    expect(updated).not.toBeNull();
+    expect(updated!.description).toBe("新描述");
+    expect(updated!.content).toBe("原内容保持不变");
+  });
+
+  it("updateNode 只更新 content，保留 description", () => {
+    upsertNode(db, {
+      type: "SKILL", name: "docker-run",
+      description: "描述不动", content: "旧内容",
+    }, "s1");
+
+    const updated = updateNode(db, "docker-run", { content: "全新内容" });
+    expect(updated).not.toBeNull();
+    expect(updated!.description).toBe("描述不动");
+    expect(updated!.content).toBe("全新内容");
+  });
+
+  it("updateNode 同时更新 description 和 content", () => {
+    upsertNode(db, {
+      type: "EVENT", name: "oom-crash",
+      description: "旧", content: "旧内容",
+    }, "s1");
+
+    const updated = updateNode(db, "oom-crash", {
+      description: "新描述", content: "新内容",
+    });
+    expect(updated!.description).toBe("新描述");
+    expect(updated!.content).toBe("新内容");
+  });
+
+  it("updateNode 保留 type/name/status/validatedCount，刷新 updated_at", () => {
+    const { node } = upsertNode(db, {
+      type: "SKILL", name: "preserve-me",
+      description: "d1", content: "c1",
+    }, "s1");
+    // 第二次 upsert 把 validated_count 提到 2
+    upsertNode(db, {
+      type: "SKILL", name: "preserve-me",
+      description: "d1", content: "c1",
+    }, "s2");
+    const before = findByName(db, "preserve-me")!;
+    expect(before.validatedCount).toBe(2);
+
+    const updated = updateNode(db, "preserve-me", { content: "refined" });
+    expect(updated!.type).toBe("SKILL");
+    expect(updated!.name).toBe("preserve-me");
+    expect(updated!.status).toBe("active");
+    expect(updated!.validatedCount).toBe(2);
+    expect(updated!.sourceSessions).toEqual(["s1", "s2"]);
+    expect(updated!.content).toBe("refined");
+    expect(updated!.updatedAt).toBeGreaterThanOrEqual(before.updatedAt);
   });
 });
 
