@@ -1,9 +1,12 @@
 const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 529]);
-const PAUSING_STATUSES = new Set([400, 401, 403, 404, 422]);
+// Only pause for errors that normally require a credential, endpoint, or
+// model configuration change. 400/422 can be caused by one bad prompt and
+// must not disable unrelated later calls.
+const PAUSING_STATUSES = new Set([401, 403, 404]);
 
 export function extractLlmStatus(error: unknown): number | null {
   const text = String(error ?? "");
-  const match = text.match(/\bLLM API (\d{3})\b/);
+  const match = text.match(/\b(?:LLM|Anthropic) API (\d{3})\b/);
   if (!match) return null;
   return Number(match[1]);
 }
