@@ -259,7 +259,7 @@ export async function summarizeCommunities(
       if (embedFn) {
         try {
           const embedText = `${cleaned}\n${members.map((m: any) => m.name).join(", ")}`;
-          embedding = await embedFn(embedText);
+          embedding = await embedFn(embedText, "db");
         } catch {
           if (process.env.GM_DEBUG) {
             console.log(`  [DEBUG] community embedding failed for ${communityId}`);

@@ -61,7 +61,7 @@ Embedding 模块改用原生 `fetch` 替代 `openai` SDK，开箱即用兼容**�
 
 - OpenAI、Azure OpenAI
 - 阿里云 DashScope（`text-embedding-v4`）
-- MiniMax（`embo-01`）
+- MiniMax（`embo-01`，1536 维 —— 使用 `texts` + `type` 请求体，不是 OpenAI 的 `input`）
 - Ollama、llama.cpp、vLLM（本地模型）
 - 任何实现了 `POST /embeddings` 的端点
 
@@ -280,7 +280,7 @@ pnpm openclaw plugins install .
 |--------|---------|------|------------|
 | OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
 | 阿里云 DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax | `https://api.minimax.chat/v1` | `embo-01` | 1024 |
+| MiniMax (MiniMax CodePlan) | `https://api.minimaxi.com/v1` | `embo-01` | 1536 |
 | Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
 | llama.cpp | `http://127.0.0.1:8080/v1` | 你的模型名 | 视模型而定 |
 

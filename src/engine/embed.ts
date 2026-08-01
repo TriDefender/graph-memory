@@ -11,14 +11,21 @@
  * 可选模块：配了 embedding.apiKey 才启用，否则返回 null → 降级 FTS5
  *
  * 使用 fetch 直接调 OpenAI 兼容 /embeddings 接口（不依赖 openai SDK），
- * 兼容 OpenAI、阿里云 DashScope、MiniMax、Jina、Ollama、llama.cpp 等。
+ * 兼容 OpenAI、阿里云 DashScope、MiniMax(MiniMax CodePlan)、Jina、Ollama、llama.cpp 等。
+ *
+ * MiniMax(MiniMax) 是特例：
+ *   - 端点走 anthropic 协议但 embeddings 用 OpenAI 风格变体
+ *   - 请求体用 `texts: [...]` + `type: "db" | "query"`（不是 OpenAI 的 `input`）
+ *   - 响应字段是 `data[0].vector`（不是 `data[0].embedding`）
+ *   - 维度固定 1536，不接受 `dimensions` 参数
  *
  * 内置：429/5xx 重试 3 次 + 10s 超时
  */
 
 import type { EmbeddingConfig } from "../types.ts";
 
-export type EmbedFn = (text: string) => Promise<number[]>;
+export type EmbedMode = "db" | "query";
+export type EmbedFn = (text: string, mode?: EmbedMode) => Promise<number[]>;
 
 // ─── 带重试+超时的 fetch ─────────────────────────────────────
 
@@ -42,6 +49,16 @@ async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs
   throw new Error("[graph-memory] embed fetch failed after retries");
 }
 
+// ─── Provider 识别 ───────────────────────────────────────────
+
+/**
+ * 识别 MiniMax(MiniMax CodePlan) 端点。
+ * 海外 minimax.io 国内打不开，所以 baseURL 主要是 api.minimaxi.com / minimax.chat。
+ */
+function isMinimax(baseURL: string): boolean {
+  return /minimaxi\.com|minimax\.chat|minimax\.io/i.test(baseURL);
+}
+
 // ─── EmbedFn 工厂 ───────────────────────────────────────────
 
 export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<EmbedFn | null> {
@@ -50,21 +67,34 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   const baseURL    = (cfg.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
   const model      = cfg.model ?? "text-embedding-3-small";
   const dimensions = cfg.dimensions && cfg.dimensions > 0 ? cfg.dimensions : undefined;
+  const minimax    = isMinimax(baseURL);
 
-  function buildBody(input: string): Record<string, unknown> {
+  /**
+   * 构造请求 body。MiniMax 走 texts+type 分支，其他 OpenAI 兼容端点维持原行为。
+   * type: db=入库, query=查询（MiniMax 内部用不同模型）
+   */
+  function buildBody(input: string, mode: EmbedMode): Record<string, unknown> {
+    if (minimax) {
+      return {
+        model,
+        texts: [input],
+        type: mode, // "db" | "query"
+        // MiniMax 不接受 dimensions
+      };
+    }
     const body: Record<string, unknown> = { model, input };
     if (dimensions) body.dimensions = dimensions;
     return body;
   }
 
-  async function callEmbedding(input: string): Promise<number[]> {
+  async function callEmbedding(input: string, mode: EmbedMode): Promise<number[]> {
     const res = await fetchRetry(`${baseURL}/embeddings`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${cfg!.apiKey}`,
       },
-      body: JSON.stringify(buildBody(input)),
+      body: JSON.stringify(buildBody(input, mode)),
     });
 
     if (!res.ok) {
@@ -73,7 +103,9 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
     }
 
     const data = await res.json() as any;
-    const embedding = data?.data?.[0]?.embedding;
+    // MiniMax: data[0].vector；OpenAI 兼容: data[0].embedding
+    const item = data?.data?.[0];
+    const embedding: number[] | undefined = minimax ? item?.vector : item?.embedding;
     if (!Array.isArray(embedding) || !embedding.length) {
       throw new Error("[graph-memory] Embedding API returned empty embedding");
     }
@@ -82,11 +114,11 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
 
   // ── 验证连通性 ────────────────────────────────────────────
   try {
-    const probe = await callEmbedding("ping");
+    const probe = await callEmbedding("ping", "query");
     if (!probe.length) return null;
 
-    return async (text: string): Promise<number[]> => {
-      return callEmbedding(text.slice(0, 8000));
+    return async (text: string, mode: EmbedMode = "db"): Promise<number[]> => {
+      return callEmbedding(text.slice(0, 8000), mode);
     };
   } catch (err) {
     console.error(`[graph-memory] embedding probe failed:`, err);

@@ -59,7 +59,7 @@ The embedding module now uses raw `fetch` instead of the `openai` SDK, making it
 
 - OpenAI, Azure OpenAI
 - Alibaba DashScope (`text-embedding-v4`)
-- MiniMax (`embo-01`)
+- MiniMax (`embo-01`, 1536d — uses `texts` + `type` body format, not OpenAI `input`)
 - Ollama, llama.cpp, vLLM (local models)
 - Any endpoint that implements `POST /embeddings`
 
@@ -278,7 +278,7 @@ If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` e
 |----------|---------|-------|------------|
 | OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
 | Alibaba DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax | `https://api.minimax.chat/v1` | `embo-01` | 1024 |
+| MiniMax (MiniMax CodePlan) | `https://api.minimaxi.com/v1` | `embo-01` | 1536 |
 | Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
 | llama.cpp | `http://127.0.0.1:8080/v1` | your model name | varies |
 
