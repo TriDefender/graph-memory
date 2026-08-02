@@ -638,15 +638,17 @@ if $INTERACTIVE; then
   echo ""
   echo -e "  ${BOLD}Embedding 提供方 / Embedding provider${NC}（语义召回+去重，不配则退化为关键词搜索）"
   echo "    1) OpenAI      2) DashScope   3) SiliconFlow"
-  echo "    4) Jina        5) Ollama(本地) 6) 其他自定义 / custom"
-  read -rp "  选择 / Choose (1-6) [1]: " PC; PC="${PC:-1}"
+  echo "    4) Jina        5) Ollama(本地) 6) MiniMax CodePlan"
+  echo "    7) 其他自定义 / custom"
+  read -rp "  选择 / Choose (1-7) [1]: " PC; PC="${PC:-1}"
   case "$PC" in
     1) EMB_BASE="https://api.openai.com/v1";          EMB_MODEL="text-embedding-3-small"; EMB_DIM=512 ;;
     2) EMB_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"; EMB_MODEL="text-embedding-v4"; EMB_DIM=1024 ;;
     3) EMB_BASE="https://api.siliconflow.cn/v1";       EMB_MODEL="BAAI/bge-large-zh-v1.5"; EMB_DIM=1024 ;;
     4) EMB_BASE="https://api.jina.ai/v1";              EMB_MODEL="jina-embeddings-v3"; EMB_DIM=1024 ;;
     5) EMB_BASE="http://localhost:11434/v1";           EMB_MODEL="nomic-embed-text"; EMB_DIM=768 ;;
-    6) read -rp "    Base URL: " EMB_BASE; read -rp "    Model: " EMB_MODEL; read -rp "    Dimensions [1024]: " EMB_DIM; EMB_DIM="${EMB_DIM:-1024}" ;;
+    6) EMB_BASE="https://api.minimaxi.com/v1";         EMB_MODEL="embo-01"; EMB_DIM=1536 ;;
+    7) read -rp "    Base URL: " EMB_BASE; read -rp "    Model: " EMB_MODEL; read -rp "    Dimensions [1024]: " EMB_DIM; EMB_DIM="${EMB_DIM:-1024}" ;;
     *) warn "无效选择，使用 OpenAI 默认 / invalid, defaulting to OpenAI"
        EMB_BASE="https://api.openai.com/v1"; EMB_MODEL="text-embedding-3-small"; EMB_DIM=512 ;;
   esac

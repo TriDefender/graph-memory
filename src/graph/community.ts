@@ -215,7 +215,7 @@ export async function summarizeCommunities(
       if (embedFn) {
         try {
           const embedText = `${cleaned}\n${members.map(m => m.name).join(", ")}`;
-          embedding = await embedFn(embedText);
+          embedding = await embedFn(embedText, "db");
         } catch {}
       }
 

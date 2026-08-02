@@ -42,7 +42,7 @@ export class Recaller {
 
     if (this.embed) {
       try {
-        const vec = await this.embed(query);
+        const vec = await this.embed(query, "query");
         const scored = await vectorSearchWithScore(this.driver, vec, Math.ceil(limit / 2));
         seeds = scored.map(s => s.node);
 
@@ -108,7 +108,7 @@ export class Recaller {
 
     if (this.embed) {
       try {
-        const vec = await this.embed(query);
+        const vec = await this.embed(query, "query");
         const scoredCommunities = await communityVectorSearch(this.driver, vec);
 
         if (scoredCommunities.length > 0) {
@@ -184,7 +184,7 @@ export class Recaller {
     if (existingHash === hash) return;
     try {
       const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
-      const vec = await this.embed(text);
+      const vec = await this.embed(text, "db");
       if (vec.length) await saveVector(this.driver, node.id, node.content, vec);
     } catch {}
   }

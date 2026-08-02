@@ -1,53 +1,135 @@
 /**
- * graph-memory
+ * graph-memory-pro — Embedding 服务
  *
- * By: adoresever
- * Email: Wywelljob@gmail.com
- */
-
-/**
- * Embedding 服务
+ * 可选模块：配了 embedding.apiKey（或本地 baseURL）才启用，否则返回 null → 降级 Neo4j 文本搜索
  *
- * 可选模块：配了 embedding.apiKey 才启用，否则返回 null → 降级 Neo4j 文本搜索
+ * 兼容 OpenAI、阿里云 DashScope、MiniMax (MiniMax CodePlan)、Jina、Ollama、llama.cpp 等。
  *
- * 支持：
- *   OpenAI     baseURL=https://api.openai.com/v1  model=text-embedding-3-small
- *   Ollama     baseURL=http://localhost:11434/v1   model=nomic-embed-text
- *   任意 OpenAI 兼容端点
+ * MiniMax (MiniMax CodePlan) 是特例：
+ *   - 端点走 anthropic 协议但 embeddings 用 OpenAI 风格变体
+ *   - 请求体用 `texts: [...]` + `type: "db" | "query"`（不走 OpenAI 的 `input`）
+ *   - 响应字段是 `data[0].vector`（不是 `data[0].embedding`）
+ *   - 维度固定 1536，不接受 `dimensions` 参数
+ *
+ * 内置 429/5xx 重试 3 次 + 10s 超时
  */
 
 import type { EmbeddingConfig } from "../types.ts";
 
-export type EmbedFn = (text: string) => Promise<number[]>;
+export type EmbedMode = "db" | "query";
+export type EmbedFn = (text: string, mode?: EmbedMode) => Promise<number[]>;
+
+// ─── 带重试 + 超时的 fetch ─────────────────────────────────────
+
+const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+
+async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 10_000): Promise<Response> {
+  for (let i = 0; i <= retries; i++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok || i >= retries || !RETRYABLE.has(res.status)) return res;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
+    } catch (err: any) {
+      clearTimeout(t);
+      if (i >= retries) throw err;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  throw new Error("[graph-memory-pro] embed fetch failed after retries");
+}
+
+// ─── Provider 识别 ───────────────────────────────────────────
+
+/**
+ * 识别 MiniMax CodePlan 端点。
+ * 海外 minimax.io 国内打不开，所以 baseURL 主要是 api.minimaxi.com / minimax.chat。
+ */
+export function isMinimaxEndpoint(baseURL: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(baseURL).hostname.toLowerCase();
+  } catch {
+    try {
+      hostname = new URL(`https://${baseURL}`).hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
+  return ["minimaxi.com", "minimax.chat", "minimax.io"].some(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
+}
+
+// ─── EmbedFn 工厂 ───────────────────────────────────────────
 
 export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<EmbedFn | null> {
-  if (!cfg?.apiKey) return null;
+  // Local OpenAI-compatible servers commonly do not require a key. A key by
+  // itself still selects the default OpenAI endpoint; a URL by itself selects
+  // an unauthenticated local/custom endpoint.
+  if (!cfg || (!cfg.apiKey && !cfg.baseURL)) return null;
+  // Bind to a non-optional local so TS narrows it inside the callEmbedding closure.
+  const config: EmbeddingConfig = cfg;
 
-  const baseURL    = cfg.baseURL    ?? "https://api.openai.com/v1";
-  const model      = cfg.model      ?? "text-embedding-3-small";
-  const dimensions = cfg.dimensions ?? 512;
+  const baseURL    = (config.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
+  const model      = config.model ?? "text-embedding-3-small";
+  const dimensions = config.dimensions && config.dimensions > 0 ? config.dimensions : undefined;
+  const minimax    = isMinimaxEndpoint(baseURL);
+  const apiKey     = config.apiKey;
+
+  /**
+   * 构造请求 body。MiniMax 走 texts+type 分支，其他 OpenAI 兼容端点维持原行为。
+   * type: db=入库, query=查询（MiniMax 内部用不同模型）
+   */
+  function buildBody(input: string, mode: EmbedMode): Record<string, unknown> {
+    if (minimax) {
+      return {
+        model,
+        texts: [input],
+        type: mode,
+      };
+    }
+    const body: Record<string, unknown> = { model, input };
+    if (dimensions) body.dimensions = dimensions;
+    return body;
+  }
+
+  async function callEmbedding(input: string, mode: EmbedMode): Promise<number[]> {
+    const res = await fetchRetry(`${baseURL}/embeddings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { "Authorization": `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify(buildBody(input, mode)),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`[graph-memory-pro] Embedding API ${res.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data = await res.json() as any;
+    const item = data?.data?.[0];
+    const embedding: number[] | undefined = minimax ? item?.vector : item?.embedding;
+    if (!Array.isArray(embedding) || !embedding.length) {
+      throw new Error("[graph-memory-pro] Embedding API returned empty embedding");
+    }
+    return embedding;
+  }
 
   try {
-    const { default: OpenAI } = await import("openai");
-    const client = new OpenAI({ apiKey: cfg.apiKey, baseURL });
+    const probe = await callEmbedding("ping", "query");
+    if (!probe.length) return null;
 
-    // 验证连通性
-    const probe = await client.embeddings.create({
-      model,
-      input: "ping",
-      ...(dimensions ? { dimensions } : {}),
-    });
-    if (!probe.data?.[0]?.embedding?.length) return null;
-
-    return async (text: string): Promise<number[]> => {
-      const res = await client.embeddings.create({
-        model,
-        input: text.slice(0, 8000),
-        ...(dimensions ? { dimensions } : {}),
-      });
-      return res.data[0]?.embedding ?? [];
+    return async (text: string, mode: EmbedMode = "db"): Promise<number[]> => {
+      return callEmbedding(text.slice(0, 8000), mode);
     };
-  } catch {
+  } catch (err) {
+    console.error(`[graph-memory-pro] embedding probe failed:`, err);
     return null;
   }
 }
