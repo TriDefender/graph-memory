@@ -1,5 +1,9 @@
 # graph-memory v1.x (SQLite) → graph-memory-pro v2.0 (Neo4j) 迁移指南
 
+> **适用场景 / Scope**：仅用于 **Windows v1.x → Linux v2.0** 的跨平台数据迁移。
+> 纯 Linux 全新安装**无需此文档**，直接运行 `bash setup-graph-memory-pro.sh`。
+> 详见 [发布线说明](../docs/RELEASE-LINE.md)。
+
 将旧版 graph-memory（SQLite + FTS5）的知识图谱迁移到 graph-memory-pro v2.0（Neo4j 5 + APOC + GDS）。
 
 ## 迁移内容
@@ -153,12 +157,13 @@ WSL 会话退出杀 daemon。解法：用 tmux console 模式（见第 2 步）�
 
 ```
 migrate/
-├── Migrate.md              本文档
+├── Migrate.md              本文档（仅 Windows→Linux 迁移用）
 ├── backup.py               SQLite 在线备份（WAL 合并，一致性快照）
 ├── migrate.py              核心转换脚本（SQLite → Neo4j）
+├── rollback.py             v2.0 → v1.x 回滚（还原 openclaw.json + 校验 SQLite）
 ├── extract_unextracted.ts  可选：批量提取未提取消息（旧插件 deepseek 并发）
 ├── patch_config.py         迁移后：复制 llm/embedding 配置到新插件
-└── install-wsl.sh          WSL 一键安装 + 迁移 runbook
+└── install-wsl.sh          WSL 一键安装 + 迁移 runbook（仅 Windows→Linux 路径）
 ```
 
 ## migrate.py 用法

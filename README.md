@@ -22,6 +22,10 @@ This repository is the Linux-portable counterpart of the Windows `v2.0.0` releas
 - Neo4j 5.24.2 with APOC 5.24.2
 - GDS 2.12.0 is strongly recommended for PageRank; without it, ranking falls back to a basic order
 
+## Release Line
+
+This branch is the **v2.0 desktop-2.0 release line** (Neo4j backend), separate from the v1.x mainline (SQLite). See [`docs/RELEASE-LINE.md`](docs/RELEASE-LINE.md) for the branch / version / test-asset boundaries.
+
 ## Linux Quick Start
 
 Run the setup script from this repository on Linux:
@@ -37,10 +41,22 @@ Useful modes:
 ```bash
 bash setup-graph-memory-pro.sh --dry-run
 bash setup-graph-memory-pro.sh --skip-neo4j --neo4j-uri bolt://localhost:7687 --neo4j-password 'your-password'
-bash setup-graph-memory-pro.sh --uninstall
+bash setup-graph-memory-pro.sh --skip-autostart      # 不配置开机自启
+bash setup-graph-memory-pro.sh --assume-deps         # 跳过 curl/tar/jq/java 依赖检查
+bash setup-graph-memory-pro.sh --uninstall           # 还原配置 + 清理自启 + 停止 Neo4j
 ```
 
 Neo4j binds to `127.0.0.1` and uses Bolt port `7687` by default.
+
+### Boot autostart (no sudo)
+
+The installer configures Neo4j to start at boot with a 3-tier no-sudo fallback:
+
+1. **systemd --user unit** (`~/.config/systemd/user/graph-memory-pro-neo4j.service`) — preferred, adds `systemctl --user` management. Best-effort `loginctl enable-linger` for boot-time start.
+2. **cron `@reboot`** — always configured as a backup so Neo4j starts even when linger is unavailable.
+3. **shell rc hook** (`~/.bashrc` / `~/.zshrc` idempotent `pgrep` guard) — last resort when systemd and cron are both unavailable.
+
+`--uninstall` cleans up all three. Only Java and jq system installs may need `sudo` (the script suggests `sdkman!` and a static `jq` binary as no-sudo alternatives).
 
 ## Manual Configuration
 
@@ -128,11 +144,22 @@ Inspect the graph with the bundled Cypher shell:
 
 ```bash
 npm install
-npm run build
-npm test
+npm run build     # tsc --noEmit
+npm test          # unit tests only (no Neo4j required)
 ```
 
-`npm run build` performs TypeScript typechecking only. The current port has no live-Neo4j integration suite; add integration tests against Neo4j before changing storage or Cypher behavior.
+### Integration tests
+
+Storage / Cypher / graph-algorithm changes are covered by integration tests that need a live Neo4j with APOC and GDS:
+
+```bash
+# 本地跑：先启动 Neo4j 5.24.2 + APOC + GDS，然后
+NEO4J_INTEGRATION=1 npm test
+```
+
+CI runs them via a Docker Neo4j service container — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+`npm run build` performs TypeScript typechecking only. Add integration tests under `test/integration.*.test.ts` whenever you change storage or Cypher behavior; unit tests cover pure logic only.
 
 ## License
 

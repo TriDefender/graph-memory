@@ -12,18 +12,29 @@
 #  用法 / Usage：
 #    bash setup-graph-memory-pro.sh                       # 全新安装（交互式填 API Key）
 #    bash setup-graph-memory-pro.sh --dry-run             # 只展示，不执行
-#    bash setup-graph-memory-pro.sh --uninstall           # 还原配置 + 停止 Neo4j
+#    bash setup-graph-memory-pro.sh --uninstall           # 还原配置 + 停止 Neo4j + 清理自启
 #    bash setup-graph-memory-pro.sh --skip-neo4j          # 复用已存在的 Neo4j（只装插件+写配置）
 #    bash setup-graph-memory-pro.sh --skip-gds            # 不装 GDS（PageRank 会降级为均匀分）
+#    bash setup-graph-memory-pro.sh --skip-autostart      # 不配置 Neo4j 开机自启
+#    bash setup-graph-memory-pro.sh --assume-deps         # 跳过 curl/tar/jq/java 依赖检查
 #    bash setup-graph-memory-pro.sh --neo4j-password XXX  # 指定 Neo4j 密码（非交互）
 #    bash setup-graph-memory-pro.sh --neo4j-version 5.26.0 --apoc-version 5.26.0
 #    bash setup-graph-memory-pro.sh --no-restart          # 装完不重启 gateway
+#
+#  开机自启 / Autostart（无 sudo 三级降级 / no-sudo 3-tier fallback）：
+#    仅在自建 Neo4j（非 --skip-neo4j）时配置。优先级：
+#      1) systemd --user unit（~/.config/systemd/user/graph-memory-pro-neo4j.service）
+#         额外尝试 loginctl enable-linger（成功则开机即起，失败则降级 cron 兜底）
+#      2) cron @reboot（总是作为兜底配置，无 linger 时由 cron 在开机时拉起）
+#      3) shell rc hook（~/.bashrc / ~/.zshrc 幂等片段，仅在以上都不可用时降级）
+#    卸载时（--uninstall）自动清理所有上述条目。
 #
 #  安全机制 / Safety：
 #    - 改 openclaw.json 前自动备份
 #    - 用 jq --arg 注入 API Key / 密码，杜绝命令注入
 #    - Neo4j 只监听 127.0.0.1，不暴露公网
 #    - 所有下载校验 HTTP 状态，失败即中止
+#    - 自启动仅写入用户私有目录（~/.config、用户 crontab、~/.bashrc），不触碰系统服务
 # ============================================================
 
 set -euo pipefail
@@ -60,18 +71,23 @@ DRY_RUN=false
 UNINSTALL=false
 SKIP_NEO4J=false
 SKIP_GDS=false
+SKIP_AUTOSTART=false
+ASSUME_DEPS=false
 NO_RESTART=false
 NEO4J_PASSWORD=""
 NEO4J_USER="neo4j"
 NEO4J_URI=""                 # 留空 → 根据是否自建 Neo4j 自动决定
 PLUGIN_REF=""
 INTERACTIVE=true
+AUTOSTART_METHODS=()         # configure_autostart 写入；卸载与完成提示读取
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)        DRY_RUN=true ;;
     --uninstall)      UNINSTALL=true ;;
     --skip-neo4j)     SKIP_NEO4J=true ;;
     --skip-gds)       SKIP_GDS=true ;;
+    --skip-autostart) SKIP_AUTOSTART=true ;;
+    --assume-deps)    ASSUME_DEPS=true ;;
     --no-restart)     NO_RESTART=true ;;
     --non-interactive) INTERACTIVE=false ;;
     --neo4j-version)  shift; NEO4J_VERSION="${1:?--neo4j-version 需要参数}" ;;
@@ -154,11 +170,154 @@ wait_port() { # wait_port <host> <port> <seconds>
   return 1
 }
 
+# ── 开机自启：无 sudo 三级降级 ──────────────────────────────────
+# systemd --user（首选）+ cron @reboot（兜底）+ shell rc hook（最低保障）
+# 设计：cron 总是配置作为兜底，systemd --user 可用时额外提供 systemctl 管理接口
+# 副作用：写入 ~/.config/systemd/user/、用户 crontab、~/.bashrc 或 ~/.zshrc
+AUTOSTART_MARKER="# gmp-neo4j-autostart"
+SYSTEMD_UNIT_NAME="graph-memory-pro-neo4j.service"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SYSTEMD_UNIT_FILE="$SYSTEMD_USER_DIR/$SYSTEMD_UNIT_NAME"
+
+write_systemd_unit() {
+  mkdir -p "$SYSTEMD_USER_DIR"
+  cat > "$SYSTEMD_UNIT_FILE" <<UNIT
+[Unit]
+Description=graph-memory-pro Neo4j (user-level, no sudo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=$NEO4J_DIR/bin/neo4j start
+ExecStop=$NEO4J_DIR/bin/neo4j stop
+PIDFile=$NEO4J_DIR/run/neo4j.pid
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+Environment=HOME=$HOME
+
+[Install]
+WantedBy=default.target
+UNIT
+}
+
+configure_autostart() {
+  AUTOSTART_METHODS=()
+  if $DRY_RUN; then
+    dry "mkdir -p $SYSTEMD_USER_DIR && write $SYSTEMD_UNIT_FILE"
+    dry "systemctl --user daemon-reload && systemctl --user enable $SYSTEMD_UNIT_NAME"
+    dry "loginctl enable-linger $USER (best-effort, no sudo)"
+    dry "crontab -l | grep -v $AUTOSTART_MARKER; add @reboot $NEO4J_DIR/bin/neo4j start"
+    dry "shell rc fallback: append idempotent pgrep hook to ~/.bashrc (only if systemd+cron fail)"
+    AUTOSTART_METHODS+=("dry-run preview")
+    return 0
+  fi
+
+  # Tier 1: systemd --user（首选）
+  if command -v systemctl &>/dev/null && systemctl --user list-units >/dev/null 2>&1; then
+    write_systemd_unit
+    if systemctl --user daemon-reload 2>/dev/null \
+       && systemctl --user enable "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1; then
+      AUTOSTART_METHODS+=("systemd --user ($SYSTEMD_UNIT_NAME)")
+      # linger：让 user unit 在用户未登录时也运行。无需 sudo 的 polkit 配置下可成功，否则 warn
+      if command -v loginctl &>/dev/null; then
+        if loginctl show-user "$USER" 2>/dev/null | grep -q "^Linger=yes"; then
+          success "  systemd --user 已就绪，linger 已启用 / linger active"
+        elif loginctl enable-linger "$USER" 2>/dev/null; then
+          success "  systemd --user 已就绪，linger 已启用 / linger enabled"
+        else
+          warn "  linger 需要 root（polkit），user unit 仅登录后启动 / linger needs root, unit starts after login"
+          warn "    管理员执行 / admin runs: sudo loginctl enable-linger $USER"
+          warn "    在那之前，cron @reboot 会兜底（见下）/ cron @reboot will cover the gap"
+        fi
+      fi
+    fi
+  fi
+
+  # Tier 2: cron @reboot（总是配置作为兜底，不依赖 linger）
+  if command -v crontab &>/dev/null; then
+    local line="@reboot $NEO4J_DIR/bin/neo4j start >> \"$NEO4J_DIR/logs/autostart.log\" 2>&1 $AUTOSTART_MARKER"
+    local tmp; tmp=$(mktemp)
+    (crontab -l 2>/dev/null | grep -v "$AUTOSTART_MARKER" || true) > "$tmp"
+    echo "$line" >> "$tmp"
+    if crontab "$tmp" 2>/dev/null; then
+      AUTOSTART_METHODS+=("cron @reboot")
+    fi
+    rm -f "$tmp"
+  fi
+
+  # Tier 3: shell rc hook（仅在前两者都失败时降级）
+  if [[ ${#AUTOSTART_METHODS[@]} -eq 0 ]]; then
+    local rc_target=""
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+      [[ -f "$rc" ]] && rc_target="$rc" && break
+    done
+    [[ -z "$rc_target" ]] && rc_target="$HOME/.bashrc"
+    if ! grep -q "$AUTOSTART_MARKER" "$rc_target" 2>/dev/null; then
+      cat >> "$rc_target" <<HOOK
+
+$AUTOSTART_MARKER
+if ! pgrep -f "$NEO4J_DIR" >/dev/null 2>&1; then
+  nohup "$NEO4J_DIR/bin/neo4j" start >> "$NEO4J_DIR/logs/autostart.log" 2>&1 &
+fi
+HOOK
+      AUTOSTART_METHODS+=("shell rc ($rc_target)")
+    else
+      AUTOSTART_METHODS+=("shell rc ($rc_target, 已存在)")
+    fi
+    warn "  systemd/cron 均不可用，降级到 $rc_target（登录时拉起）/ degraded to shell rc hook"
+  fi
+
+  if [[ ${#AUTOSTART_METHODS[@]} -gt 0 ]]; then
+    success "开机自启已配置 / Autostart configured: ${AUTOSTART_METHODS[*]}"
+  else
+    warn "未能配置开机自启，请手动启动 / Manual start required: $NEO4J_DIR/bin/neo4j start"
+  fi
+}
+
+remove_autostart() {
+  $DRY_RUN && { dry "remove_autostart (systemd --user + cron + shell rc)"; return 0; }
+  local cleaned=()
+
+  if command -v systemctl &>/dev/null && [[ -f "$SYSTEMD_UNIT_FILE" ]]; then
+    systemctl --user disable --now "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_UNIT_FILE"
+    systemctl --user daemon-reload 2>/dev/null || true
+    cleaned+=("systemd --user unit")
+  fi
+
+  if command -v crontab &>/dev/null; then
+    local tmp; tmp=$(mktemp)
+    (crontab -l 2>/dev/null | grep -v "$AUTOSTART_MARKER" || true) > "$tmp"
+    if crontab "$tmp" 2>/dev/null; then
+      cleaned+=("cron @reboot entry")
+    fi
+    rm -f "$tmp"
+  fi
+
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [[ -f "$rc" ]] && grep -q "$AUTOSTART_MARKER" "$rc"; then
+      local backup="${rc}.bak.$(date +%Y%m%d_%H%M%S)"
+      cp "$rc" "$backup"
+      sed -i "/$AUTOSTART_MARKER/,/^fi\$/d; /^$/N;/^\n$/D" "$rc"
+      cleaned+=("$rc hook (备份 $backup)")
+    fi
+  done
+
+  if [[ ${#cleaned[@]} -gt 0 ]]; then
+    info "自启动已清理 / Autostart removed: ${cleaned[*]}"
+  fi
+}
+
 # ============================================================
 #  卸载流程
 # ============================================================
 if $UNINSTALL; then
   info "进入卸载模式 / Uninstall mode..."
+
+  # 先清理自启动条目（避免停 Neo4j 后又被自启拉起）
+  remove_autostart
 
   # 还原 openclaw.json
   if [[ -f "$OPENCLAW_JSON" ]]; then
@@ -207,13 +366,22 @@ fi
 # ── Step 1: 环境检查 ──
 info "第 1 步：环境检查 / Environment check..."
 
-command -v curl &>/dev/null || fail "缺少 curl / curl not found"
-command -v tar  &>/dev/null || fail "缺少 tar / tar not found"
-if ! command -v jq &>/dev/null; then
-  warn "缺少 jq / jq missing —— 配置写入需要它 / config writes require jq"
-  echo "    安装 / Install: sudo apt install jq   |   sudo dnf install jq   |   brew install jq"
-  $INTERACTIVE || fail "非交互模式下 jq 必需 / jq required in --non-interactive"
-  read -rp "    继续？/ Continue without jq? (y/n) [n]: " C; [[ "$C" =~ ^[yY]$ ]] || exit 0
+if $ASSUME_DEPS; then
+  warn "--assume-deps：跳过 curl/tar/jq/java 依赖检查 / skip dep checks（自负责保证已安装 / ensure they exist）"
+else
+  command -v curl &>/dev/null || fail "缺少 curl / curl not found"
+  command -v tar  &>/dev/null || fail "缺少 tar / tar not found"
+  if ! command -v jq &>/dev/null; then
+    warn "缺少 jq / jq missing —— 配置写入需要它 / config writes require jq"
+    echo "    安装（任选其一 / pick one）:"
+    echo "      sudo apt install jq             # Debian/Ubuntu"
+    echo "      sudo dnf install jq             # Fedora/RHEL"
+    echo "      brew install jq                 # Homebrew (Linuxbrew)"
+    echo "      # 无 sudo 替代 / no-sudo: 下载静态二进制到 ~/.local/bin"
+    echo "      mkdir -p ~/.local/bin && curl -fL https://github.com/jqlang/jq/releases/latest/download/jq-linux64 -o ~/.local/bin/jq && chmod +x ~/.local/bin/jq"
+    $INTERACTIVE || fail "非交互模式下 jq 必需 / jq required in --non-interactive"
+    read -rp "    继续？/ Continue without jq? (y/n) [n]: " C; [[ "$C" =~ ^[yY]$ ]] || exit 0
+  fi
 fi
 
 # OS / arch
@@ -228,20 +396,24 @@ success "OS=$OS ARCH=$ARCH_TAG"
 
 # Java 17（Neo4j 5.x 依赖）— 仅自建 Neo4j 时需要
 if ! $SKIP_NEO4J; then
-  if command -v java &>/dev/null; then
+  if $ASSUME_DEPS; then
+    info "--assume-deps：跳过 Java 检查 / skip Java check（启动失败时再排查 / troubleshoot on startup failure）"
+  elif command -v java &>/dev/null; then
     JAVA_MAJOR=$(java -version 2>&1 | head -1 | sed -E 's/.*"([0-9]+)\..*/\1/')
-    # java 8 报 "1.8"
     [[ "$JAVA_MAJOR" == "1" ]] && JAVA_MAJOR=$(java -version 2>&1 | head -1 | sed -E 's/"1\.([0-9]+)\..*/\1/')
     if (( JAVA_MAJOR < 17 )); then
       fail "Java 版本过低 ($JAVA_MAJOR)，Neo4j 5.x 需要 JDK 17+ / Neo4j 5.x requires JDK 17+
-    安装 / Install:
-      sudo apt install -y openjdk-17-jdk
-      sudo dnf install -y java-17-openjdk"
+    安装（任选其一 / pick one）:
+      sudo apt install -y openjdk-17-jdk        # Debian/Ubuntu
+      sudo dnf install -y java-17-openjdk        # Fedora/RHEL
+      # 无 sudo 替代 / no-sudo: sdkman! 或下载 JDK 解压
+      curl -s \"https://get.sdkman.io\" | bash && source \"\$HOME/.sdkman/bin/sdkman-init.sh\" && sdk install java 17.0.13-tem"
     fi
     success "Java $JAVA_MAJOR"
   else
     fail "未找到 java / java not found。Neo4j 5.x 需要 JDK 17：
-    sudo apt install -y openjdk-17-jdk   |   sudo dnf install -y java-17-openjdk"
+    sudo apt install -y openjdk-17-jdk | sudo dnf install -y java-17-openjdk
+    无 sudo / no-sudo: curl -s https://get.sdkman.io | bash && source \$HOME/.sdkman/bin/sdkman-init.sh && sdk install java 17.0.13-tem"
   fi
 fi
 
@@ -403,6 +575,19 @@ fi
 
 success "Neo4j: $NEO4J_URI  (user=$NEO4J_USER)"
 
+# ── Step 3.5: 配置 Neo4j 开机自启（无 sudo 三级降级）──
+# 仅自建 Neo4j 路径下配置；--skip-neo4j 跳过（复用外部 Neo4j 应由其自身管理）
+echo ""
+if $SKIP_NEO4J; then
+  info "第 3.5 步：跳过开机自启（--skip-neo4j，外部 Neo4j 自管）/ Skip autostart (external Neo4j)"
+elif $SKIP_AUTOSTART; then
+  info "第 3.5 步：跳过开机自启（--skip-autostart）/ Skip autostart config"
+  warn "  Neo4j 重启后需手动启动 / Manual start after reboot: $NEO4J_DIR/bin/neo4j start"
+else
+  info "第 3.5 步：配置 Neo4j 开机自启 / Configure autostart（无 sudo / no sudo）..."
+  configure_autostart
+fi
+
 # ── Step 4: 安装插件 ──
 echo ""
 info "第 4 步：安装 graph-memory-pro 插件 / Install plugin..."
@@ -543,6 +728,11 @@ echo -e "  Neo4j 用户 : $NEO4J_USER"
 [[ -n "$NEO4J_PASSWORD" ]] && echo -e "  Neo4j 密码 : ${YELLOW}$NEO4J_PASSWORD${NC}  （已写入 openclaw.json）"
 echo -e "  插件路径   : $PLUGIN_SRC"
 echo -e "  配置文件   : $OPENCLAW_JSON"
+if ! $SKIP_NEO4J && ! $SKIP_AUTOSTART && [[ ${#AUTOSTART_METHODS[@]} -gt 0 ]]; then
+  echo -e "  ${BOLD}开机自启 / Autostart:${NC} ${AUTOSTART_METHODS[*]}"
+  echo    "    管理命令 / manage: systemctl --user {status|stop|start} $SYSTEMD_UNIT_NAME  (systemd 路径)"
+  echo    "                 crontab -l | grep $AUTOSTART_MARKER  (查看 cron 条目)"
+fi
 echo ""
 echo -e "  ${BOLD}验证 / Verify:${NC}"
 echo    "    openclaw gateway --verbose   # 启动日志应见 [graph-memory-pro] ready"
