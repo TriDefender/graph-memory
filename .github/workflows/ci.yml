@@ -11,24 +11,22 @@ jobs:
     name: TypeScript typecheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "npm"
-      - run: npm ci
+      - run: npm install --no-audit --no-fund
       - run: npm run build
 
   unit-tests:
     name: Unit tests (no DB)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "npm"
-      - run: npm ci
+      - run: npm install --no-audit --no-fund
       - run: npm test
         env:
           # 不设 NEO4J_INTEGRATION，集成测试自动 skip
@@ -56,12 +54,11 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: "npm"
-      - run: npm ci
+      - run: npm install --no-audit --no-fund
       - name: Wait for Neo4j plugins (APOC/GDS) load
         run: |
           echo "Waiting for Neo4j + APOC + GDS to be ready..."
@@ -84,9 +81,21 @@ jobs:
     name: Shell script syntax check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: bash -n syntax check
         run: |
+          # 用 if/then 控制流，避免 set -e 在文件不存在时让 job 失败
+          status=0
           for f in setup-graph-memory-pro.sh migrate/install-wsl.sh; do
-            [[ -f "$f" ]] && bash -n "$f" && echo "OK: $f"
+            if [[ -f "$f" ]]; then
+              if bash -n "$f"; then
+                echo "OK: $f"
+              else
+                echo "FAIL: $f"
+                status=1
+              fi
+            else
+              echo "SKIP (not in repo): $f"
+            fi
           done
+          exit $status
