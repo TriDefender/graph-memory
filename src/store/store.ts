@@ -9,7 +9,7 @@ import type { Driver, Session } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { createHash } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType } from "../types.ts";
-import { NODE_TYPE_TO_LABEL } from "../types.ts";
+import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
 import { getSession } from "./db.ts";
 
 /** Neo4j LIMIT/索引参数必须是 Integer */
@@ -156,7 +156,8 @@ export async function upsertNode(
   sessionId: string,
 ): Promise<{ node: GmNode; isNew: boolean }> {
   const name = normalizeName(c.name);
-  const label = NODE_TYPE_TO_LABEL[c.type as NodeType] ?? "Skill";
+  const label = NODE_TYPE_TO_LABEL[c.type as NodeType];
+  if (!label) throw new Error(`[graph-memory-pro] Invalid node type: ${String(c.type)}`);
   const session = getSession(driver);
   try {
     // Try to find existing node with this name across all knowledge labels
@@ -348,9 +349,19 @@ export async function updateCommunities(driver: Driver, labels: Map<string, stri
 export async function upsertEdge(
   driver: Driver,
   e: { fromId: string; toId: string; type: EdgeType; instruction: string; condition?: string; sessionId: string },
-): Promise<void> {
+): Promise<boolean> {
   const session = getSession(driver);
   try {
+    // TypeScript 类型不能保护 LLM/HTTP 运行时输入；按数据库中的真实端点类型复核。
+    const endpoints = await session.run(`
+      MATCH (a:Task|Skill|Event {id: $fromId}), (b:Task|Skill|Event {id: $toId})
+      RETURN a.type AS fromType, b.type AS toType
+    `, { fromId: e.fromId, toId: e.toId });
+    if (endpoints.records.length === 0) return false;
+    const fromType = endpoints.records[0].get("fromType");
+    const toType = endpoints.records[0].get("toType");
+    if (!isValidEdgeDirection(e.type, fromType, toType)) return false;
+
     // 检查是否已存在同 from+to+type 的边
     const existing = await session.run(`
       MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
@@ -387,6 +398,7 @@ export async function upsertEdge(
         now: Date.now(),
       });
     }
+    return true;
   } finally {
     await session.close();
   }

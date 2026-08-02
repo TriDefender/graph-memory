@@ -6,30 +6,13 @@
  */
 
 import type { GmConfig, ExtractionResult, FinalizeResult } from "../types.ts";
+import { EDGE_TYPES, isValidEdgeDirection } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
 
 // ─── 节点/边合法值 ──────────────────────────────────────────────
 
 const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT"]);
-const VALID_EDGE_TYPES = new Set(["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"]);
-
-/** 边类型 → 合法的 from 节点类型 */
-const EDGE_FROM_CONSTRAINT: Record<string, Set<string>> = {
-  USED_SKILL:     new Set(["TASK"]),
-  SOLVED_BY:      new Set(["EVENT", "SKILL"]),
-  REQUIRES:       new Set(["SKILL"]),
-  PATCHES:        new Set(["SKILL"]),
-  CONFLICTS_WITH: new Set(["SKILL"]),
-};
-
-/** 边类型 → 合法的 to 节点类型 */
-const EDGE_TO_CONSTRAINT: Record<string, Set<string>> = {
-  USED_SKILL:     new Set(["SKILL"]),
-  SOLVED_BY:      new Set(["SKILL"]),
-  REQUIRES:       new Set(["SKILL"]),
-  PATCHES:        new Set(["SKILL"]),
-  CONFLICTS_WITH: new Set(["SKILL"]),
-};
+const VALID_EDGE_TYPES = new Set<string>(EDGE_TYPES);
 
 // ─── 提取 System Prompt ─────────────────────────────────────────
 
@@ -196,17 +179,20 @@ export function normalizeName(name: string): string {
  *   EVENT → SKILL + 任何非 SOLVED_BY → 修正为 SOLVED_BY
  *   方向约束不满足 → 丢弃该边
  */
-function correctEdgeType(
+export function correctEdgeType(
   edge: { from: string; to: string; type: string; instruction: string; condition?: string },
   nameToType: Map<string, string>,
 ): typeof edge | null {
   const fromType = nameToType.get(normalizeName(edge.from));
   const toType = nameToType.get(normalizeName(edge.to));
 
-  // 无法确定节点类型时原样返回
-  if (!fromType || !toType) return edge;
-
   let type = edge.type;
+
+  // 即使端点类型未知，也必须先拒绝白名单外的关系类型。
+  if (!VALID_EDGE_TYPES.has(type)) return null;
+
+  // 已有节点的类型可能不在本轮输出中；存储层会再次按真实端点类型校验。
+  if (!fromType || !toType) return edge;
 
   // TASK → SKILL 必须是 USED_SKILL
   if (fromType === "TASK" && toType === "SKILL" && type !== "USED_SKILL") {
@@ -218,15 +204,8 @@ function correctEdgeType(
     type = "SOLVED_BY";
   }
 
-  // 验证修正后的类型是否合法
-  if (!VALID_EDGE_TYPES.has(type)) {
-    return null;
-  }
-
   // 验证方向约束
-  const fromOk = EDGE_FROM_CONSTRAINT[type]?.has(fromType) ?? false;
-  const toOk = EDGE_TO_CONSTRAINT[type]?.has(toType) ?? false;
-  if (!fromOk || !toOk) {
+  if (!isValidEdgeDirection(type, fromType, toType)) {
     return null;
   }
 

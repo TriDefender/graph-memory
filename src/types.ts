@@ -36,12 +36,38 @@ export interface GmNode {
 
 // ─── 边 ───────────────────────────────────────────────────────
 
-export type EdgeType =
-  | "USED_SKILL"
-  | "SOLVED_BY"
-  | "REQUIRES"
-  | "PATCHES"
-  | "CONFLICTS_WITH";
+export const EDGE_TYPES = [
+  "USED_SKILL",
+  "SOLVED_BY",
+  "REQUIRES",
+  "PATCHES",
+  "CONFLICTS_WITH",
+] as const;
+
+export type EdgeType = (typeof EDGE_TYPES)[number];
+
+const EDGE_DIRECTION_RULES: Record<EdgeType, {
+  from: readonly NodeType[];
+  to: readonly NodeType[];
+}> = {
+  USED_SKILL:     { from: ["TASK"], to: ["SKILL"] },
+  SOLVED_BY:      { from: ["EVENT", "SKILL"], to: ["SKILL"] },
+  REQUIRES:       { from: ["SKILL"], to: ["SKILL"] },
+  PATCHES:        { from: ["SKILL"], to: ["SKILL"] },
+  CONFLICTS_WITH: { from: ["SKILL"], to: ["SKILL"] },
+};
+
+/** 运行时校验关系白名单及端点方向（LLM/HTTP 输入不能依赖 TS 类型）。 */
+export function isValidEdgeDirection(
+  type: string,
+  fromType: string,
+  toType: string,
+): type is EdgeType {
+  const rule = EDGE_DIRECTION_RULES[type as EdgeType];
+  return !!rule
+    && rule.from.includes(fromType as NodeType)
+    && rule.to.includes(toType as NodeType);
+}
 
 export interface GmEdge {
   id: string;

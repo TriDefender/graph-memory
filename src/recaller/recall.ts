@@ -17,6 +17,12 @@ import {
 import { getCommunityPeers } from "../graph/community.ts";
 import { personalizedPageRank } from "../graph/pagerank.ts";
 
+export function buildNodeEmbeddingText(
+  node: Pick<GmNode, "name" | "description" | "content">,
+): string {
+  return `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
+}
+
 export class Recaller {
   private embed: EmbedFn | null = null;
 
@@ -179,13 +185,13 @@ export class Recaller {
 
   async syncEmbed(node: GmNode): Promise<void> {
     if (!this.embed) return;
-    const hash = createHash("md5").update(node.content).digest("hex");
+    const text = buildNodeEmbeddingText(node);
+    const hash = createHash("md5").update(text).digest("hex");
     const existingHash = await getVectorHash(this.driver, node.id);
     if (existingHash === hash) return;
     try {
-      const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
       const vec = await this.embed(text, "db");
-      if (vec.length) await saveVector(this.driver, node.id, node.content, vec);
+      if (vec.length) await saveVector(this.driver, node.id, text, vec);
     } catch {}
   }
 }

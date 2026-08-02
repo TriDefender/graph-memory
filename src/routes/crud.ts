@@ -16,6 +16,7 @@ import type { Driver } from "neo4j-driver";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { Recaller } from "../recaller/recall.ts";
 import type { NodeType, EdgeType } from "../types.ts";
+import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
 import {
   upsertNode, findById, findByName, allActiveNodes, allEdges,
   upsertEdge, edgesFrom, edgesTo, deprecate, mergeNodes,
@@ -250,6 +251,7 @@ async function handleUpdateNode(
   // Build SET clause from provided fields
   const updates: string[] = [];
   const params: Record<string, unknown> = { id, now: Date.now() };
+  let newType: NodeType | undefined;
 
   if (body.description !== undefined) {
     updates.push("n.description = $description");
@@ -270,11 +272,14 @@ async function handleUpdateNode(
     params.newName = newName;
   }
   if (body.type !== undefined) {
-    const newType = (body.type as string).toUpperCase();
-    if (["TASK", "SKILL", "EVENT"].includes(newType)) {
-      updates.push("n.type = $newType");
-      params.newType = newType;
+    const candidate = typeof body.type === "string" ? body.type.toUpperCase() : "";
+    if (!["TASK", "SKILL", "EVENT"].includes(candidate)) {
+      json(res, 400, { error: `Invalid type: ${String(body.type)}. Must be TASK, SKILL, or EVENT` });
+      return true;
     }
+    newType = candidate as NodeType;
+    updates.push("n.type = $newType");
+    params.newType = newType;
   }
 
   updates.push("n.updatedAt = $now");
@@ -283,7 +288,9 @@ async function handleUpdateNode(
     const session = getSession(driver);
     try {
       await session.run(
-        `MATCH (n:Task|Skill|Event {id: $id}) SET ${updates.join(", ")}`,
+        `MATCH (n:Task|Skill|Event {id: $id})
+         SET ${updates.join(", ")}
+         ${newType ? `REMOVE n:Task, n:Skill, n:Event SET n:${NODE_TYPE_TO_LABEL[newType]}` : ""}`,
         params,
       );
     } finally {
@@ -363,6 +370,13 @@ async function handleMergeNodes(
   }
   if (!mergeNode) {
     json(res, 404, { error: `Merge node not found: ${mergeId}` });
+    return true;
+  }
+
+  if (keepNode.type !== mergeNode.type) {
+    json(res, 400, {
+      error: `Cannot merge different node types: ${keepNode.type} and ${mergeNode.type}`,
+    });
     return true;
   }
 
@@ -450,11 +464,23 @@ async function handleCreateEdge(
     return true;
   }
 
-  await upsertEdge(driver, {
+  if (!isValidEdgeDirection(type, fromNode.type, toNode.type)) {
+    json(res, 400, {
+      error: `Invalid ${type} direction: ${fromNode.type} -> ${toNode.type}`,
+    });
+    return true;
+  }
+
+  const stored = await upsertEdge(driver, {
     fromId, toId, type, instruction,
     condition,
     sessionId: "clawx-manual",
   });
+
+  if (!stored) {
+    json(res, 400, { error: "Edge endpoints are missing or incompatible" });
+    return true;
+  }
 
   json(res, 201, { success: true, fromId, toId, type });
   return true;

@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { sliceLastTurn, extractAssistantText, extractUserText } from "../index.ts";
+import {
+  sliceLastTurn,
+  extractAssistantText,
+  extractUserText,
+  prepareAssemblyMessages,
+} from "../index.ts";
 
 describe("sliceLastTurn (#5 旧轮裁剪，降 token)", () => {
   it("空消息返回空", () => {
@@ -53,6 +58,21 @@ describe("sliceLastTurn (#5 旧轮裁剪，降 token)", () => {
       { role: "tool", content: "short result" },
     ]);
     expect(result.messages.find(m => m.role === "tool")!.content).toBe("short result");
+  });
+});
+
+describe("prepareAssemblyMessages", () => {
+  it("即使没有图谱上下文也裁剪旧轮并返回真实 token 估算", () => {
+    const messages = Array.from({ length: 7 }, (_, i) => [
+      { role: "user", content: `question-${i}` },
+      { role: "assistant", content: `answer-${i}` },
+    ]).flat();
+
+    const result = prepareAssemblyMessages(messages);
+    expect(result.dropped).toBeGreaterThan(0);
+    expect(result.messages.length).toBeLessThan(messages.length);
+    expect(result.tokens).toBeGreaterThan(0);
+    expect(result.messages.every(m => Array.isArray(m.content))).toBe(true);
   });
 });
 

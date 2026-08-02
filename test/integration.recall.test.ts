@@ -13,7 +13,7 @@ import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.
 import {
   upsertNode, upsertEdge, saveVector, getVectorHash,
 } from "../src/store/store.ts";
-import { Recaller } from "../src/recaller/recall.ts";
+import { Recaller, buildNodeEmbeddingText } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
 
 const ENABLED = !!process.env.NEO4J_INTEGRATION;
@@ -113,7 +113,7 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
 
     // 先写入向量
     const initialVec = new Array(1024).fill(0).map((_, i) => Math.cos(i * 0.05));
-    await saveVector(driver, node.id, "stable content", initialVec);
+    await saveVector(driver, node.id, buildNodeEmbeddingText(node), initialVec);
     const hashBefore = await getVectorHash(driver, node.id);
     expect(hashBefore).not.toBeNull();
 
@@ -159,5 +159,25 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
     await recaller.syncEmbed(refetched);
 
     expect(embedCalled).toBe(true);
+  });
+
+  it("syncEmbed：仅 description 变化也会刷新 embedding", async () => {
+    const { node } = await upsertNode(driver, {
+      type: "SKILL", name: "syncembed-description-target",
+      description: "old description", content: "stable content",
+    }, TEST_SID);
+
+    const initialVec = new Array(1024).fill(0.25);
+    await saveVector(driver, node.id, buildNodeEmbeddingText(node), initialVec);
+
+    let embeddedText = "";
+    const recaller = new Recaller(driver, cfg);
+    recaller.setEmbedFn(async (text) => {
+      embeddedText = text;
+      return new Array(1024).fill(0.75);
+    });
+
+    await recaller.syncEmbed({ ...node, description: "new description" });
+    expect(embeddedText).toContain("new description");
   });
 });

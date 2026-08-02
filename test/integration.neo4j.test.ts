@@ -110,6 +110,20 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(incoming.some(e => e.type === "USED_SKILL")).toBe(true);
   });
 
+  it("upsertEdge 在存储层拒绝非法方向和白名单外类型", async () => {
+    const task = await findByName(driver, "deploy-app");
+    const skill = await findByName(driver, "cicd-pipeline");
+
+    expect(await upsertEdge(driver, {
+      fromId: skill!.id, toId: task!.id, type: "USED_SKILL",
+      instruction: "wrong direction", sessionId: TEST_SID,
+    })).toBe(false);
+    expect(await upsertEdge(driver, {
+      fromId: skill!.id, toId: skill!.id, type: "ARBITRARY_REL" as any,
+      instruction: "unknown type", sessionId: TEST_SID,
+    })).toBe(false);
+  });
+
   it("graphWalk 从 seed 遍历到关联节点", async () => {
     const seed = await findByName(driver, "deploy-app");
     expect(seed).not.toBeNull();

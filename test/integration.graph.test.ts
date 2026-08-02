@@ -80,7 +80,7 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
 
     await upsertEdge(driver, { fromId: nodes["gmpsrc-deploy"], toId: nodes["gmpsrc-compose"], type: "USED_SKILL", instruction: "uses", sessionId: TEST_SID });
     await upsertEdge(driver, { fromId: nodes["gmpsrc-compose"], toId: nodes["gmpsrc-port"], type: "REQUIRES", instruction: "needs", sessionId: TEST_SID });
-    await upsertEdge(driver, { fromId: nodes["gmpsrc-compose"], toId: nodes["gmpsrc-nginx"], type: "USED_SKILL", instruction: "uses", sessionId: TEST_SID });
+    await upsertEdge(driver, { fromId: nodes["gmpsrc-compose"], toId: nodes["gmpsrc-nginx"], type: "REQUIRES", instruction: "needs", sessionId: TEST_SID });
     await upsertEdge(driver, { fromId: nodes["gmpsrc-conda"], toId: nodes["gmpsrc-pip"], type: "REQUIRES", instruction: "needs", sessionId: TEST_SID });
 
     nodeIds = nodes;

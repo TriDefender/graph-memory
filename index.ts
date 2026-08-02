@@ -199,6 +199,18 @@ export function sliceLastTurn(
   return { messages: kept, tokens, dropped };
 }
 
+/** 图谱为空时也必须执行相同的裁剪、工具配对修复和 content 规范化。 */
+export function prepareAssemblyMessages(
+  messages: any[],
+): { messages: any[]; tokens: number; dropped: number } {
+  const sliced = sliceLastTurn(messages);
+  return {
+    messages: normalizeMessageContent(sanitizeToolUseResultPairing(sliced.messages)),
+    tokens: sliced.tokens,
+    dropped: sliced.dropped,
+  };
+}
+
 // ─── 插件对象 ─────────────────────────────────────────────────
 
 const graphMemoryProPlugin = {
@@ -391,9 +403,19 @@ const graphMemoryProPlugin = {
           }
         }
         const totalGmNodes = activeNodes.length + rec.nodes.length;
+        const prepared = prepareAssemblyMessages(messages);
 
         if (totalGmNodes === 0) {
-          return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
+          if (prepared.dropped > 0) {
+            api.logger.info(
+              `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
+              `dropped ${prepared.dropped} older msgs, graph ~0 tok`,
+            );
+          }
+          return {
+            messages: prepared.messages,
+            estimatedTokens: prepared.tokens,
+          };
         }
 
         const { xml, systemPrompt, tokens: gmTokens } = await assembleContext(driver, {
@@ -404,13 +426,10 @@ const graphMemoryProPlugin = {
           recalledEdges: rec.edges,
         });
 
-        const lastTurn = sliceLastTurn(messages);
-        const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
-
-        if (lastTurn.dropped > 0) {
+        if (prepared.dropped > 0) {
           api.logger.info(
-            `[graph-memory-pro] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
-            `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok`,
+            `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
+            `dropped ${prepared.dropped} older msgs, graph ~${gmTokens} tok`,
           );
         }
 
@@ -420,8 +439,8 @@ const graphMemoryProPlugin = {
         }
 
         return {
-          messages: normalizeMessageContent(repaired),
-          estimatedTokens: gmTokens + lastTurn.tokens,
+          messages: prepared.messages,
+          estimatedTokens: gmTokens + prepared.tokens,
           ...(systemPromptAddition ? { systemPromptAddition } : {}),
         };
       },
@@ -627,11 +646,15 @@ const graphMemoryProPlugin = {
         }),
         async execute(_toolCallId: string, p: any) {
           const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          if (!["TASK", "SKILL", "EVENT"].includes(p.type)) {
+            throw new Error(`[graph-memory-pro] 无效节点类型：${String(p.type)}`);
+          }
           const { node } = await upsertNode(driver, { type: p.type, name: p.name, description: p.description, content: p.content }, sid);
           if (p.relatedSkill) {
             const rel = await findByName(driver, p.relatedSkill);
-            if (rel) {
-              await upsertEdge(driver, { fromId: node.id, toId: rel.id, type: "SOLVED_BY", instruction: `关联 ${p.relatedSkill}`, sessionId: sid });
+            if (rel?.type === "SKILL") {
+              const edgeType = node.type === "TASK" ? "USED_SKILL" : "SOLVED_BY";
+              await upsertEdge(driver, { fromId: node.id, toId: rel.id, type: edgeType, instruction: `关联 ${p.relatedSkill}`, sessionId: sid });
             }
           }
           recaller.syncEmbed(node).catch(() => {});

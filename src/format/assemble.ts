@@ -100,7 +100,7 @@ export async function assembleContext(
   let used = 0;
   for (const n of sorted) {
     const sz = n.content.length + n.name.length + n.description.length + 50;
-    if (used + sz > maxChars) break;
+    if (used + sz > maxChars) continue;
     selected.push(n);
     used += sz;
   }
@@ -141,13 +141,13 @@ export async function assembleContext(
 
   for (const [cid, members] of byCommunity) {
     const summary = communitySummaries.get(cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    xmlParts.push(`  <community id="${cid}" desc="${label}">`);
+    const label = escapeXml(summary ? summary.summary : cid);
+    xmlParts.push(`  <community id="${escapeXml(cid)}" desc="${label}">`);
     for (const n of members) {
       const tag = n.type.toLowerCase();
       const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
       const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-      xmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
+      xmlParts.push(`    <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${escapeXml(n.content.trim())}\n    </${tag}>`);
     }
     xmlParts.push(`  </community>`);
   }
@@ -156,7 +156,7 @@ export async function assembleContext(
     const tag = n.type.toLowerCase();
     const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
     const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-    xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
+    xmlParts.push(`  <${tag} name="${escapeXml(n.name)}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${escapeXml(n.content.trim())}\n  </${tag}>`);
   }
 
   const nodesXml = xmlParts.join("\n");
@@ -166,7 +166,7 @@ export async function assembleContext(
         const fromName = idToName.get(e.fromId) ?? e.fromId;
         const toName = idToName.get(e.toId) ?? e.toId;
         const cond = e.condition ? ` when="${escapeXml(e.condition)}"` : "";
-        return `    <e type="${e.type}" from="${fromName}" to="${toName}"${cond}>${escapeXml(e.instruction)}</e>`;
+        return `    <e type="${e.type}" from="${escapeXml(fromName)}" to="${escapeXml(toName)}"${cond}>${escapeXml(e.instruction)}</e>`;
       }).join("\n")}\n  </edges>`
     : "";
 
