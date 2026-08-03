@@ -22,7 +22,7 @@
         }
       },
       "compactTurnCount": { "type": "number", "default": 6 },
-      "recallMaxNodes": { "type": "number", "default": 6 },
+      "recallMaxNodes": { "type": "number", "default": 3 },
       "recallMaxDepth": { "type": "number", "default": 2 },
       "freshTailCount": { "type": "number", "default": 10 },
       "dedupThreshold": { "type": "number", "default": 0.90 },
@@ -42,7 +42,8 @@
             "description": "LLM总结 API 地址"
           },
           "model": { "type": "string", "description": "使用的模型名称" },
-          "timeoutMs": { "type": "number", "default": 60000, "description": "单次 LLM 请求超时（毫秒）" }
+          "timeoutMs": { "type": "number", "default": 60000, "description": "单次 LLM 请求超时（毫秒）" },
+          "maxTokens": { "type": "number", "default": 4000, "description": "补全 token 预算，如果报错多请适当调高" }
         }
       },
       "embedding": {
@@ -51,7 +52,7 @@
           "apiKey": { "type": "string" },
           "baseURL": { "type": "string" },
           "model": { "type": "string" },
-          "dimensions": { "type": "number", "default": 1024 }
+          "dimensions": { "type": "number", "default": 1024, "description": "向量化模型维度数"  }
         }
       }
     }

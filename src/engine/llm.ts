@@ -30,11 +30,13 @@ export interface LlmConfig {
   model?: string;
   /** 单次 LLM 请求超时（毫秒）。未配时默认 60000。 */
   timeoutMs?: number;
+  maxTokens?: number;
 }
 
 export type CompleteFn = (system: string, user: string) => Promise<string>;
 
 const DEFAULT_LLM_TIMEOUT_MS = 60_000;
+const DEFAULT_LLM_MAX_TOKENS = 4_000;
 const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 /**
@@ -86,6 +88,9 @@ export function createCompleteFn(
   const timeoutMs = llmConfig?.timeoutMs && llmConfig.timeoutMs > 0
     ? llmConfig.timeoutMs
     : DEFAULT_LLM_TIMEOUT_MS;
+  const maxTokens = llmConfig?.maxTokens && llmConfig.maxTokens > 0
+    ? llmConfig.maxTokens
+    : DEFAULT_LLM_MAX_TOKENS;
 
   return async (system, user) => {
     if (provider === "anthropic") {
@@ -106,7 +111,7 @@ export function createCompleteFn(
         },
         body: JSON.stringify({
           model: effectiveModel,
-          max_tokens: 2000,
+          max_tokens: maxTokens,
           system,
           messages: [{ role: "user", content: user }],
         }),
@@ -115,7 +120,14 @@ export function createCompleteFn(
         const errText = await res.text().catch(() => "");
         throw new Error(`[graph-memory] Anthropic API ${res.status}: ${errText.slice(0, 200)}`);
       }
-      return ((await res.json() as any).content?.[0]?.text) ?? "";
+      const data = await res.json() as any;
+      const text = data.content?.[0]?.text;
+      if (text) return text;
+      const stop = data.choices?.[0]?.finish_reason ?? data.stop_reason;
+      throw new Error(
+        `[graph-memory] LLM returned empty content${stop ? ` (stop_reason=${stop})` : ""}. ` +
+        `Reasoning models may exhaust max_tokens (${maxTokens}); raise llm.maxTokens if recurring.`,
+      );
     }
 
     // ── OpenAI 兼容 /chat/completions ──
@@ -139,7 +151,7 @@ export function createCompleteFn(
           ...(system.trim() ? [{ role: "system", content: system.trim() }] : []),
           { role: "user", content: user },
         ],
-        max_tokens: 2000,
+        max_tokens: maxTokens,
         temperature: 0.1,
       }),
     }, timeoutMs);
@@ -148,8 +160,15 @@ export function createCompleteFn(
       throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, 200)}`);
     }
     const data = await res.json() as any;
-    const text = data.choices?.[0]?.message?.content ?? "";
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content ?? "";
     if (text) return text;
-    throw new Error("[graph-memory] LLM returned empty content");
+    const stop = choice?.finish_reason;
+    const reasoningTokens = data?.usage?.completion_tokens_details?.reasoning_tokens;
+    throw new Error(
+      `[graph-memory] LLM returned empty content${stop ? ` (finish_reason=${stop})` : ""}` +
+      (reasoningTokens ? ` — reasoning consumed ${reasoningTokens} of ${maxTokens} tokens` : "") +
+      `. Raise llm.maxTokens if recurring.`,
+    );
   };
 }

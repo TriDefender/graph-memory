@@ -152,6 +152,7 @@ export interface GmConfig {
     baseURL?: string;
     model?: string;
     timeoutMs?: number;
+    maxTokens?: number;
   };
   dedupThreshold: number;
   pagerankDamping: number;
