@@ -12,13 +12,14 @@ import {
 
 // 仅在 NEO4J_INTEGRATION=1 时运行，避免污染默认 npm test（需要 Docker Neo4j）
 const ENABLED = !!process.env.NEO4J_INTEGRATION;
+const NEO4J_URI = process.env.NEO4J_TEST_URI ?? "bolt://localhost:7687";
 
 let driver: Driver;
 const TEST_SID = `integration-${Date.now()}`;
 
 describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
   beforeAll(async () => {
-    driver = getDriver({ uri: "bolt://localhost:7687", user: "neo4j", password: "graphmemory" });
+    driver = getDriver({ uri: NEO4J_URI, user: "neo4j", password: "graphmemory" });
     await initSchema(driver);
   }, 60000);
 
@@ -131,6 +132,31 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(nodes.length).toBeGreaterThanOrEqual(1);
     expect(nodes.some(n => n.name === "cicd-pipeline")).toBe(true);
     expect(edges.some(e => e.type === "USED_SKILL")).toBe(true);
+  });
+
+  it("graphWalk 不穿过 deprecated 中间节点连接两个 active 节点", async () => {
+    const { node: start } = await upsertNode(driver, {
+      type: "SKILL", name: "Active Walk Start", description: "start", content: "start",
+    }, TEST_SID);
+    const { node: deprecatedBridge } = await upsertNode(driver, {
+      type: "SKILL", name: "Deprecated Walk Bridge", description: "bridge", content: "bridge",
+    }, TEST_SID);
+    const { node: unreachable } = await upsertNode(driver, {
+      type: "SKILL", name: "Active Walk Unreachable", description: "end", content: "end",
+    }, TEST_SID);
+    await upsertEdge(driver, {
+      fromId: start.id, toId: deprecatedBridge.id, type: "REQUIRES",
+      instruction: "first hop", sessionId: TEST_SID,
+    });
+    await upsertEdge(driver, {
+      fromId: deprecatedBridge.id, toId: unreachable.id, type: "REQUIRES",
+      instruction: "second hop", sessionId: TEST_SID,
+    });
+    await deprecate(driver, deprecatedBridge.id);
+
+    const { nodes } = await graphWalk(driver, [start.id], 2);
+
+    expect(nodes.map(node => node.id)).not.toContain(unreachable.id);
   });
 
   it("graphWalk 空种子返回空结果", async () => {

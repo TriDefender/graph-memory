@@ -9,24 +9,13 @@
 import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { getSession } from "../store/db.ts";
-import { updateCommunities, upsertCommunitySummary, pruneCommunitySummaries } from "../store/store.ts";
-
-const ALL_REL_TYPES = ["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"];
-
-async function getExistingRelTypes(session: any): Promise<string[]> {
-  const result = await session.run(`
-    MATCH (:Task|Skill|Event)-[r]->(:Task|Skill|Event)
-    WHERE type(r) IN $types
-    RETURN DISTINCT type(r) AS t
-  `, { types: ALL_REL_TYPES });
-  return result.records.map((r: any) => r.get("t"));
-}
-
-function buildRelProjection(existingTypes: string[]): string {
-  if (existingTypes.length === 0) return "'*'";
-  const parts = existingTypes.map(t => `${t}: {orientation: 'UNDIRECTED'}`);
-  return `{${parts.join(", ")}}`;
-}
+import {
+  clearCommunities,
+  updateCommunities,
+  upsertCommunitySummary,
+  pruneCommunitySummaries,
+} from "../store/store.ts";
+import { getExistingActiveRelTypes, projectActiveGraph } from "./projection.ts";
 
 export interface CommunityResult {
   labels: Map<string, string>;
@@ -48,20 +37,17 @@ export async function detectCommunities(driver: Driver, maxIter = 50): Promise<C
     );
     const nodeCount = countResult.records[0]?.get("c")?.toNumber?.() ?? 0;
     if (nodeCount === 0) {
+      await clearCommunities(driver);
       return { labels: new Map(), communities: new Map(), count: 0 };
     }
 
-    const existingTypes = await getExistingRelTypes(session);
+    const existingTypes = await getExistingActiveRelTypes(session);
     if (existingTypes.length === 0) {
+      await clearCommunities(driver);
       return { labels: new Map(), communities: new Map(), count: 0 };
     }
 
-    const relProjection = buildRelProjection(existingTypes);
-
-    // 标准投影（只包含实际存在的关系类型）
-    await session.run(
-      `CALL gds.graph.project('${graphName}', ['Task', 'Skill', 'Event'], ${relProjection})`
-    );
+    await projectActiveGraph(session, graphName, existingTypes);
 
     // 运行 Label Propagation
     const lpResult = await session.run(`

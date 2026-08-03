@@ -2,7 +2,7 @@
 
 > **适用场景 / Scope**：仅用于 **Windows v1.x → Linux v2.0** 的跨平台数据迁移。
 > 纯 Linux 全新安装**无需此文档**，直接运行 `bash setup-graph-memory-pro.sh`。
-> 详见 [发布线说明](../docs/RELEASE-LINE.md)。
+> 本仓库提供 Linux 安装器和下述四个迁移/回滚脚本；请按本文的手动步骤执行。
 
 将旧版 graph-memory（SQLite + FTS5）的知识图谱迁移到 graph-memory-pro v2.0（Neo4j 5 + APOC + GDS）。
 
@@ -29,22 +29,7 @@ FTS5 表、`gm_signals`（空）、`_migrations` 不迁移。
 
 ---
 
-## 快速路径（一键）
-
-```bash
-cd /mnt/d/TEMP/graph-memory   # 或 v2.0 源码所在路径
-bash migrate/install-wsl.sh
-```
-
-runbook 自动完成：备份 → 安装 Neo4j（tmux console 模式）→ 注册插件 → 复制配置 → 禁用旧插件 → 迁移。跑完只需重启 gateway。
-
-环境变量：
-- `NEO4J_PASS=xxx` — Neo4j 密码（默认 `graphmemory`）
-- `SKIP_MIGRATE=1` — 只装不迁移
-
----
-
-## 手动步骤（逐项）
+## 迁移步骤（逐项）
 
 ### 1. 备份 SQLite（在线一致性快照，WAL 合并）
 
@@ -105,34 +90,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # 首次
 
 ---
 
-## 可选：提取未提取消息
-
-旧 DB 可能有大量 `extracted=0` 的消息（知识尚未提取成节点）。可选地先用旧版提取器补提取，再迁移：
-
-```bash
-cd ~/.openclaw/extensions/graph-memory   # 旧插件目录（有 node_modules）
-cp /mnt/d/TEMP/graph-memory/migrate/extract_unextracted.ts .
-npx tsx extract_unextracted.ts
-```
-
-脚本用 deepseek 并发提取（BATCH=6 消息/call，20 路并发），结果写回 SQLite 备份，之后正常迁移即可带上新节点。
-
-- 自动跳过退化的 `memory-reflection-cli*` 会话（"continue" 死循环噪声）
-- 幂等：每批 `markExtracted`，崩溃可重跑续
-- 提取完重跑第 4 步迁移（带 `--reset`）
-
----
-
 ## 排障
 
 ### `下载失败: dist.neo4j.org/...`
 
-WSL 走代理时大文件下载中断。解法：Windows 浏览器下载制品，放到 `migrate/staging/`，runbook 的 `dl()` 会优先用本地暂存：
+WSL 走代理时大文件下载中断。解法：Windows 浏览器下载制品，放到安装器实际读取的 `~/.graph-memory-pro/staging/`：
 
 ```
-migrate/staging/neo4j.tar.gz                         (128MB, neo4j-community-5.24.2-unix.tar.gz)
-migrate/staging/apoc-5.24.2-core.jar
-migrate/staging/neo4j-graph-data-science-2.12.0.jar  (可选；GitHub 下不到就 --skip-gds)
+~/.graph-memory-pro/staging/neo4j.tar.gz
+~/.graph-memory-pro/staging/apoc-5.24.2-core.jar
+~/.graph-memory-pro/staging/neo4j-graph-data-science-2.12.0.jar  # 可选；没有时使用 --skip-gds
 ```
 
 ### `Neo4j Server shutdown initiated by request`（启动即停）
@@ -161,9 +128,8 @@ migrate/
 ├── backup.py               SQLite 在线备份（WAL 合并，一致性快照）
 ├── migrate.py              核心转换脚本（SQLite → Neo4j）
 ├── rollback.py             v2.0 → v1.x 回滚（还原 openclaw.json + 校验 SQLite）
-├── extract_unextracted.ts  可选：批量提取未提取消息（旧插件 deepseek 并发）
 ├── patch_config.py         迁移后：复制 llm/embedding 配置到新插件
-└── install-wsl.sh          WSL 一键安装 + 迁移 runbook（仅 Windows→Linux 路径）
+└── staging/                可选的制品缓存；安装前需复制到 ~/.graph-memory-pro/staging/
 ```
 
 ## migrate.py 用法

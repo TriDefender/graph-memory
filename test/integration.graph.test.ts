@@ -12,7 +12,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
 import {
-  upsertNode, upsertEdge, saveVector, findByName, findById,
+  upsertNode, upsertEdge, saveVector, findByName, findById, deprecate,
 } from "../src/store/store.ts";
 import {
   personalizedPageRank, computeGlobalPageRank,
@@ -23,6 +23,7 @@ import { runMaintenance } from "../src/graph/maintenance.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
 
 const ENABLED = !!process.env.NEO4J_INTEGRATION;
+const NEO4J_URI = process.env.NEO4J_TEST_URI ?? "bolt://localhost:7687";
 
 async function getVectorIndexDimension(driver: Driver): Promise<number> {
   const session = getSession(driver);
@@ -66,7 +67,7 @@ let nodeIds: Record<string, string> = {};
 
 describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
   beforeAll(async () => {
-    driver = getDriver({ uri: "bolt://localhost:7687", user: "neo4j", password: "graphmemory" });
+    driver = getDriver({ uri: NEO4J_URI, user: "neo4j", password: "graphmemory" });
     await initSchema(driver);
 
     const nodes: Record<string, string> = {};
@@ -136,6 +137,29 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
       expect(scores.size).toBe(0);
       expect(topK).toEqual([]);
     }
+  });
+
+  it("computeGlobalPageRank 不改写 deprecated 节点的分数", async () => {
+    const { node } = await upsertNode(driver, {
+      type: "SKILL", name: "Deprecated Pagerank Sentinel",
+      description: "deprecated", content: "deprecated",
+    }, TEST_SID);
+    await deprecate(driver, node.id);
+    const session = getSession(driver);
+    try {
+      await session.run(
+        "MATCH (n:MemoryNode {id: $id}) SET n.pagerank = $score",
+        { id: node.id, score: 777 },
+      );
+    } finally {
+      await session.close();
+    }
+
+    const result = await computeGlobalPageRank(driver, cfg);
+    const after = await findById(driver, node.id);
+
+    expect(result.scores.size).toBeGreaterThan(0);
+    expect(after?.pagerank).toBe(777);
   });
 
   it("detectCommunities：返回社区映射并写回 n.communityId（GDS 可用时）", async () => {
@@ -244,5 +268,56 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
       console.warn("[SKIP] dedup merge test skipped — vector dimension mismatch in shared Neo4j (历史数据含 256 维 embedding)");
     });
     if (!passed) expect(true).toBe(true);
+  });
+
+  it("detectCommunities 在最后一条边删除后清空旧 communityId 和摘要", async () => {
+    const session = getSession(driver);
+    try {
+      await session.run(`
+        MATCH (n:MemoryNode)
+        WHERE $sid IN n.sourceSessions AND n.status = 'active'
+        SET n.communityId = 'c-stale'
+      `, { sid: TEST_SID });
+      await session.run(`
+        MERGE (c:Community {id: 'c-stale'})
+        SET c.summary = 'stale', c.nodeCount = 1, c.createdAt = 1, c.updatedAt = 1
+      `);
+      await session.run(`
+        MATCH (source:MemoryNode)-[relationship]->(target:MemoryNode)
+        WHERE $sid IN source.sourceSessions OR $sid IN target.sourceSessions
+        DELETE relationship
+      `, { sid: TEST_SID });
+      const remaining = await session.run(`
+        MATCH (source:MemoryNode {status: 'active'})-[relationship]->(target:MemoryNode {status: 'active'})
+        WHERE type(relationship) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
+        RETURN count(relationship) AS count,
+               collect({source: source.name, target: target.name, type: type(relationship), sid: relationship.sessionId})[0..5] AS sample
+      `);
+      const relationshipCount = remaining.records[0]?.get("count")?.toNumber?.() ?? 0;
+      const sample = remaining.records[0]?.get("sample") ?? [];
+      expect(relationshipCount, JSON.stringify(sample)).toBe(0);
+    } finally {
+      await session.close();
+    }
+
+    const result = await detectCommunities(driver);
+    const after = getSession(driver);
+    try {
+      const state = await after.run(`
+        MATCH (n:MemoryNode)
+        WHERE $sid IN n.sourceSessions AND n.status = 'active'
+        WITH collect(n.communityId) AS ids
+        OPTIONAL MATCH (c:Community {id: 'c-stale'})
+        RETURN ids, count(c) AS summaries
+      `, { sid: TEST_SID });
+      const ids = state.records[0]?.get("ids") ?? [];
+      const summaries = state.records[0]?.get("summaries")?.toNumber?.() ?? 0;
+
+      expect(result.count).toBe(0);
+      expect(ids.every((id: string | null) => id === null)).toBe(true);
+      expect(summaries).toBe(0);
+    } finally {
+      await after.close();
+    }
   });
 });

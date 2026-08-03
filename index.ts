@@ -22,7 +22,7 @@ import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
-import { DEFAULT_CONFIG, type GmConfig } from "./src/types.ts";
+import { DEFAULT_CONFIG, type GmConfig, type RecallResult } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 
 // ─── 从 OpenClaw config 读 provider/model ────────────────────
@@ -323,7 +323,19 @@ const graphMemoryProPlugin = {
 
     // ── Session 运行时状态 ──────────────────────────────────
     const msgSeq = new Map<string, number>();
-    const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
+    const recalled = new Map<string, RecallResult>();
+    const sessionIdsByKey = new Map<string, string>();
+    const pendingSubagentRecall = new Map<string, RecallResult>();
+
+    function bindSessionIdentity(sessionId: string, sessionKey?: string): void {
+      if (!sessionKey) return;
+      sessionIdsByKey.set(sessionKey, sessionId);
+      const pendingRecall = pendingSubagentRecall.get(sessionKey);
+      if (pendingRecall) {
+        recalled.set(sessionId, pendingRecall);
+        pendingSubagentRecall.delete(sessionKey);
+      }
+    }
 
     async function ingestMessage(sessionId: string, message: any): Promise<void> {
       const seq = (msgSeq.get(sessionId) ?? 0) + 1;
@@ -344,9 +356,11 @@ const graphMemoryProPlugin = {
 
         const res = await recaller.recall(prompt);
         if (res.nodes.length) {
-          if (ctx?.sessionId) recalled.set(ctx.sessionId, res);
-          if (ctx?.sessionKey && ctx.sessionKey !== ctx?.sessionId) {
-            recalled.set(ctx.sessionKey, res);
+          const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : undefined;
+          const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : undefined;
+          if (sessionId) {
+            bindSessionIdentity(sessionId, sessionKey);
+            recalled.set(sessionId, res);
           }
           api.logger.info(`[graph-memory-pro] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`);
         }
@@ -364,19 +378,22 @@ const graphMemoryProPlugin = {
         ownsCompaction: true,
       },
 
-      async bootstrap({ sessionId }: { sessionId: string }) {
+      async bootstrap({ sessionId, sessionKey }: { sessionId: string; sessionKey?: string }) {
+        bindSessionIdentity(sessionId, sessionKey);
         return { bootstrapped: true };
       },
 
-      async ingest({ sessionId, message, isHeartbeat }: { sessionId: string; message: any; isHeartbeat?: boolean }) {
+      async ingest({ sessionId, sessionKey, message, isHeartbeat }: { sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean }) {
         if (isHeartbeat) return { ingested: false };
+        bindSessionIdentity(sessionId, sessionKey);
         await ingestMessage(sessionId, message);
         return { ingested: true };
       },
 
-      async assemble({ sessionId, messages, tokenBudget, prompt }: {
-        sessionId: string; messages: any[]; tokenBudget?: number; prompt?: string;
+      async assemble({ sessionId, sessionKey, messages, tokenBudget, prompt }: {
+        sessionId: string; sessionKey?: string; messages: any[]; tokenBudget?: number; prompt?: string;
       }) {
+        bindSessionIdentity(sessionId, sessionKey);
         const budget = tokenBudget ?? 128_000;
 
         const activeNodes = await getBySession(driver, sessionId);
@@ -445,7 +462,8 @@ const graphMemoryProPlugin = {
         };
       },
 
-      async compact({ sessionId, currentTokenCount }: { sessionId: string; sessionFile: string; tokenBudget?: number; force?: boolean; currentTokenCount?: number }) {
+      async compact({ sessionId, sessionKey, currentTokenCount }: { sessionId: string; sessionKey?: string; sessionFile: string; tokenBudget?: number; force?: boolean; currentTokenCount?: number }) {
+        bindSessionIdentity(sessionId, sessionKey);
         const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
 
         if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
@@ -493,12 +511,13 @@ const graphMemoryProPlugin = {
         }
       },
 
-      async afterTurn({ sessionId, messages, prePromptMessageCount, isHeartbeat }: {
-        sessionId: string; sessionFile: string; messages: any[];
+      async afterTurn({ sessionId, sessionKey, messages, prePromptMessageCount, isHeartbeat }: {
+        sessionId: string; sessionKey?: string; sessionFile: string; messages: any[];
         prePromptMessageCount: number; autoCompactionSummary?: string;
         isHeartbeat?: boolean; tokenBudget?: number;
       }) {
         if (isHeartbeat) return;
+        bindSessionIdentity(sessionId, sessionKey);
 
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
         if (!newMessages.length) return;
@@ -518,20 +537,30 @@ const graphMemoryProPlugin = {
         });
       },
 
-      async prepareSubagentSpawn({ parentSessionKey, childSessionKey }: { parentSessionKey: string; childSessionKey: string }) {
-        const rec = recalled.get(parentSessionKey);
-        if (rec) recalled.set(childSessionKey, rec);
-        return { rollback: () => { recalled.delete(childSessionKey); } };
+      async prepareSubagentSpawn({ parentSessionKey, childSessionKey, parentSessionId }: {
+        parentSessionKey: string; childSessionKey: string; parentSessionId?: string;
+      }) {
+        const canonicalParentId = parentSessionId ?? sessionIdsByKey.get(parentSessionKey);
+        const rec = canonicalParentId ? recalled.get(canonicalParentId) : undefined;
+        if (rec) pendingSubagentRecall.set(childSessionKey, rec);
+        return { rollback: () => { pendingSubagentRecall.delete(childSessionKey); } };
       },
 
       async onSubagentEnded({ childSessionKey }: { childSessionKey: string }) {
-        recalled.delete(childSessionKey);
-        msgSeq.delete(childSessionKey);
+        const childSessionId = sessionIdsByKey.get(childSessionKey);
+        if (childSessionId) {
+          recalled.delete(childSessionId);
+          msgSeq.delete(childSessionId);
+        }
+        sessionIdsByKey.delete(childSessionKey);
+        pendingSubagentRecall.delete(childSessionKey);
       },
 
       async dispose() {
         msgSeq.clear();
         recalled.clear();
+        sessionIdsByKey.clear();
+        pendingSubagentRecall.clear();
         // 不关闭 Neo4j driver — 让连接池自己管理
         // closeDriver() 只在进程退出时由 Node.js 自动清理
       },
@@ -542,8 +571,13 @@ const graphMemoryProPlugin = {
     // ── session_end：finalize + 图维护 ──────────────────────
 
     api.on("session_end", async (event: any, ctx: any) => {
-      const sid = ctx?.sessionKey ?? ctx?.sessionId ?? event?.sessionKey ?? event?.sessionId;
+      const sid = typeof event?.sessionId === "string"
+        ? event.sessionId
+        : typeof ctx?.sessionId === "string" ? ctx.sessionId : undefined;
       if (!sid) return;
+      const sessionKey = typeof event?.sessionKey === "string"
+        ? event.sessionKey
+        : typeof ctx?.sessionKey === "string" ? ctx.sessionKey : undefined;
 
       try {
         const nodes = await getBySession(driver, sid);
@@ -601,6 +635,10 @@ const graphMemoryProPlugin = {
       } finally {
         msgSeq.delete(sid);
         recalled.delete(sid);
+        if (sessionKey && sessionIdsByKey.get(sessionKey) === sid) {
+          sessionIdsByKey.delete(sessionKey);
+          pendingSubagentRecall.delete(sessionKey);
+        }
       }
     });
 

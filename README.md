@@ -24,7 +24,7 @@ This repository is the Linux-portable counterpart of the Windows `v2.0.0` releas
 
 ## Release Line
 
-This branch is the **v2.0 desktop-2.0 release line** (Neo4j backend), separate from the v1.x mainline (SQLite). See [`docs/RELEASE-LINE.md`](docs/RELEASE-LINE.md) for the branch / version / test-asset boundaries.
+This branch is the **v2.0 desktop-2.0 release line** (Neo4j backend), separate from the v1.x mainline (SQLite). The supported SQLite-to-Neo4j migration workflow is documented in [`migrate/Migrate.md`](migrate/Migrate.md).
 
 ## Linux Quick Start
 

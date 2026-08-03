@@ -316,6 +316,15 @@ remove_autostart() {
 if $UNINSTALL; then
   info "进入卸载模式 / Uninstall mode..."
 
+  if $DRY_RUN; then
+    remove_autostart
+    [[ -f "$OPENCLAW_JSON" ]] && dry "restore latest openclaw.json backup or remove graph-memory-pro fields"
+    [[ -x "$NEO4J_DIR/bin/neo4j" ]] && dry "$NEO4J_DIR/bin/neo4j stop"
+    dry "preserve $GMP_HOME unless deletion is explicitly confirmed in a real uninstall"
+    success "卸载预览完成，未修改任何文件或服务 / Uninstall preview complete; no files or services changed"
+    exit 0
+  fi
+
   # 先清理自启动条目（避免停 Neo4j 后又被自启拉起）
   remove_autostart
 
@@ -425,19 +434,26 @@ HAS_OPENCLAW=false
 command -v openclaw &>/dev/null && HAS_OPENCLAW=true
 command -v pnpm &>/dev/null || warn "未找到 pnpm（若用 pnpm 安装插件会降级为手动注册）/ pnpm not found"
 
-mkdir -p "$HOME/.openclaw"
-if [[ ! -f "$OPENCLAW_JSON" ]]; then
-  if $HAS_OPENCLAW; then
-    info "初始化 openclaw.json / Seeding config via CLI..."
-    $DRY_RUN && dry "openclaw config init"
-    openclaw config init >/dev/null 2>&1 || echo '{}' > "$OPENCLAW_JSON"
-  else
-    warn "未找到 openclaw CLI，创建空配置 / No openclaw CLI, creating empty config"
-    $DRY_RUN || echo '{}' > "$OPENCLAW_JSON"
+if $DRY_RUN; then
+  [[ -d "$HOME/.openclaw" ]] || dry "mkdir -p $HOME/.openclaw"
+  if [[ ! -f "$OPENCLAW_JSON" ]]; then
+    dry "initialize $OPENCLAW_JSON"
+  elif ! jq -e 'type == "object"' "$OPENCLAW_JSON" >/dev/null 2>&1; then
+    dry "replace invalid $OPENCLAW_JSON with an empty JSON object"
   fi
+else
+  mkdir -p "$HOME/.openclaw"
+  if [[ ! -f "$OPENCLAW_JSON" ]]; then
+    if $HAS_OPENCLAW; then
+      info "初始化 openclaw.json / Seeding config via CLI..."
+      openclaw config init >/dev/null 2>&1 || echo '{}' > "$OPENCLAW_JSON"
+    else
+      warn "未找到 openclaw CLI，创建空配置 / No openclaw CLI, creating empty config"
+      echo '{}' > "$OPENCLAW_JSON"
+    fi
+  fi
+  jq -e 'type == "object"' "$OPENCLAW_JSON" >/dev/null 2>&1 || echo '{}' > "$OPENCLAW_JSON"
 fi
-# 保证是合法 JSON 对象
-jq -e 'type == "object"' "$OPENCLAW_JSON" >/dev/null 2>&1 || echo '{}' > "$OPENCLAW_JSON"
 success "配置文件: $OPENCLAW_JSON"
 
 # 探测插件源目录（含 openclaw.plugin.json 的目录，默认 = 脚本所在目录）
@@ -474,18 +490,47 @@ else
   fi
   NEO4J_URI="bolt://localhost:${NEO4J_BOLT_PORT}"
 
-  mkdir -p "$GMP_HOME"
+  if $DRY_RUN; then
+    [[ -d "$GMP_HOME" ]] || dry "mkdir -p $GMP_HOME"
+  else
+    mkdir -p "$GMP_HOME"
+  fi
   TGZ="$GMP_HOME/neo4j.tar.gz"
   NEO4J_URL="$NEO4J_URL_BASE/neo4j-community-${NEO4J_VERSION}-unix.tar.gz"
   dl "$NEO4J_URL" "$TGZ"
 
   if ! $DRY_RUN; then
     info "解压 / Extracting..."
-    rm -rf "$GMP_HOME/neo4j-community-"* "$NEO4J_DIR"
+    rm -rf "$GMP_HOME/neo4j-community-"*
     tar xzf "$TGZ" -C "$GMP_HOME"
     EXTRACTED="$(ls -d "$GMP_HOME/neo4j-community-"* 2>/dev/null | head -1)"
     [[ -n "$EXTRACTED" ]] || fail "解压后未找到 neo4j 目录 / extracted dir not found"
-    mv "$EXTRACTED" "$NEO4J_DIR"
+
+    UPGRADE_BACKUP=""
+    if [[ -d "$NEO4J_DIR" ]]; then
+      info "检测到现有 Neo4j，停止服务并保留 data/ / Existing Neo4j found; preserving data/"
+      [[ -x "$NEO4J_DIR/bin/neo4j" ]] && "$NEO4J_DIR/bin/neo4j" stop >/dev/null 2>&1 || true
+      UPGRADE_BACKUP="$GMP_HOME/neo4j.upgrade-backup.$(date +%Y%m%d_%H%M%S)"
+      [[ ! -e "$UPGRADE_BACKUP" ]] || fail "升级备份目录已存在 / upgrade backup already exists: $UPGRADE_BACKUP"
+      mv "$NEO4J_DIR" "$UPGRADE_BACKUP"
+    fi
+
+    if ! mv "$EXTRACTED" "$NEO4J_DIR"; then
+      [[ -n "$UPGRADE_BACKUP" ]] && mv "$UPGRADE_BACKUP" "$NEO4J_DIR"
+      fail "安装新 Neo4j 目录失败，已恢复旧版本 / failed to install new Neo4j; previous version restored"
+    fi
+
+    if [[ -n "$UPGRADE_BACKUP" && -d "$UPGRADE_BACKUP/data" ]]; then
+      rm -rf "$NEO4J_DIR/data"
+      if ! mv "$UPGRADE_BACKUP/data" "$NEO4J_DIR/data"; then
+        rm -rf "$NEO4J_DIR"
+        mv "$UPGRADE_BACKUP" "$NEO4J_DIR"
+        fail "恢复 Neo4j 数据失败，已回滚旧版本 / failed to restore Neo4j data; previous version restored"
+      fi
+      rm -rf "$UPGRADE_BACKUP"
+      success "Neo4j data/ 已保留 / existing Neo4j data preserved"
+    fi
+
     rm -f "$TGZ"
     success "Neo4j 解压到 / extracted to $NEO4J_DIR"
   else

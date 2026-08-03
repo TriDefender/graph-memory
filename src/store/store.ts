@@ -344,6 +344,22 @@ export async function updateCommunities(driver: Driver, labels: Map<string, stri
   }
 }
 
+export async function clearCommunities(driver: Driver): Promise<void> {
+  const session = getSession(driver);
+  try {
+    await session.run(`
+      MATCH (n:MemoryNode)
+      SET n.communityId = null
+      WITH count(n) AS nodeCount
+      MATCH (c:Community)
+      DETACH DELETE c
+      RETURN nodeCount, count(c) AS deletedCommunities
+    `);
+  } finally {
+    await session.close();
+  }
+}
+
 // ─── 边 CRUD ─────────────────────────────────────────────────
 
 export async function upsertEdge(
@@ -627,6 +643,7 @@ export async function graphWalk(
       CALL {
         WITH seed
         MATCH path = (seed)-[*0..${maxDepth}]-(neighbor:Task|Skill|Event {status: 'active'})
+        WHERE all(node IN nodes(path) WHERE node.status = 'active')
         RETURN DISTINCT neighbor
       }
       RETURN DISTINCT neighbor AS n

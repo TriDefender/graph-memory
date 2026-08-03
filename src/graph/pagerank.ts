@@ -5,32 +5,10 @@
  * 所以先查有哪些关系类型，只投影存在的
  */
 
-import type { Driver, Session } from "neo4j-driver";
+import type { Driver } from "neo4j-driver";
 import type { GmConfig } from "../types.ts";
 import { getSession } from "../store/db.ts";
-
-const ALL_REL_TYPES = ["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"];
-
-/**
- * 查询数据库中实际存在的知识节点关系类型
- */
-async function getExistingRelTypes(session: Session): Promise<string[]> {
-  const result = await session.run(`
-    MATCH (:Task|Skill|Event)-[r]->(:Task|Skill|Event)
-    WHERE type(r) IN $types
-    RETURN DISTINCT type(r) AS t
-  `, { types: ALL_REL_TYPES });
-  return result.records.map(r => r.get("t"));
-}
-
-/**
- * 构建 GDS 投影的关系类型 map（只包含存在的）
- */
-function buildRelProjection(existingTypes: string[]): string {
-  if (existingTypes.length === 0) return "'*'";
-  const parts = existingTypes.map(t => `${t}: {orientation: 'UNDIRECTED'}`);
-  return `{${parts.join(", ")}}`;
-}
+import { getExistingActiveRelTypes, projectActiveGraph } from "./projection.ts";
 
 // ─── 个性化 PageRank ─────────────────────────────────────────
 
@@ -50,7 +28,7 @@ export async function personalizedPageRank(
 
   const session = getSession(driver);
   try {
-    const existingTypes = await getExistingRelTypes(session);
+    const existingTypes = await getExistingActiveRelTypes(session);
     if (existingTypes.length === 0) {
       // 没有关系，fallback
       const scores = new Map<string, number>();
@@ -59,12 +37,8 @@ export async function personalizedPageRank(
     }
 
     const graphName = `gm-ppr-${Date.now()}`;
-    const relProjection = buildRelProjection(existingTypes);
-
     try {
-      await session.run(
-        `CALL gds.graph.project('${graphName}', ['Task', 'Skill', 'Event'], ${relProjection})`
-      );
+      await projectActiveGraph(session, graphName, existingTypes);
 
       const seedResult = await session.run(`
         MATCH (n:Task|Skill|Event) WHERE n.id IN $seedIds AND n.status = 'active'
@@ -129,7 +103,7 @@ export async function computeGlobalPageRank(driver: Driver, cfg: GmConfig): Prom
     const nodeCount = countResult.records[0]?.get("c")?.toNumber?.() ?? 0;
     if (nodeCount === 0) return { scores: new Map(), topK: [] };
 
-    const existingTypes = await getExistingRelTypes(session);
+    const existingTypes = await getExistingActiveRelTypes(session);
     if (existingTypes.length === 0) {
       // 没有关系，均匀分
       const uniformScore = 1 / nodeCount;
@@ -146,10 +120,7 @@ export async function computeGlobalPageRank(driver: Driver, cfg: GmConfig): Prom
       return { scores, topK };
     }
 
-    const relProjection = buildRelProjection(existingTypes);
-    await session.run(
-      `CALL gds.graph.project('${graphName}', ['Task', 'Skill', 'Event'], ${relProjection})`
-    );
+    await projectActiveGraph(session, graphName, existingTypes);
 
     await session.run(`
       CALL gds.pageRank.write('${graphName}', {
