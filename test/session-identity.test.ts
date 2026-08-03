@@ -42,6 +42,7 @@ vi.mock("../src/store/store.ts", () => ({
 
 vi.mock("../src/engine/llm.ts", () => ({
   createCompleteFn: () => async () => "",
+  resolveProvider: () => ({ provider: "openai", inferred: false }),
 }));
 
 vi.mock("../src/engine/embed.ts", () => ({

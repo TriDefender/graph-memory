@@ -7,7 +7,7 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
-import { getDriver, initSchema, getSession, closeDriver } from "./src/store/db.ts";
+import { getDriver, initSchema, getSession } from "./src/store/db.ts";
 import {
   saveMessage, getUnextracted,
   markExtracted, isTurnExtracted,
@@ -15,7 +15,7 @@ import {
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats,
 } from "./src/store/store.ts";
-import { createCompleteFn } from "./src/engine/llm.ts";
+import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
@@ -25,27 +25,30 @@ import { runMaintenance } from "./src/graph/maintenance.ts";
 import { DEFAULT_CONFIG, type GmConfig, type RecallResult } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 
-// ─── 从 OpenClaw config 读 provider/model ────────────────────
+// ─── 从 OpenClaw config 读默认 model 名 ──────────────────────
 
-export function readProviderModel(apiConfig: unknown): { provider: string; model: string } {
+/**
+ * 从 openclaw.json agents.defaults.model 读取默认 model 名。
+ * 支持两种形式：字符串 或 { primary: "..." }。
+ * 形如 "anthropic/claude-sonnet-4-5" 的 provider 前缀会被剥离 —— provider 路由
+ * 由 cfg.llm.provider 显式声明，不再由此函数隐式推断（修 #48 根因）。
+ */
+export function readDefaultModel(apiConfig: unknown): string {
+  if (!apiConfig || typeof apiConfig !== "object") return "";
+  const m = (apiConfig as any).agents?.defaults?.model;
   let raw = "";
-  if (apiConfig && typeof apiConfig === "object") {
-    const m = (apiConfig as any).agents?.defaults?.model;
-    if (typeof m === "string" && m.trim()) {
-      raw = m.trim();
-    } else if (m && typeof m === "object" && typeof m.primary === "string" && m.primary.trim()) {
-      raw = m.primary.trim();
-    }
+  if (typeof m === "string") {
+    raw = m.trim();
+  } else if (m && typeof m === "object" && typeof m.primary === "string") {
+    raw = m.primary.trim();
   }
+  if (!raw) return "";
+  // 剥离 provider 前缀："anthropic/claude-x" → "claude-x"；多段 / 保留剩余部分
   if (raw.includes("/")) {
-    const [provider, ...rest] = raw.split("/");
-    const model = rest.join("/").trim();
-    if (provider?.trim() && model) return { provider: provider.trim(), model };
+    const [, ...rest] = raw.split("/");
+    return rest.join("/").trim();
   }
-  if (raw) {
-    return { provider: "anthropic", model: raw };
-  }
-  return { provider: "", model: "" };
+  return raw;
 }
 
 // ─── 清洗 OpenClaw metadata 包装 ─────────────────────────────
@@ -228,13 +231,35 @@ const graphMemoryProPlugin = {
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
 
-    const { provider, model } = readProviderModel(api.config);
+    const providerModel = readDefaultModel(api.config);
 
-    const effectiveModel = cfg.llm?.model ?? model;
+    // Model 解析链：cfg.llm.model（插件级显式配置） → agents.defaults.model（openclaw provider 级）
+    // 留空也能工作 —— 但 extraction / community summaries 会因无 model 而失败，故仅告警。
+    const effectiveModel = cfg.llm?.model ?? providerModel;
     if (!effectiveModel) {
       api.logger.warn(
         "[graph-memory-pro] No LLM model configured. Set agents.defaults.model in openclaw.json " +
         "or config.llm.model in graph-memory plugin config — extraction and community summaries will fail.",
+      );
+    }
+
+    // Provider 解析（显式 > 启发式推断）。推断时告警，建议显式设置 —— 修 issue #48：
+    // 旧版日志里打的 provider 来自 agents.defaults.model 解析，跟实际路由（基于 !baseURL）脱节。
+    const { provider: llmProvider, inferred: providerInferred } = resolveProvider(cfg.llm);
+    if (providerInferred) {
+      api.logger.warn(
+        `[graph-memory-pro] llm.provider 未显式设置，按 baseURL 是否存在推断为 "${llmProvider}"。` +
+        `建议在 config.llm 中显式设置 provider: "openai" | "anthropic" 以避免歧义。`,
+      );
+    }
+    // 按真实路由校验必需字段，缺了清晰报错（而不是静默 fallthrough 后失败）
+    if (llmProvider === "anthropic" && !cfg.llm?.apiKey) {
+      api.logger.error(
+        '[graph-memory-pro] llm.provider=anthropic 但未配 llm.apiKey — extraction/community summaries 将失败',
+      );
+    } else if (llmProvider === "openai" && (!cfg.llm?.apiKey || !cfg.llm?.baseURL)) {
+      api.logger.error(
+        '[graph-memory-pro] llm.provider=openai 需要 llm.apiKey + llm.baseURL — extraction/community summaries 将失败',
       );
     }
 
@@ -246,12 +271,9 @@ const graphMemoryProPlugin = {
       .then(() => api.logger.info("[graph-memory-pro] Neo4j schema initialized"))
       .catch(err => api.logger.error(`[graph-memory-pro] schema init failed: ${err}`));
 
-    const anthropicApiKey = cfg.llm?.apiKey && !cfg.llm.baseURL
-      ? cfg.llm.apiKey
-      : undefined;
-    const llm = createCompleteFn(provider, model, cfg.llm, anthropicApiKey);
+    const llm = createCompleteFn(effectiveModel, cfg.llm);
     const recaller = new Recaller(driver, cfg);
-    const extractor = new Extractor(cfg, llm);
+    const extractor = new Extractor(llm);
 
     // ── 初始化 embedding ────────────────────────────────────
     createEmbedFn(cfg.embedding)
@@ -561,8 +583,7 @@ const graphMemoryProPlugin = {
         recalled.clear();
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
-        // 不关闭 Neo4j driver — 让连接池自己管理
-        // closeDriver() 只在进程退出时由 Node.js 自动清理
+        // 不关闭 Neo4j driver — 连接池自管理生命周期，进程退出时由 OS 回收
       },
     };
 
@@ -703,7 +724,7 @@ const graphMemoryProPlugin = {
     );
 
     api.registerTool(
-      (ctx: any) => ({
+      (_ctx: any) => ({
         name: "gm_update",
         label: "Update Graph Memory Node",
         description:
@@ -836,7 +857,7 @@ const graphMemoryProPlugin = {
     });
 
     api.logger.info(
-      `[graph-memory-pro] ready | neo4j=${cfg.neo4j.uri} | provider=${provider} | model=${effectiveModel || "(none)"}`,
+      `[graph-memory-pro] ready | neo4j=${cfg.neo4j.uri} | llm.provider=${llmProvider} | model=${effectiveModel || "(none)"}`,
     );
   },
 };

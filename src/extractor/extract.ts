@@ -5,7 +5,7 @@
  * Email: Wywelljob@gmail.com
  */
 
-import type { GmConfig, ExtractionResult, FinalizeResult } from "../types.ts";
+import type { ExtractionResult, FinalizeResult } from "../types.ts";
 import { EDGE_TYPES, isValidEdgeDirection } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
 
@@ -215,7 +215,7 @@ export function correctEdgeType(
 // ─── Extractor ────────────────────────────────────────────────
 
 export class Extractor {
-  constructor(private _cfg: GmConfig, private llm: CompleteFn) {}
+  constructor(private llm: CompleteFn) {}
 
   async extract(params: {
     messages: any[];

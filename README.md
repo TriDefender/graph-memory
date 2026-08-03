@@ -78,6 +78,7 @@ Install the local plugin, then make it the OpenClaw context engine:
             "password": "your-neo4j-password"
           },
           "llm": {
+            "provider": "openai",
             "apiKey": "your-llm-api-key",
             "baseURL": "https://api.openai.com/v1",
             "model": "gpt-4o-mini"
@@ -92,6 +93,16 @@ Install the local plugin, then make it the OpenClaw context engine:
       }
     }
   }
+}
+```
+
+Anthropic direct (Claude) — drop `baseURL`, switch `provider`:
+
+```json
+"llm": {
+  "provider": "anthropic",
+  "apiKey": "sk-ant-...",
+  "model": "claude-3-5-sonnet-20241022"
 }
 ```
 

@@ -17,8 +17,6 @@ export const NODE_TYPE_TO_LABEL: Record<NodeType, string> = {
   EVENT: "Event",
 };
 
-export const ALL_NODE_LABELS = ["Task", "Skill", "Event"];
-
 export interface GmNode {
   id: string;
   type: NodeType;
@@ -149,9 +147,11 @@ export interface GmConfig {
   freshTailCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
+    provider?: "openai" | "anthropic";
     apiKey?: string;
     baseURL?: string;
     model?: string;
+    timeoutMs?: number;
   };
   dedupThreshold: number;
   pagerankDamping: number;

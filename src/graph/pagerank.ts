@@ -148,7 +148,32 @@ export async function computeGlobalPageRank(driver: Driver, cfg: GmConfig): Prom
     return { scores, topK };
   } catch {
     try { await session.run(`CALL gds.graph.drop('${graphName}')`); } catch {}
-    return { scores: new Map(), topK: [] };
+    // GDS 不可用时降级为确定性 fallback（与 PPR 一致：按稳定排序赋 1/(i+1)）
+    await session.run(`
+      MATCH (n:Task|Skill|Event {status: 'active'})
+      WITH n ORDER BY n.createdAt ASC, n.id ASC
+      WITH collect(n) AS nodes
+      UNWIND range(0, size(nodes) - 1) AS idx
+      WITH nodes[idx] AS node, idx
+      SET node.pagerank = 1.0 / toFloat(idx + 1)
+    `);
+    const fallbackResult = await session.run(`
+      MATCH (n:Task|Skill|Event {status: 'active'})
+      RETURN n.id AS id, n.name AS name, n.pagerank AS score
+      ORDER BY n.pagerank DESC, n.createdAt ASC
+      LIMIT 20
+    `);
+    const scores = new Map<string, number>();
+    const topK: Array<{ id: string; name: string; score: number }> = [];
+    for (const r of fallbackResult.records) {
+      const rawScore = r.get("score");
+      const score = typeof rawScore === "number" ? rawScore : (rawScore?.toNumber?.() ?? 0);
+      const id = r.get("id");
+      const name = r.get("name");
+      scores.set(id, score);
+      topK.push({ id, name, score });
+    }
+    return { scores, topK };
   } finally {
     await session.close();
   }

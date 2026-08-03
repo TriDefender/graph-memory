@@ -31,9 +31,18 @@
       "llm": {
         "type": "object",
         "properties": {
-          "apiKey": { "type": "string", "description": "API Key（传统认证）" },
-          "baseURL": { "type": "string", "description": "API 地址" },
-          "model": { "type": "string", "description": "模型名称" }
+          "provider": {
+            "type": "string",
+            "enum": ["openai", "anthropic"],
+            "description": "选择LLM总结 API格式"
+          },
+          "apiKey": { "type": "string", "description": "API Key" },
+          "baseURL": {
+            "type": "string",
+            "description": "LLM总结 API 地址"
+          },
+          "model": { "type": "string", "description": "使用的模型名称" },
+          "timeoutMs": { "type": "number", "default": 60000, "description": "单次 LLM 请求超时（毫秒）" }
         }
       },
       "embedding": {

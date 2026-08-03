@@ -12,7 +12,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
 import {
-  upsertNode, upsertEdge, saveVector, findByName, findById, deprecate,
+  upsertNode, upsertEdge, saveVector, findById, deprecate,
 } from "../src/store/store.ts";
 import {
   personalizedPageRank, computeGlobalPageRank,

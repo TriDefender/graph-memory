@@ -5,7 +5,7 @@
  * 所有操作改为 async，使用 Cypher 查询
  */
 
-import type { Driver, Session } from "neo4j-driver";
+import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { createHash } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType } from "../types.ts";
@@ -40,20 +40,6 @@ function toNode(r: any): GmNode {
     pagerank: toFloat(n.pagerank ?? 0),
     createdAt: toInt(n.createdAt ?? n.created_at ?? 0),
     updatedAt: toInt(n.updatedAt ?? n.updated_at ?? 0),
-  };
-}
-
-function toEdge(r: any): GmEdge {
-  const e = r.properties ?? r;
-  return {
-    id: e.id,
-    fromId: e.fromId ?? e.from_id,
-    toId: e.toId ?? e.to_id,
-    type: e.type,
-    instruction: e.instruction,
-    condition: e.condition ?? undefined,
-    sessionId: e.sessionId ?? e.session_id,
-    createdAt: toInt(e.createdAt ?? e.created_at ?? 0),
   };
 }
 
@@ -275,20 +261,46 @@ export async function mergeNodes(driver: Driver, keepId: string, mergeId: string
             keep.updatedAt = $now
       `, { keepId, mergeId, now: Date.now() });
 
-      // 迁移入边：指向 mergeId 的边改指向 keepId
+      // 迁移入边：指向 mergeId 的边改指向 keepId（去重——keep 已有同类型边则直接丢弃原边）
       await tx.run(`
         MATCH (a:Task|Skill|Event)-[r]->(merge:Task|Skill|Event {id: $mergeId})
         WHERE a.id <> $keepId
+          AND EXISTS {
+            MATCH (keep:Task|Skill|Event {id: $keepId}), (a)-[dup]->(keep)
+            WHERE type(dup) = type(r)
+          }
+        DELETE r
+      `, { mergeId, keepId });
+      await tx.run(`
+        MATCH (a:Task|Skill|Event)-[r]->(merge:Task|Skill|Event {id: $mergeId})
+        WHERE a.id <> $keepId
+          AND NOT EXISTS {
+            MATCH (keep:Task|Skill|Event {id: $keepId}), (a)-[dup]->(keep)
+            WHERE type(dup) = type(r)
+          }
         WITH a, r, type(r) AS rType, properties(r) AS props
         MATCH (keep:Task|Skill|Event {id: $keepId})
         CALL apoc.create.relationship(a, rType, props, keep) YIELD rel
         DELETE r
       `, { mergeId, keepId });
 
-      // 迁移出边：从 mergeId 出发的边改从 keepId 出发
+      // 迁移出边：从 mergeId 出发的边改从 keepId 出发（同上去重）
       await tx.run(`
         MATCH (merge:Task|Skill|Event {id: $mergeId})-[r]->(b:Task|Skill|Event)
         WHERE b.id <> $keepId
+          AND EXISTS {
+            MATCH (keep:Task|Skill|Event {id: $keepId}), (keep)-[dup]->(b)
+            WHERE type(dup) = type(r)
+          }
+        DELETE r
+      `, { mergeId, keepId });
+      await tx.run(`
+        MATCH (merge:Task|Skill|Event {id: $mergeId})-[r]->(b:Task|Skill|Event)
+        WHERE b.id <> $keepId
+          AND NOT EXISTS {
+            MATCH (keep:Task|Skill|Event {id: $keepId}), (keep)-[dup]->(b)
+            WHERE type(dup) = type(r)
+          }
         WITH b, r, type(r) AS rType, properties(r) AS props
         MATCH (keep:Task|Skill|Event {id: $keepId})
         CALL apoc.create.relationship(keep, rType, props, b) YIELD rel
@@ -812,8 +824,6 @@ export async function isTurnExtracted(driver: Driver, sid: string, turn: number)
     await session.close();
   }
 }
-
-// ─── 信号 CRUD ───────────────────────────────────────────────
 
 // ─── 统计 ────────────────────────────────────────────────────
 

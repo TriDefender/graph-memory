@@ -18,7 +18,7 @@ import type { Recaller } from "../recaller/recall.ts";
 import type { NodeType, EdgeType } from "../types.ts";
 import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
 import {
-  upsertNode, findById, findByName, allActiveNodes, allEdges,
+  upsertNode, findById, allActiveNodes, allEdges,
   upsertEdge, edgesFrom, edgesTo, deprecate, mergeNodes,
   searchNodes, getStats,
 } from "../store/store.ts";

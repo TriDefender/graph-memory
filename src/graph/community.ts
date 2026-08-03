@@ -7,7 +7,6 @@
  */
 
 import type { Driver } from "neo4j-driver";
-import neo4j from "neo4j-driver";
 import { getSession } from "../store/db.ts";
 import {
   clearCommunities,

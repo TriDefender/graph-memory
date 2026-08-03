@@ -1,13 +1,13 @@
 /**
  * graph-memory-pro — assemble.ts
  *
- * 基于原版，微调：getCommunitySummary 改为同步接收预加载数据
- * 因为 Neo4j 是异步的，assemble 在调用前预加载所有社区摘要
+ * 组装 XML 上下文 + system prompt，在 15% token 预算内裁剪。
+ * 社区摘要在生成 XML 前预加载到 Map（Neo4j 是异步的，先批量取再组装）。
  */
 
 import type { Driver } from "neo4j-driver";
 import type { GmNode, GmEdge } from "../types.ts";
-import { getCommunitySummary, getAllCommunitySummaries, type CommunitySummary } from "../store/store.ts";
+import { getCommunitySummary, type CommunitySummary } from "../store/store.ts";
 
 const CHARS_PER_TOKEN = 3;
 
