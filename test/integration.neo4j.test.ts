@@ -9,6 +9,7 @@ import {
   getBySession, saveVector, vectorSearchWithScore, getVectorHash,
   updateCommunities, updatePageranks,
   deleteNode, deprecateNodeAndDisconnect,
+  deleteEdges,
 } from "../src/store/store.ts";
 
 // 仅在 NEO4J_INTEGRATION=1 时运行，避免污染默认 npm test（需要 Docker Neo4j）
@@ -282,6 +283,55 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
 
   it("deprecateNodeAndDisconnect 未知 name 返回 null", async () => {
     expect(await deprecateNodeAndDisconnect(driver, "ghost-node-deprecate-xyz")).toBeNull();
+  });
+
+  it("deleteEdges 按 type 删除：保留其他类型的边（gm_unlink type 过滤）", async () => {
+    const { node: a } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink Type A", description: "a", content: "a",
+    }, TEST_SID);
+    const { node: b } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink Type B", description: "b", content: "b",
+    }, TEST_SID);
+
+    await upsertEdge(driver, { fromId: a.id, toId: b.id, type: "REQUIRES", instruction: "needs", sessionId: TEST_SID });
+    await upsertEdge(driver, { fromId: a.id, toId: b.id, type: "PATCHES", instruction: "patches", sessionId: TEST_SID });
+
+    const deleted = await deleteEdges(driver, a.id, b.id, "REQUIRES");
+    expect(deleted).toBe(1);
+
+    const remaining = await edgesFrom(driver, a.id);
+    const abRemaining = remaining.filter(e => e.toId === b.id);
+    expect(abRemaining).toHaveLength(1);
+    expect(abRemaining[0].type).toBe("PATCHES");
+  });
+
+  it("deleteEdges 不带 type：删除 from→to 之间所有边（gm_unlink 全删）", async () => {
+    const { node: a } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink All A", description: "a", content: "a",
+    }, TEST_SID);
+    const { node: b } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink All B", description: "b", content: "b",
+    }, TEST_SID);
+
+    await upsertEdge(driver, { fromId: a.id, toId: b.id, type: "REQUIRES", instruction: "x", sessionId: TEST_SID });
+    await upsertEdge(driver, { fromId: a.id, toId: b.id, type: "PATCHES", instruction: "y", sessionId: TEST_SID });
+
+    const deleted = await deleteEdges(driver, a.id, b.id);
+    expect(deleted).toBe(2);
+
+    const remaining = (await edgesFrom(driver, a.id)).filter(e => e.toId === b.id);
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("deleteEdges 不存在的边返回 0", async () => {
+    const { node: a } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink Empty A", description: "a", content: "a",
+    }, TEST_SID);
+    const { node: b } = await upsertNode(driver, {
+      type: "SKILL", name: "Unlink Empty B", description: "b", content: "b",
+    }, TEST_SID);
+    const deleted = await deleteEdges(driver, a.id, b.id);
+    expect(deleted).toBe(0);
   });
 
   // ─── SQLite 时代 store 测试意图移植 ─────────────────────────────

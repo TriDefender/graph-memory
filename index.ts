@@ -14,6 +14,7 @@ import {
   upsertNode, upsertEdge, findByName, updateNode,
   deleteNode, deprecateNodeAndDisconnect,
   getBySession, edgesFrom, edgesTo,
+  deleteEdges, mergeNodes,
   deprecate, getStats,
 } from "./src/store/store.ts";
 import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
@@ -23,7 +24,7 @@ import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
-import { DEFAULT_CONFIG, type GmConfig, type RecallResult } from "./src/types.ts";
+import { DEFAULT_CONFIG, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 
 // ─── 从 OpenClaw config 读默认 model 名 ──────────────────────
@@ -50,6 +51,14 @@ export function readDefaultModel(apiConfig: unknown): string {
     return rest.join("/").trim();
   }
   return raw;
+}
+
+function throwNodeNotFound(name: string): never {
+  throw new Error(
+    `[graph-memory-pro] 未找到名称为 "${name}" 的节点。` +
+    `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
+    `或使用 gm_search 搜索已有节点。`,
+  );
 }
 
 // ─── 清洗 OpenClaw metadata 包装 ─────────────────────────────
@@ -681,12 +690,39 @@ const graphMemoryProPlugin = {
       (_ctx: any) => ({
         name: "gm_search",
         label: "Search Graph Memory",
-        description: "搜索知识图谱中的相关经验、技能和解决方案。",
+        description: "搜索知识图谱中的相关经验、技能和解决方案。支持按时间筛选：after（晚于某时间点）/before（早于某时间点）/两者同传（区间），timeField 选择 createdAt(默认) 或 updatedAt。",
         parameters: Type.Object({
           query: Type.String({ description: "搜索关键词或问题描述" }),
+          after: Type.Optional(Type.String({
+            description: "可选。ISO 8601 时间点（如 '2024-01-01' 或 '2024-01-01T00:00:00Z'），只返回 timeField >= 此刻的节点。晚于该时间。",
+          })),
+          before: Type.Optional(Type.String({
+            description: "可选。ISO 8601 时间点，只返回 timeField <= 此刻的节点。早于该时间。与 after 同传即区间筛选。",
+          })),
+          timeField: Type.Optional(Type.Union([
+            Type.Literal("createdAt"),
+            Type.Literal("updatedAt"),
+          ], { description: "按哪个时间字段筛选，默认 createdAt" })),
         }),
-        async execute(_toolCallId: string, params: { query: string }) {
-          const res = await recaller.recall(params.query);
+        async execute(_toolCallId: string, params: {
+          query: string;
+          after?: string;
+          before?: string;
+          timeField?: "createdAt" | "updatedAt";
+        }) {
+          let res;
+          try {
+            res = await recaller.recall(params.query, {
+              after: params.after,
+              before: params.before,
+              timeField: params.timeField,
+            });
+          } catch (e: any) {
+            return {
+              content: [{ type: "text", text: `时间筛选参数错误：${e?.message ?? e}` }],
+              details: { count: 0, query: params.query, error: true },
+            };
+          }
           if (!res.nodes.length) {
             return { content: [{ type: "text", text: "图谱中未找到相关记录。" }], details: { count: 0, query: params.query } };
           }
@@ -839,6 +875,169 @@ const graphMemoryProPlugin = {
         },
       }),
       { name: "gm_update" },
+    );
+
+    const EDGE_TYPE_LITERAL = (label: string) => Type.Literal(label);
+    const edgeTypeUnion = (description: string) => Type.Union(
+      [EDGE_TYPE_LITERAL("USED_SKILL"), EDGE_TYPE_LITERAL("SOLVED_BY"),
+       EDGE_TYPE_LITERAL("REQUIRES"), EDGE_TYPE_LITERAL("PATCHES"),
+       EDGE_TYPE_LITERAL("CONFLICTS_WITH")],
+      { description },
+    );
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_link",
+        label: "Link Graph Memory Nodes",
+        description:
+          "手动在两个已存在节点之间建立关系边。两端节点必须存在；类型和方向必须符合图谱白名单" +
+          "（USED_SKILL: TASK→SKILL；SOLVED_BY: EVENT|SKILL→SKILL；REQUIRES/PATCHES/CONFLICTS_WITH: SKILL→SKILL）。" +
+          "用于纠正 LLM 提取遗漏的关系或细化现有 instruction。同 from+to+type 已存在时仅更新 instruction。",
+        parameters: Type.Object({
+          from: Type.String({ description: "起点节点名（必须已存在；会被标准化）" }),
+          to: Type.String({ description: "终点节点名（必须已存在；会被标准化）" }),
+          type: edgeTypeUnion("关系类型（详见白名单方向规则）"),
+          instruction: Type.String({ description: "关系的自然语言说明（一句话）" }),
+          condition: Type.Optional(Type.String({ description: "关系生效的条件（可选）" })),
+        }),
+        async execute(
+          _toolCallId: string,
+          p: { from: string; to: string; type: EdgeType; instruction: string; condition?: string },
+        ) {
+          const fromNode = await findByName(driver, p.from);
+          const toNode = await findByName(driver, p.to);
+          if (!fromNode) throwNodeNotFound(p.from);
+          if (!toNode) throwNodeNotFound(p.to);
+
+          const stored = await upsertEdge(driver, {
+            fromId: fromNode.id, toId: toNode.id, type: p.type,
+            instruction: p.instruction, condition: p.condition, sessionId: "manual",
+          });
+          if (!stored) {
+            throw new Error(
+              `[graph-memory-pro] ${p.type} 方向不被允许：${fromNode.type} → ${toNode.type}` +
+              `（白名单：USED_SKILL: TASK→SKILL；SOLVED_BY: EVENT|SKILL→SKILL；REQUIRES/PATCHES/CONFLICTS_WITH: SKILL→SKILL）`,
+            );
+          }
+          return {
+            content: [{
+              type: "text",
+              text: `已连接：${fromNode.name} -[${p.type}]-> ${toNode.name}\n说明：${p.instruction}`,
+            }],
+            details: {
+              from: fromNode.name, to: toNode.name, type: p.type,
+              instruction: p.instruction, condition: p.condition ?? null,
+            },
+          };
+        },
+      }),
+      { name: "gm_link" },
+    );
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_unlink",
+        label: "Unlink Graph Memory Nodes",
+        description:
+          "手动删除 from→to 方向的关系边（仅匹配 (from)-[r]->(to)，不影响 to→from 方向的边）。" +
+          "可选 type 只删该类型，不传则删除 from→to 方向上所有类型的边。" +
+          "用于清理 LLM 错误提取的关系或重置关系集合。两端节点保留。",
+        parameters: Type.Object({
+          from: Type.String({ description: "起点节点名（必须已存在）" }),
+          to: Type.String({ description: "终点节点名（必须已存在）" }),
+          type: Type.Optional(edgeTypeUnion("只删该类型的边；省略则删除 from→to 方向上所有类型的边（不影响 to→from）")),
+        }),
+        async execute(
+          _toolCallId: string,
+          p: { from: string; to: string; type?: EdgeType },
+        ) {
+          const fromNode = await findByName(driver, p.from);
+          const toNode = await findByName(driver, p.to);
+          if (!fromNode) throwNodeNotFound(p.from);
+          if (!toNode) throwNodeNotFound(p.to);
+
+          const deleted = await deleteEdges(driver, fromNode.id, toNode.id, p.type);
+          const typeHint = p.type ? ` (type=${p.type})` : " (所有类型)";
+          if (deleted === 0) {
+            return {
+              content: [{
+                type: "text",
+                text: `未找到 ${fromNode.name} → ${toNode.name} 之间的边${typeHint}，无操作。`,
+              }],
+              details: { deleted: 0, from: fromNode.name, to: toNode.name, type: p.type ?? null },
+            };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: `已删除 ${deleted} 条边：${fromNode.name} → ${toNode.name}${typeHint}`,
+            }],
+            details: { deleted, from: fromNode.name, to: toNode.name, type: p.type ?? null },
+          };
+        },
+      }),
+      { name: "gm_unlink" },
+    );
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "gm_merge",
+        label: "Merge Graph Memory Nodes",
+        description:
+          "合并两个同类型的重复节点。keep 节点保留并吸收 merge 节点的 validatedCount / 较长 content/description / sourceSessions；" +
+          "merge 节点的入/出边去重迁移到 keep 后被标记 deprecated（不硬删）。用于清理 LLM 重复提取产生的同名变体。" +
+          "合并后建议再调用 gm_maintain 刷新 PageRank 和社区。",
+        parameters: Type.Object({
+          keep: Type.String({ description: "保留的节点名（必须已存在）" }),
+          merge: Type.String({ description: "被合并的节点名（必须已存在，类型必须与 keep 相同，会被标记 deprecated）" }),
+        }),
+        async execute(
+          _toolCallId: string,
+          p: { keep: string; merge: string },
+        ) {
+          const keepNode = await findByName(driver, p.keep);
+          const mergeNode = await findByName(driver, p.merge);
+          if (!keepNode) throwNodeNotFound(p.keep);
+          if (!mergeNode) throwNodeNotFound(p.merge);
+
+          if (keepNode.id === mergeNode.id) {
+            throw new Error(
+              `[graph-memory-pro] keep 和 merge 解析到同一个节点（id=${keepNode.id}，name="${keepNode.name}"）。` +
+              `名称标准化后等价（如 "React" 和 "react"），无需合并。`,
+            );
+          }
+
+          if (keepNode.type !== mergeNode.type) {
+            throw new Error(
+              `[graph-memory-pro] 类型不匹配：keep="${keepNode.name}"(${keepNode.type}) vs merge="${mergeNode.name}"(${mergeNode.type})` +
+              `（合并要求两端同类型，请用 gm_search 确认节点类型）`,
+            );
+          }
+
+          await mergeNodes(driver, keepNode.id, mergeNode.id);
+
+          const kept = await findByName(driver, p.keep);
+          if (kept) recaller.syncEmbed(kept).catch(() => {});
+
+          return {
+            content: [{
+              type: "text",
+              text:
+                `已合并：${mergeNode.name} → ${keepNode.name} (${keepNode.type})\n` +
+                `- validatedCount 累加\n` +
+                `- content/description 取较长版本\n` +
+                `- sourceSessions 取并集\n` +
+                `- 入边/出边去重迁移到 keep（同类型同端点已存在的丢弃，避免重复）\n` +
+                `- merge 节点标记 deprecated（节点保留，不硬删）`,
+            }],
+            details: {
+              kept: kept ? { name: kept.name, type: kept.type, validatedCount: kept.validatedCount } : null,
+              merged: { name: mergeNode.name, type: mergeNode.type, status: "deprecated" },
+            },
+          };
+        },
+      }),
+      { name: "gm_merge" },
     );
 
     api.registerTool(

@@ -543,6 +543,35 @@ export async function edgesTo(driver: Driver, id: string): Promise<GmEdge[]> {
   }
 }
 
+/** 删除 from→to 之间的边；type 省略时删除所有类型。返回删除条数。 */
+export async function deleteEdges(
+  driver: Driver,
+  fromId: string,
+  toId: string,
+  type?: EdgeType,
+): Promise<number> {
+  const session = getSession(driver);
+  try {
+    const result = type
+      ? await session.run(
+          `MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
+           WHERE type(r) = $type
+           DELETE r
+           RETURN count(r) AS deleted`,
+          { fromId, toId, type },
+        )
+      : await session.run(
+          `MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
+           DELETE r
+           RETURN count(r) AS deleted`,
+          { fromId, toId },
+        );
+    return toInt(result.records[0]?.get("deleted") ?? 0);
+  } finally {
+    await session.close();
+  }
+}
+
 // ─── 搜索 ───────────────────────────────────────────────────
 
 /** 全文搜索节点（CONTAINS 模糊匹配） */

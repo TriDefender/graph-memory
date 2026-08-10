@@ -119,6 +119,9 @@ openclaw gateway --verbose
 | `gm_search` | 按查询召回图谱知识 |
 | `gm_record` | 手动记录知识节点 |
 | `gm_update` | 按精确节点名称更新 / 删除 / 弃用已有节点（不存在则报错）。`mode=update`（默认）refine description/content；`mode=delete` 硬删除节点及其所有关系；`mode=deprecate` 标记 `[DEPRECATED]` 并删除所有关系（节点本身保留但被隔离） |
+| `gm_link` | 手动在两个已存在节点之间建立或细化关系边（按白名单校验类型+方向；from+to+type 已存在时仅更新 instruction） |
+| `gm_unlink` | 按名称删除两节点之间的关系边；可选 type 过滤，不传则删除 from→to 之间所有边 |
+| `gm_merge` | 合并两个同类型重复节点：keep 吸收 content/validatedCount/sessions + 去重边迁移；merge 节点被软删除（deprecated） |
 | `gm_stats` | 查看节点、关系、社区和 PageRank 统计 |
 | `gm_maintain` | 执行去重、PageRank 和社区维护 |
 

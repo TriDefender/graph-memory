@@ -148,6 +148,9 @@ Inspect the graph with the bundled Cypher shell:
 | `gm_search` | Recall graph knowledge for a query |
 | `gm_record` | Add a knowledge node manually |
 | `gm_update` | Update, delete, or deprecate an existing node by exact name. `mode=update` (default) refines description/content; `mode=delete` hard-deletes the node and all its relationships; `mode=deprecate` marks `[DEPRECATED]` and removes all relationships while keeping the node (throws if not found) |
+| `gm_link` | Manually create or refine an edge between two existing nodes (validates type + direction against the whitelist; idempotent on from+to+type) |
+| `gm_unlink` | Remove edges between two nodes by name; optional `type` filter, otherwise all from→to edges |
+| `gm_merge` | Merge two same-type duplicate nodes: keep absorbs content/validatedCount/sessions + dedup-aware edge migration; merge is soft-deleted |
 | `gm_stats` | Show node, relationship, community, and PageRank statistics |
 | `gm_maintain` | Run deduplication, PageRank, and community maintenance |
 
