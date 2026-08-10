@@ -9,7 +9,7 @@
  * `program` 实例由 OpenClaw host 运行时注入，本模块只依赖其鸭子类型形状。
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -59,8 +59,19 @@ const DEFAULT_TIMEOUT_SECONDS = 120;
 
 // ─── 配置文件读写（最小实现） ───────────────────────────────────
 
-interface OpenClawConfigRoot {
-  plugins?: Record<string, Record<string, unknown> | undefined>;
+interface OpenClawPluginEntry {
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+interface OpenClawPluginsConfig {
+  entries?: Record<string, OpenClawPluginEntry | undefined>;
+  [key: string]: unknown;
+}
+
+export interface OpenClawConfigRoot {
+  plugins?: OpenClawPluginsConfig;
   [key: string]: unknown;
 }
 
@@ -85,15 +96,34 @@ async function loadOpenClawConfig(configPath: string): Promise<OpenClawConfigRoo
 
 async function saveOpenClawConfig(configPath: string, config: OpenClawConfigRoot): Promise<void> {
   await mkdir(path.dirname(configPath), { recursive: true });
-  await writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+  const temporaryPath = `${configPath}.graph-memory-${process.pid}.tmp`;
+  let mode = 0o600;
+  try {
+    mode = (await stat(configPath)).mode & 0o777;
+  } catch {}
+  await writeFile(temporaryPath, JSON.stringify(config, null, 2) + "\n", {
+    encoding: "utf8",
+    mode,
+  });
+  await chmod(temporaryPath, mode);
+  await rename(temporaryPath, configPath);
 }
 
-function ensurePluginConfigRoot(config: OpenClawConfigRoot, pluginId: string): Record<string, unknown> {
-  if (!config.plugins) config.plugins = {};
-  if (!config.plugins[pluginId] || typeof config.plugins[pluginId] !== "object") {
-    config.plugins[pluginId] = {};
+/** Return plugins.entries[pluginId].config, preserving the rest of openclaw.json. */
+export function ensurePluginConfigRoot(
+  config: OpenClawConfigRoot,
+  pluginId: string,
+): Record<string, unknown> {
+  if (!isPlainObject(config.plugins)) config.plugins = {};
+  if (!isPlainObject(config.plugins.entries)) config.plugins.entries = {};
+
+  const entries = config.plugins.entries;
+  if (!isPlainObject(entries[pluginId])) {
+    entries[pluginId] = { enabled: true, config: {} };
   }
-  return config.plugins[pluginId] as Record<string, unknown>;
+  const entry = entries[pluginId] as OpenClawPluginEntry;
+  if (!isPlainObject(entry.config)) entry.config = {};
+  return entry.config;
 }
 
 // ─── Provider / model 选择（简化版，当前仅支持 openai-codex） ────
@@ -149,8 +179,9 @@ async function backupLegacyLlmConfig(oauthPath: string, legacyLlm: unknown): Pro
   await writeFile(
     backupPath,
     JSON.stringify({ backedUpAt: new Date().toISOString(), llm: legacyLlm }, null, 2) + "\n",
-    "utf8",
+    { encoding: "utf8", mode: 0o600 },
   );
+  await chmod(backupPath, 0o600);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -159,6 +190,35 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function isOauthLlmConfig(llm: unknown): boolean {
   return isPlainObject(llm) && llm.provider === "oauth";
+}
+
+export function applyOAuthConfig(
+  config: OpenClawConfigRoot,
+  pluginId: string,
+  oauth: {
+    providerId: OAuthProviderId;
+    oauthPath: string;
+    model: string;
+    reasoningEffort: ReasoningEffort;
+  },
+): { existingLlm: Record<string, unknown>; wasOauthMode: boolean } {
+  const pluginConfig = ensurePluginConfigRoot(config, pluginId);
+  const hadLlmConfig = isPlainObject(pluginConfig.llm);
+  const existingLlm: Record<string, unknown> = hadLlmConfig
+    ? { ...(pluginConfig.llm as Record<string, unknown>) }
+    : {};
+  const wasOauthMode = isOauthLlmConfig(existingLlm);
+
+  pluginConfig.llm = {
+    ...existingLlm,
+    provider: "oauth",
+    oauthProvider: oauth.providerId,
+    oauthPath: oauth.oauthPath,
+    model: oauth.model,
+    reasoningEffort: oauth.reasoningEffort,
+  };
+
+  return { existingLlm, wasOauthMode };
 }
 
 // ─── CLI 工厂 ───────────────────────────────────────────────────
@@ -189,8 +249,8 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
       .option("--model <model>", "保存到 llm.model 的模型名（覆盖默认值）", undefined)
       .option(
         "--effort <level>",
-        "推理模型思考强度：low / medium / high（默认 medium）",
-        "medium",
+        "推理模型思考强度：low / medium / high（默认沿用现有配置，否则 medium）",
+        undefined,
       )
       .option(
         "--oauth-path <path>",
@@ -226,7 +286,9 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
           const currentEffort = typeof currentLlm?.reasoningEffort === "string" ? currentLlm.reasoningEffort : undefined;
 
           // ── 校验并解析 reasoningEffort（CLI flag > 当前配置 > 默认 medium） ──
-          const effortFlag = typeof options.effort === "string" ? options.effort.trim().toLowerCase() : "medium";
+          const effortFlag = typeof options.effort === "string"
+            ? options.effort.trim().toLowerCase()
+            : (currentEffort?.trim().toLowerCase() || "medium");
           if (effortFlag !== "low" && effortFlag !== "medium" && effortFlag !== "high") {
             throw new Error(`--effort 仅支持 low / medium / high，收到：${effortFlag || "(空)"}`);
           }
@@ -283,26 +345,16 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
 
           // ── 写回 openclaw.json，切换到 oauth provider ──
           const openclawConfig = await loadOpenClawConfig(configPath);
-          const pluginConfig = ensurePluginConfigRoot(openclawConfig, pluginId);
-          const hadLlmConfig = isPlainObject(pluginConfig.llm);
-          const existingLlm: Record<string, unknown> = hadLlmConfig
-            ? { ...(pluginConfig.llm as Record<string, unknown>) }
-            : {};
-          const wasOauthMode = isOauthLlmConfig(existingLlm);
-
-          if (!wasOauthMode && hadLlmConfig) {
-            await backupLegacyLlmConfig(oauthPath, existingLlm);
-          }
-
-          // graph-memory-pro 用 llm.provider 路由（修 #48），不是 llm.auth
-          pluginConfig.llm = {
-            ...existingLlm,
-            provider: "oauth",
-            oauthProvider: selectedProvider.providerId,
+          const { existingLlm, wasOauthMode } = applyOAuthConfig(openclawConfig, pluginId, {
+            providerId: selectedProvider.providerId,
             oauthPath,
             model: oauthModel,
             reasoningEffort,
-          };
+          });
+
+          if (!wasOauthMode && Object.keys(existingLlm).length > 0) {
+            await backupLegacyLlmConfig(oauthPath, existingLlm);
+          }
 
           await saveOpenClawConfig(configPath, openclawConfig);
 
@@ -311,8 +363,9 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
             `已更新 ${pluginId} 配置：llm.provider=oauth, llm.oauthProvider=${selectedProvider.providerId}, llm.oauthPath=${oauthPath}, llm.model=${oauthModel}, llm.reasoningEffort=${reasoningEffort}`,
           );
         } catch (error) {
-          console.error("OAuth 登录失败：", error instanceof Error ? error.message : error);
-          process.exit(1);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error("OAuth 登录失败：", message);
+          throw new Error(`[graph-memory-pro] OAuth login failed: ${message}`);
         }
       });
   };

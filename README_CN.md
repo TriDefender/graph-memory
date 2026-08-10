@@ -81,6 +81,17 @@ bash setup-graph-memory-pro.sh --uninstall
 
 `embedding` 可选。设置时，`dimensions` 必须与 Neo4j 向量索引维度一致。新数据库会在插件启动时按配置创建索引；更换维度后需要重建向量索引或 Neo4j 数据库。
 
+### OAuth 登录（实验性）
+
+```bash
+openclaw graph-memory auth login
+```
+
+命令通过浏览器完成登录，将令牌以 `0600` 权限保存到
+`~/.openclaw/.graph-memory-pro/oauth.json`，并原子更新
+`plugins.entries.graph-memory-pro.config.llm`。原有非 OAuth LLM 配置会备份到同目录的
+`llm-config.backup.json`。此路径依赖 Codex/ChatGPT 的 OAuth 与后端协议，不属于稳定的公开 OpenAI API 合约；生产环境优先使用 API Key 配置。
+
 ## 数据流
 
 ```text
@@ -133,7 +144,7 @@ npm run build
 npm test
 ```
 
-`npm run build` 只进行 TypeScript 类型检查。
+`npm run typecheck` 检查源码和测试类型；`npm run build` 将安装时使用的 JavaScript 运行入口输出到 `dist/`。OpenClaw 在源码工作区使用 TypeScript 入口，在安装包中优先使用构建后的入口。
 
 ### 集成测试
 

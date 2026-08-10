@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts", "index.ts"],
+  "exclude": ["test/**/*.ts", "dist", "node_modules"]
+}

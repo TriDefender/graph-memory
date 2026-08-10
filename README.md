@@ -108,6 +108,17 @@ Anthropic direct (Claude) — drop `baseURL`, switch `provider`:
 
 `embedding` is optional. When present, `dimensions` must match the Neo4j vector index dimension. For a fresh database, the plugin creates matching indexes during startup. If you change dimensions later, recreate the vector indexes or the Neo4j database.
 
+### OAuth login (experimental)
+
+```bash
+openclaw graph-memory auth login
+```
+
+The command completes login in a browser, stores tokens at
+`~/.openclaw/.graph-memory-pro/oauth.json` with mode `0600`, and atomically updates
+`plugins.entries.graph-memory-pro.config.llm`. A previous non-OAuth LLM configuration is backed up as
+`llm-config.backup.json` in the same directory. This path depends on Codex/ChatGPT OAuth and backend protocols rather than the stable public OpenAI API contract; prefer API-key configuration for production deployments.
+
 ## Data Flow
 
 ```text
@@ -173,7 +184,7 @@ NEO4J_INTEGRATION=1 npm test
 
 CI runs them via a Docker Neo4j service container — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-`npm run build` performs TypeScript typechecking only. Add integration tests under `test/integration.*.test.ts` whenever you change storage or Cypher behavior; unit tests cover pure logic only.
+`npm run typecheck` validates source and test types. `npm run build` emits the installed runtime to `dist/`; OpenClaw uses the source entry for a checkout and the built entry for an installed package. Add integration tests under `test/integration.*.test.ts` whenever you change storage or Cypher behavior; unit tests cover pure logic only.
 
 ## License
 

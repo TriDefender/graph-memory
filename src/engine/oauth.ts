@@ -9,7 +9,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { platform } from "node:os";
 import { spawn } from "node:child_process";
@@ -381,7 +381,7 @@ export async function loadOAuthSession(authPath: string): Promise<OAuthSession> 
 }
 
 export function needsRefresh(session: OAuthSession): boolean {
-  return !!session.refreshToken && !!session.expiresAt && session.expiresAt - EXPIRY_SKEW_MS <= Date.now();
+  return !!session.expiresAt && session.expiresAt - EXPIRY_SKEW_MS <= Date.now();
 }
 
 export async function refreshOAuthSession(session: OAuthSession, timeoutMs?: number): Promise<OAuthSession> {
@@ -456,6 +456,9 @@ export async function saveOAuthSession(authPath: string, session: OAuthSession):
     encoding: "utf8",
     mode: 0o600,
   });
+  // writeFile's mode only applies when a file is first created. Tighten an
+  // existing session file too, because it contains bearer and refresh tokens.
+  await chmod(authPath, 0o600);
 }
 
 // ─── Model normalization ──────────────────────────────────────
@@ -605,21 +608,23 @@ async function exchangeAuthorizationCode(code: string, verifier: string, provide
 }
 
 function tryOpenBrowser(url: string): void {
+  const detach = (command: string, args: string[]): void => {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+  };
   const targetPlatform = platform();
   if (targetPlatform === "darwin") {
-    const child = spawn("open", [url], { detached: true, stdio: "ignore" });
-    child.unref();
+    detach("open", [url]);
     return;
   }
 
   if (targetPlatform === "win32") {
-    const child = spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" });
-    child.unref();
+    detach("cmd", ["/c", "start", "", url]);
     return;
   }
 
-  const child = spawn("xdg-open", [url], { detached: true, stdio: "ignore" });
-  child.unref();
+  detach("xdg-open", [url]);
 }
 
 export function resolveOAuthCallbackListenHost(redirectUri: URL | string): string {
