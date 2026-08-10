@@ -8,7 +8,8 @@
   "main": "index.ts",
   "slots": ["contextEngine"],
   "contracts": {
-    "tools": ["gm_search", "gm_record", "gm_update", "gm_stats", "gm_maintain"]
+    "tools": ["gm_search", "gm_record", "gm_update", "gm_stats", "gm_maintain"],
+    "cli": ["graph-memory"]
   },
   "configSchema": {
     "type": "object",
@@ -45,7 +46,13 @@
           "timeoutMs": { "type": "number", "default": 60000, "description": "单次 LLM 请求超时（毫秒）" },
           "maxTokens": { "type": "number", "default": 4000, "description": "补全 token 预算，如果报错多请适当调高" },
           "oauthPath": { "type": "string", "description": "OAuth 会话文件路径（provider=oauth 时必填，自动生成）" },
-          "oauthProvider": { "type": "string", "default": "openai-codex", "description": "OAuth 提供商标识（目前仅支持 openai-codex）" }
+          "oauthProvider": { "type": "string", "default": "openai-codex", "description": "OAuth 提供商标识（目前仅支持 openai-codex）" },
+          "reasoningEffort": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "default": "medium",
+            "description": "推理模型思考强度（仅 provider=oauth 生效）。low=快速响应，medium=平衡，high=深度推理"
+          }
         }
       },
       "embedding": {

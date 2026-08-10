@@ -36,6 +36,11 @@ import type { OAuthSession } from "./oauth.ts";
 
 export type LlmProvider = "openai" | "anthropic" | "oauth";
 
+/** OpenAI Codex Responses API 思考强度。low=快速、medium=平衡、high=深度推理。 */
+export type ReasoningEffort = "low" | "medium" | "high";
+
+const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
+
 export interface LlmConfig {
   /** 显式 provider 切换。未设时按 baseURL 是否存在推断（向后兼容，仅产生 openai/anthropic）。 */
   provider?: LlmProvider;
@@ -45,10 +50,12 @@ export interface LlmConfig {
   /** 单次 LLM 请求超时（毫秒）。未配时默认 60000。OAuth 刷新令牌也用此值。 */
   timeoutMs?: number;
   maxTokens?: number;
-  /** OAuth 会话文件路径（provider="oauth" 时必填）。文件由 `codex login` 或 performOAuthLogin() 生成。 */
+  /** OAuth 会话文件路径（provider="oauth" 时必填）。文件由 `openclaw graph-memory auth login` 生成。 */
   oauthPath?: string;
   /** OAuth 提供商标识（默认 "openai-codex"，目前仅支持此一种）。 */
   oauthProvider?: string;
+  /** 推理模型思考强度（仅 oauth provider 生效；默认 "medium"）。 */
+  reasoningEffort?: ReasoningEffort;
 }
 
 export type CompleteFn = (system: string, user: string) => Promise<string>;
@@ -127,6 +134,12 @@ export function createCompleteFn(
   const maxTokens = llmConfig?.maxTokens && llmConfig.maxTokens > 0
     ? llmConfig.maxTokens
     : DEFAULT_LLM_MAX_TOKENS;
+  const reasoningEffort: ReasoningEffort =
+    llmConfig?.reasoningEffort === "low" ||
+    llmConfig?.reasoningEffort === "medium" ||
+    llmConfig?.reasoningEffort === "high"
+      ? llmConfig.reasoningEffort
+      : DEFAULT_REASONING_EFFORT;
 
   // ── OAuth 会话缓存：单飞刷新，避免并发请求同时触发 refresh ──
   const oauthPath = provider === "oauth" ? llmConfig?.oauthPath : undefined;
@@ -192,6 +205,7 @@ export function createCompleteFn(
               content: [{ type: "input_text", text: user }],
             },
           ],
+          reasoning: { effort: reasoningEffort },
           store: false,
           stream: false,
           text: { format: { type: "text" } },

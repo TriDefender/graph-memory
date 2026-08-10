@@ -88,8 +88,8 @@ const OAUTH_PROVIDERS: Record<OAuthProviderId, OAuthProviderDefinition> = {
     scope: "openid profile email offline_access",
     accountIdClaim: "https://api.openai.com/auth",
     backendBaseUrl: "https://chatgpt.com/backend-api",
-    defaultModel: "gpt-5.4",
-    modelPattern: /^(gpt-|o[1345]\b|o\d-mini\b|gpt-5|gpt-4|gpt-4o|gpt-5-codex|gpt-5\.1-codex)/i,
+    defaultModel: "gpt-5.6-luna",
+    modelPattern: /^(gpt-|o[1345]\b|o\d-mini\b|gpt-5|gpt-4|gpt-4o|gpt-5-codex|gpt-5\.1-codex|gpt-5\.6)/i,
     extraAuthorizeParams: {
       id_token_add_organizations: "true",
       codex_cli_simplified_flow: "true",
@@ -387,7 +387,7 @@ export function needsRefresh(session: OAuthSession): boolean {
 export async function refreshOAuthSession(session: OAuthSession, timeoutMs?: number): Promise<OAuthSession> {
   if (!session.refreshToken) {
     throw new Error(
-      `OAuth session from ${session.authPath} is expired and has no refresh token. Re-run \`codex login\`.`,
+      `OAuth session from ${session.authPath} is expired and has no refresh token. Re-run \`openclaw graph-memory auth login\`.`,
     );
   }
 

@@ -133,7 +133,18 @@ npm run build
 npm test
 ```
 
-`npm run build` 只进行 TypeScript 类型检查。当前移植版没有 live-Neo4j 集成测试；修改存储层或 Cypher 前应补充针对 Neo4j 的集成测试。
+`npm run build` 只进行 TypeScript 类型检查。
+
+### 集成测试
+
+存储层 / Cypher / 图算法的变更由集成测试覆盖，需要带 APOC 和 GDS 的 Neo4j 实例：
+
+```bash
+# 本地运行：先启动 Neo4j 5.24.2 + APOC + GDS，然后
+NEO4J_INTEGRATION=1 npm test
+```
+
+CI 通过 Docker Neo4j 服务容器运行这些测试——详见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。修改存储层或 Cypher 行为时，请在 `test/integration.*.test.ts` 下补充集成测试；单元测试仅覆盖纯逻辑。
 
 ## 许可证
 

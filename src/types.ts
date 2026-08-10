@@ -153,8 +153,12 @@ export interface GmConfig {
     model?: string;
     timeoutMs?: number;
     maxTokens?: number;
+    /** OAuth 会话文件路径（provider="oauth" 时必填）。 */
     oauthPath?: string;
+    /** OAuth 提供商标识（默认 "openai-codex"）。 */
     oauthProvider?: string;
+    /** 推理模型思考强度（仅 oauth provider 生效；默认 "medium"）。 */
+    reasoningEffort?: "low" | "medium" | "high";
   };
   dedupThreshold: number;
   pagerankDamping: number;

@@ -26,6 +26,7 @@ import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts"
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { DEFAULT_CONFIG, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
+import { createGraphMemoryCli } from "./src/cli.ts";
 
 // ─── 从 OpenClaw config 读默认 model 名 ──────────────────────
 
@@ -275,7 +276,7 @@ const graphMemoryProPlugin = {
       if (!cfg.llm?.oauthPath) {
         api.logger.error(
           '[graph-memory-pro] llm.provider=oauth 但未配 llm.oauthPath — LLM 调用将失败。' +
-          '请先用 `codex login` 生成 OAuth 会话文件，然后在 config.llm.oauthPath 中指定路径',
+          '请先用 `openclaw graph-memory auth login` 生成 OAuth 会话文件，然后在 config.llm.oauthPath 中指定路径',
         );
       } else {
         api.logger.info(
@@ -1113,6 +1114,18 @@ const graphMemoryProPlugin = {
 
     // ── CRUD REST 路由（给 ClawX 前端用） ─────────────────
     registerCrudRoutes(api, driver, recaller);
+
+    // ── CLI：`openclaw graph-memory auth login`（OAuth 触发入口） ──
+    if (typeof api.registerCli === "function") {
+      api.registerCli(
+        createGraphMemoryCli({
+          pluginId: "graph-memory-pro",
+          pluginConfig: raw as Record<string, unknown> | undefined,
+          resolveConfigPath: (p: string) => api.resolvePath?.(p) ?? p,
+        }),
+        { commands: ["graph-memory"] },
+      );
+    }
 
     // ── Neovis 配置接口（给 ClawX 前端用） ──────────────────
 

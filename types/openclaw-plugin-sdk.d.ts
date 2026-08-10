@@ -8,16 +8,41 @@
 declare module "openclaw/plugin-sdk" {
   import type { IncomingMessage, ServerResponse } from "http";
 
-  export type OpenClawPluginHttpRouteHandler = (
-    req: IncomingMessage,
-    res: ServerResponse,
-  ) => Promise<boolean | void> | boolean | void;
+  export interface OpenClawPluginHttpRouteHandler {
+    (req: IncomingMessage, res: ServerResponse):
+      | Promise<boolean | void>
+      | boolean
+      | void;
+  }
 
   export interface OpenClawPluginHttpRouteParams {
     path: string;
     handler: OpenClawPluginHttpRouteHandler;
     auth: "gateway" | "plugin";
     match?: "exact" | "prefix";
+  }
+
+  /** Minimal commander-compatible surface; the real instance is injected by host. */
+  export interface OpenClawPluginCliCommand {
+    command(name: string): OpenClawPluginCliCommand;
+    description(text: string): OpenClawPluginCliCommand;
+    option(flags: string, description?: string, defaultValue?: unknown): OpenClawPluginCliCommand;
+    action(handler: (options: Record<string, unknown>) => void | Promise<void>): OpenClawPluginCliCommand;
+  }
+
+  export interface OpenClawPluginCliContext {
+    program: OpenClawPluginCliCommand;
+    parentPath: readonly string[];
+    config: any;
+    workspaceDir?: string;
+    logger: OpenClawPluginLogger;
+  }
+
+  export type OpenClawPluginCliRegistrar = (ctx: OpenClawPluginCliContext) => void | Promise<void>;
+
+  export interface OpenClawPluginCliRegistrationOptions {
+    parentPath?: readonly string[];
+    commands?: readonly string[];
   }
 
   export interface OpenClawPluginLogger {
@@ -36,6 +61,10 @@ declare module "openclaw/plugin-sdk" {
     registerContextEngine(id: string, factory: (...args: any[]) => any): void;
     registerTool(...args: any[]): void;
     registerHttpRoute(params: OpenClawPluginHttpRouteParams): void;
+    registerCli?(
+      registrar: OpenClawPluginCliRegistrar,
+      opts?: OpenClawPluginCliRegistrationOptions,
+    ): void;
     [key: string]: any;
   }
 }

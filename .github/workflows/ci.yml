@@ -86,7 +86,7 @@ jobs:
         run: |
           # 用 if/then 控制流，避免 set -e 在文件不存在时让 job 失败
           status=0
-          for f in setup-graph-memory-pro.sh migrate/install-wsl.sh; do
+          for f in setup-graph-memory-pro.sh; do
             if [[ -f "$f" ]]; then
               if bash -n "$f"; then
                 echo "OK: $f"
