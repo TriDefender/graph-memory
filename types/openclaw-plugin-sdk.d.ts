@@ -28,6 +28,7 @@ declare module "openclaw/plugin-sdk" {
     description(text: string): OpenClawPluginCliCommand;
     option(flags: string, description?: string, defaultValue?: unknown): OpenClawPluginCliCommand;
     action(handler: (options: Record<string, unknown>) => void | Promise<void>): OpenClawPluginCliCommand;
+    outputHelp(): void;
   }
 
   export interface OpenClawPluginCliContext {
