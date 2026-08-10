@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [2.0, desktop-2.0, dev, main]
+  pull_request:
+    branches: [2.0, desktop-2.0, dev, main]
+
+jobs:
+  typecheck:
+    name: TypeScript typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Verify built runtime entry
+        run: test -f dist/index.js
+
+  unit-tests:
+    name: Unit tests (no DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+        env:
+          # 不设 NEO4J_INTEGRATION，集成测试自动 skip
+          CI: "true"
+
+  integration-tests:
+    name: Integration tests (Neo4j 5 + APOC + GDS)
+    runs-on: ubuntu-latest
+    services:
+      neo4j:
+        image: neo4j:5.24.2
+        env:
+          NEO4J_AUTH: neo4j/graphmemory
+          NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+          NEO4J_dbms_security_procedures_unrestricted: apoc.*,gds.*
+          NEO4J_dbms_security_procedures_allowlist: apoc.*,gds.*
+          NEO4J_server_memory_heap_initial__size: 512m
+          NEO4J_server_memory_heap_max__size: 1G
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p graphmemory 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+      - name: Verify Neo4j plugins
+        run: |
+          node --input-type=module <<'NODE'
+          import neo4j from "neo4j-driver";
+
+          const driver = neo4j.driver(
+            "bolt://localhost:7687",
+            neo4j.auth.basic("neo4j", "graphmemory"),
+          );
+          try {
+            await driver.verifyConnectivity();
+            const session = driver.session();
+            try {
+              const result = await session.run(
+                "RETURN apoc.version() AS apoc, gds.version() AS gds",
+              );
+              const record = result.records[0];
+              console.log(`APOC ${record.get("apoc")}; GDS ${record.get("gds")}`);
+            } finally {
+              await session.close();
+            }
+          } finally {
+            await driver.close();
+          }
+          NODE
+      - name: Run integration tests
+        run: npm test
+        env:
+          NEO4J_INTEGRATION: "1"
+          CI: "true"
+
+  shellcheck:
+    name: Shell script syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: bash -n syntax check
+        run: |
+          # 用 if/then 控制流，避免 set -e 在文件不存在时让 job 失败
+          status=0
+          for f in setup-graph-memory-pro.sh; do
+            if [[ -f "$f" ]]; then
+              if bash -n "$f"; then
+                echo "OK: $f"
+              else
+                echo "FAIL: $f"
+                status=1
+              fi
+            else
+              echo "SKIP (not in repo): $f"
+            fi
+          done
+          exit $status

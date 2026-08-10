@@ -1,252 +1,84 @@
-<p align="center">
-  <img src="docs/images/banner.jpg" alt="graph-memory" width="100%" />
-</p>
+# graph-memory-pro
 
-<h1 align="center">graph-memory</h1>
+Neo4j-backed knowledge graph context engine for OpenClaw. It extracts `TASK`, `SKILL`, and `EVENT` triples from conversations, recalls related knowledge across sessions, and maintains the graph with GDS PageRank, community detection, and vector deduplication.
 
-<p align="center">
-  <strong>Knowledge Graph Context Engine for OpenClaw</strong><br>
-  By <a href="mailto:Wywelljob@gmail.com">adoresever</a> · MIT License
-</p>
+This repository is the Linux-portable counterpart of the Windows `v2.0.0` release. It uses Neo4j rather than the SQLite implementation from graph-memory v1.x.
 
-<p align="center">
-  <a href="#installation">Installation</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#configuration">Configuration</a> ·
-  <a href="README_CN.md">中文文档</a>
-</p>
+## Features
 
----
+- Neo4j labels: `Task`, `Skill`, `Event`, `Community`, and `GmMessage`
+- Typed relationships: `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, `CONFLICTS_WITH`
+- GDS Personalized PageRank for recall and global PageRank for maintenance
+- Neo4j vector indexes for semantic recall and duplicate detection
+- APOC-backed dynamic relationship creation and node merge
+- Community-level recall with LLM-generated summaries
+- Gateway-authenticated CRUD API at `/graph-memory-pro/api/`
 
-<p align="center">
-  <img src="docs/images/hero.png" alt="graph-memory overview" width="90%" />
-</p>
+## Requirements
 
-## What it does
+- OpenClaw
+- Node.js 20+
+- Java 17+ when using the bundled Linux setup
+- Neo4j 5.24.2 with APOC 5.24.2
+- GDS 2.12.0 is strongly recommended for PageRank; without it, ranking falls back to a basic order
 
-When conversations grow long, agents lose track of what happened. graph-memory solves three problems at once:
+## Release Line
 
-1. **Context explosion** — 174 messages eat 95K tokens. graph-memory compresses to ~24K by replacing raw history with structured knowledge graph nodes
-2. **Cross-session amnesia** — Yesterday's bugs, solved problems, all gone in a new session. graph-memory recalls relevant knowledge automatically via FTS5/vector search + graph traversal
-3. **Skill islands** — Self-improving agents record learnings as isolated markdown. graph-memory connects them: "installed libgl1" and "ImportError: libGL.so.1" are linked by a `SOLVED_BY` edge
+This branch is the **v2.0 desktop-2.0 release line** (Neo4j backend), separate from the v1.x mainline (SQLite). The supported SQLite-to-Neo4j migration workflow is documented in [`migrate/Migrate.md`](migrate/Migrate.md).
 
-**It feels like talking to an agent that learns from experience. Because it does.**
+## Linux Quick Start
 
-<p align="center">
-  <img src="docs/images/graph-ui.png" alt="graph-memory knowledge graph visualization with community detection" width="95%" />
-</p>
-
-> *58 nodes, 40 edges, 3 communities — automatically extracted from conversations. Right panel shows the knowledge graph with community clusters (GitHub ops, B站 MCP, session management). Left panel shows agent using `gm_stats` and `gm_search` tools.*
-
-## What's new in v2.0
-
-### Community-aware recall
-
-Recall now runs **two parallel paths** that merge results:
-
-- **Precise path**: vector/FTS5 search → community expansion → graph walk → PPR ranking
-- **Generalized path**: query vector vs community summary embeddings → community members → PPR ranking
-
-Community summaries are generated immediately after each community detection cycle (every 7 turns), so the generalized path is available from the first maintenance window.
-
-### Episodic context (conversation traces)
-
-The top 3 PPR-ranked nodes now pull their **original user/assistant conversation snippets** into the context. The agent sees not just structured triples, but the actual dialogue that produced them — improving accuracy when reapplying past solutions.
-
-### Universal embedding support
-
-The embedding module now uses raw `fetch` instead of the `openai` SDK, making it compatible with **any OpenAI-compatible endpoint** out of the box:
-
-- OpenAI, Azure OpenAI
-- Alibaba DashScope (`text-embedding-v4`)
-- MiniMax (`embo-01`)
-- Ollama, llama.cpp, vLLM (local models)
-- Any endpoint that implements `POST /embeddings`
-
-### Windows one-click installer
-
-v2.0 ships a **Windows installer** (`.exe`). Download from [Releases](https://github.com/adoresever/graph-memory/releases):
-
-1. Download `graph-memory-installer-win-x64.exe`
-2. Run the installer — it auto-detects your OpenClaw installation
-3. The installer configures `plugins.slots.contextEngine`, adds the plugin entry, and restarts the gateway
-
-## Real-world results
-
-<p align="center">
-  <img src="docs/images/token-comparison.png" alt="Token comparison: 7 rounds" width="85%" />
-</p>
-
-7-round conversation installing bilibili-mcp + login + query:
-
-| Round | Without graph-memory | With graph-memory |
-|-------|---------------------|-------------------|
-| R1 | 14,957 | 14,957 |
-| R4 | 81,632 | 29,175 |
-| R7 | **95,187** | **23,977** |
-
-**75% compression.** Red = linear growth without graph-memory. Blue = stabilized with graph-memory.
-
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="Cross-session recall" width="85%" />
-</p>
-
-## How it works
-
-### The Knowledge Graph
-
-graph-memory builds a typed property graph from conversations:
-
-- **3 node types**: `TASK` (what was done), `SKILL` (how to do it), `EVENT` (what went wrong)
-- **5 edge types**: `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, `CONFLICTS_WITH`
-- **Personalized PageRank**: ranks nodes by relevance to the current query, not global popularity
-- **Community detection**: automatically groups related skills (Docker cluster, Python cluster, etc.)
-- **Community summaries**: LLM-generated descriptions + embeddings for each community, enabling semantic community-level recall
-- **Episodic traces**: original conversation snippets linked to graph nodes for faithful context reconstruction
-- **Vector dedup**: merges semantically duplicate nodes via cosine similarity
-
-### Dual-path recall
-
-```
-User query
-  │
-  ├─ Precise path (entity-level)
-  │    vector/FTS5 search → seed nodes
-  │    → community peer expansion
-  │    → graph walk (N hops)
-  │    → Personalized PageRank ranking
-  │
-  ├─ Generalized path (community-level)
-  │    query embedding vs community summary embeddings
-  │    → matched community members
-  │    → graph walk (1 hop)
-  │    → Personalized PageRank ranking
-  │
-  └─ Merge & deduplicate → final context
-```
-
-Both paths run in parallel. Precise results take priority; generalized results fill gaps from uncovered knowledge domains.
-
-### Data flow
-
-```
-Message in → ingest (zero LLM)
-  ├─ All messages saved to gm_messages
-  └─ turn_index continues from DB max (survives gateway restart)
-
-assemble (zero LLM)
-  ├─ Graph nodes → XML with community grouping (systemPromptAddition)
-  ├─ PPR ranking decides injection priority
-  ├─ Episodic traces for top 3 nodes
-  ├─ Content normalization (prevents OpenClaw content.filter crash)
-  └─ Keep last turn raw messages
-
-afterTurn (async, non-blocking)
-  ├─ LLM extracts triples → gm_nodes + gm_edges
-  ├─ Every 7 turns: PageRank + community detection + community summaries
-  └─ User sends new message → extract auto-interrupted
-
-session_end
-  ├─ finalize (LLM): EVENT → SKILL promotion
-  └─ maintenance: dedup → PageRank → community detection
-
-Next session → before_prompt_build
-  ├─ Dual-path recall (precise + generalized)
-  └─ Personalized PageRank ranking → inject into context
-```
-
-### Personalized PageRank (PPR)
-
-Unlike global PageRank, PPR ranks nodes **relative to your current query**:
-
-- Ask about "Docker deployment" → Docker-related SKILLs rank highest
-- Ask about "conda environment" → conda-related SKILLs rank highest
-- Same graph, completely different rankings per query
-- Computed in real-time at recall (~5ms for thousands of nodes)
-
-## Installation
-
-### Prerequisites
-
-- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.3.x+)
-- Node.js 22+
-
-### Windows users
-
-Download the installer from [Releases](https://github.com/adoresever/graph-memory/releases):
-
-```
-graph-memory-installer-win-x64.exe
-```
-
-The installer handles everything: plugin installation, context engine activation, and gateway restart. After running, skip to [Step 3: Configure LLM and Embedding](#step-3-configure-llm-and-embedding).
-
-### Step 1: Install the plugin
-
-Choose one of three methods:
-
-**Option A — From npm registry** (recommended):
+Run the setup script from this repository on Linux:
 
 ```bash
-pnpm openclaw plugins install graph-memory
+bash setup-graph-memory-pro.sh
 ```
 
-No `node-gyp`, no manual compilation. The SQLite driver (`@photostructure/sqlite`) ships prebuilt binaries — works with OpenClaw's `--ignore-scripts` install.
+The script installs a user-local Neo4j distribution in `~/.graph-memory-pro/neo4j`, configures APOC and GDS, installs or registers this local plugin, writes `~/.openclaw/openclaw.json`, and restarts the gateway when possible.
 
-**Option B — From GitHub**:
+Useful modes:
 
 ```bash
-pnpm openclaw plugins install github:adoresever/graph-memory
+bash setup-graph-memory-pro.sh --dry-run
+bash setup-graph-memory-pro.sh --skip-neo4j --neo4j-uri bolt://localhost:7687 --neo4j-password 'your-password'
+bash setup-graph-memory-pro.sh --skip-autostart      # 不配置开机自启
+bash setup-graph-memory-pro.sh --assume-deps         # 跳过 curl/tar/jq/java 依赖检查
+bash setup-graph-memory-pro.sh --uninstall           # 还原配置 + 清理自启 + 停止 Neo4j
 ```
 
-**Option C — From source** (for development or custom modifications):
+Neo4j binds to `127.0.0.1` and uses Bolt port `7687` by default.
 
-```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
-npm install
-npx vitest run   # verify 80 tests pass
-pnpm openclaw plugins install .
-```
+### Boot autostart (no sudo)
 
-### Step 2: Activate context engine
+The installer configures Neo4j to start at boot with a 3-tier no-sudo fallback:
 
-This is the **critical step** most people miss. graph-memory must be registered as the context engine, otherwise OpenClaw will only use it for recall but **won't ingest messages or extract knowledge**.
+1. **systemd --user unit** (`~/.config/systemd/user/graph-memory-pro-neo4j.service`) — preferred, adds `systemctl --user` management. Best-effort `loginctl enable-linger` for boot-time start.
+2. **cron `@reboot`** — always configured as a backup so Neo4j starts even when linger is unavailable.
+3. **shell rc hook** (`~/.bashrc` / `~/.zshrc` idempotent `pgrep` guard) — last resort when systemd and cron are both unavailable.
 
-Edit `~/.openclaw/openclaw.json` and add `plugins.slots`:
+`--uninstall` cleans up all three. Only Java and jq system installs may need `sudo` (the script suggests `sdkman!` and a static `jq` binary as no-sudo alternatives).
+
+## Manual Configuration
+
+Install the local plugin, then make it the OpenClaw context engine:
 
 ```json
 {
   "plugins": {
     "slots": {
-      "contextEngine": "graph-memory"
+      "contextEngine": "graph-memory-pro"
     },
     "entries": {
-      "graph-memory": {
-        "enabled": true
-      }
-    }
-  }
-}
-```
-
-Without `"contextEngine": "graph-memory"` in `plugins.slots`, the plugin registers but the `ingest` / `assemble` / `compact` pipeline never fires — you'll see `recall` in logs but zero data in the database.
-
-### Step 3: Configure LLM and Embedding
-
-Add your API credentials inside `plugins.entries.graph-memory.config`:
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
+      "graph-memory-pro": {
         "enabled": true,
         "config": {
+          "neo4j": {
+            "uri": "bolt://localhost:7687",
+            "user": "neo4j",
+            "password": "your-neo4j-password"
+          },
           "llm": {
+            "provider": "openai",
             "apiKey": "your-llm-api-key",
             "baseURL": "https://api.openai.com/v1",
             "model": "gpt-4o-mini"
@@ -254,8 +86,8 @@ Add your API credentials inside `plugins.entries.graph-memory.config`:
           "embedding": {
             "apiKey": "your-embedding-api-key",
             "baseURL": "https://api.openai.com/v1",
-            "model": "text-embedding-3-small",
-            "dimensions": 512
+            "model": "text-embedding-v4",
+            "dimensions": 1024
           }
         }
       }
@@ -264,143 +96,95 @@ Add your API credentials inside `plugins.entries.graph-memory.config`:
 }
 ```
 
-**LLM** (`config.llm`) — Required. Used for knowledge extraction and community summaries. Any OpenAI-compatible endpoint works. Use a cheap/fast model.
+Anthropic direct (Claude) — drop `baseURL`, switch `provider`:
 
-**Embedding** (`config.embedding`) — Optional but recommended. Enables semantic vector search, community-level recall, and vector dedup. Without it, falls back to FTS5 full-text search (still works, just keyword-based).
+```json
+"llm": {
+  "provider": "anthropic",
+  "apiKey": "sk-ant-...",
+  "model": "claude-3-5-sonnet-20241022"
+}
+```
 
-> **⚠️ Important**: `pnpm openclaw plugins install` may reset your config. Always verify `config.llm` and `config.embedding` are present after reinstalling.
+`embedding` is optional. When present, `dimensions` must match the Neo4j vector index dimension. For a fresh database, the plugin creates matching indexes during startup. If you change dimensions later, recreate the vector indexes or the Neo4j database.
 
-If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` environment variable + Anthropic API.
-
-### Supported embedding providers
-
-| Provider | baseURL | Model | dimensions |
-|----------|---------|-------|------------|
-| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
-| Alibaba DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax | `https://api.minimax.chat/v1` | `embo-01` | 1024 |
-| Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
-| llama.cpp | `http://127.0.0.1:8080/v1` | your model name | varies |
-
-Set `dimensions: 0` or omit it entirely if the model doesn't support the `dimensions` parameter.
-
-### Restart and verify
+### OAuth login (experimental)
 
 ```bash
-pnpm openclaw gateway --verbose
+openclaw graph-memory auth login
 ```
 
-You should see these two lines in the startup log:
+The command completes login in a browser, stores tokens at
+`~/.openclaw/.graph-memory-pro/oauth.json` with mode `0600`, and atomically updates
+`plugins.entries.graph-memory-pro.config.llm`. A previous non-OAuth LLM configuration is backed up as
+`llm-config.backup.json` in the same directory. This path depends on Codex/ChatGPT OAuth and backend protocols rather than the stable public OpenAI API contract; prefer API-key configuration for production deployments.
 
+## Data Flow
+
+```text
+conversation messages -> GmMessage nodes -> LLM triple extraction
+  -> Task / Skill / Event nodes + typed relationships
+  -> embeddings -> vector recall + community expansion + GDS PPR
+  -> XML context injection
+
+session end -> dedup -> global PageRank -> communities -> summaries
 ```
-[graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
-[graph-memory] vector search ready
-```
 
-If you see `FTS5 search mode` instead of `vector search ready`, your embedding config is missing or the API key is invalid.
+## Verify
 
-After a few rounds of conversation, verify:
+Start OpenClaw with verbose logging:
 
 ```bash
-# Check messages are being ingested
-sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
-
-# Check knowledge triples are being extracted
-sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
-
-# Check communities are detected
-sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
-
-# In gateway logs, look for:
-# [graph-memory] extracted N nodes, M edges
-# [graph-memory] recalled N nodes, M edges
+openclaw gateway --verbose
 ```
 
-### Troubleshooting
+Expected messages include:
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `recall` works but `gm_messages` is empty | `plugins.slots.contextEngine` not set | Add `"contextEngine": "graph-memory"` to `plugins.slots` |
-| `FTS5 search mode` instead of `vector search ready` | Embedding not configured or API key invalid | Check `config.embedding` credentials |
-| `No LLM available` error | LLM config missing after plugin reinstall | Re-add `config.llm` to `plugins.entries.graph-memory` |
-| No `extracted` log after `afterTurn` | Gateway restart caused turn_index overlap | Update to v2.0 (fixes msgSeq persistence) |
-| `content.filter is not a function` | OpenClaw expects array content | Update to v2.0 (adds content normalization) |
-| Nodes are empty after many messages | `compactTurnCount` not reached | Default is 7 messages. Keep chatting or set a lower value |
+```text
+[graph-memory-pro] Neo4j schema initialized
+[graph-memory-pro] ready | neo4j=bolt://localhost:7687
+```
 
-## Agent tools
+Inspect the graph with the bundled Cypher shell:
+
+```bash
+~/.graph-memory-pro/neo4j/bin/cypher-shell -u neo4j -p 'your-password' \
+  "MATCH (n:Task|Skill|Event) RETURN n.type, n.name, n.pagerank ORDER BY n.pagerank DESC LIMIT 10"
+```
+
+## Agent Tools
 
 | Tool | Description |
-|------|-------------|
-| `gm_search` | Search the knowledge graph for relevant skills, events, and solutions |
-| `gm_record` | Manually record knowledge to the graph |
-| `gm_stats` | View graph statistics: nodes, edges, communities, PageRank top nodes |
-| `gm_maintain` | Manually trigger graph maintenance: dedup → PageRank → community detection + summaries |
-
-## Configuration
-
-All parameters have defaults. Only set what you want to override.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `dbPath` | `~/.openclaw/graph-memory.db` | SQLite database path |
-| `compactTurnCount` | `7` | Turns between maintenance cycles (PageRank + community + summaries) |
-| `recallMaxNodes` | `6` | Max nodes injected per recall |
-| `recallMaxDepth` | `2` | Graph traversal hops from seed nodes |
-| `dedupThreshold` | `0.90` | Cosine similarity threshold for node dedup |
-| `pagerankDamping` | `0.85` | PPR damping factor |
-| `pagerankIterations` | `20` | PPR iteration count |
-
-## Database
-
-SQLite via `@photostructure/sqlite` (prebuilt binaries, zero native compilation). Default: `~/.openclaw/graph-memory.db`.
-
-| Table | Purpose |
-|-------|---------|
-| `gm_nodes` | Knowledge nodes with pagerank + community_id |
-| `gm_edges` | Typed relationships |
-| `gm_nodes_fts` | FTS5 full-text index |
-| `gm_messages` | Raw conversation messages |
-| `gm_signals` | Detected signals |
-| `gm_vectors` | Embedding vectors (optional) |
-| `gm_communities` | Community summaries + embeddings |
-
-## vs lossless-claw
-
-| | lossless-claw | graph-memory |
-|--|---|---|
-| **Approach** | DAG of summaries | Knowledge graph (triples) |
-| **Recall** | FTS grep + sub-agent expansion | Dual-path: entity PPR + community vector matching |
-| **Cross-session** | Per-conversation only | Automatic cross-session recall |
-| **Compression** | Summaries (lossy text) | Structured triples (lossless semantics) |
-| **Graph algorithms** | None | PageRank, community detection, vector dedup |
-| **Context traces** | None | Episodic snippets from source conversations |
+| --- | --- |
+| `gm_search` | Recall graph knowledge for a query |
+| `gm_record` | Add a knowledge node manually |
+| `gm_update` | Update, delete, or deprecate an existing node by exact name. `mode=update` (default) refines description/content; `mode=delete` hard-deletes the node and all its relationships; `mode=deprecate` marks `[DEPRECATED]` and removes all relationships while keeping the node (throws if not found) |
+| `gm_link` | Manually create or refine an edge between two existing nodes (validates type + direction against the whitelist; idempotent on from+to+type) |
+| `gm_unlink` | Remove edges between two nodes by name; optional `type` filter, otherwise all from→to edges |
+| `gm_merge` | Merge two same-type duplicate nodes: keep absorbs content/validatedCount/sessions + dedup-aware edge migration; merge is soft-deleted |
+| `gm_stats` | Show node, relationship, community, and PageRank statistics |
+| `gm_maintain` | Run deduplication, PageRank, and community maintenance |
 
 ## Development
 
 ```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
 npm install
-npm test        # 80 tests
-npx vitest      # watch mode
+npm run build     # tsc --noEmit
+npm test          # unit tests only (no Neo4j required)
 ```
 
-### Project structure
+### Integration tests
 
+Storage / Cypher / graph-algorithm changes are covered by integration tests that need a live Neo4j with APOC and GDS:
+
+```bash
+# 本地跑：先启动 Neo4j 5.24.2 + APOC + GDS，然后
+NEO4J_INTEGRATION=1 npm test
 ```
-graph-memory/
-├── index.ts                     # Plugin entry point
-├── openclaw.plugin.json         # Plugin manifest
-├── src/
-│   ├── types.ts                 # Type definitions
-│   ├── store/                   # SQLite CRUD / FTS5 / CTE traversal / community CRUD
-│   ├── engine/                  # LLM (fetch-based) + Embedding (fetch-based, SDK-free)
-│   ├── extractor/               # Knowledge extraction prompts
-│   ├── recaller/                # Dual-path recall (precise + generalized + PPR)
-│   ├── format/                  # Context assembly + transcript repair + content normalization
-│   └── graph/                   # PageRank, community detection + summaries, dedup, maintenance
-└── test/                        # 80 vitest tests
-```
+
+CI runs them via a Docker Neo4j service container — see [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+`npm run typecheck` validates source and test types. `npm run build` emits the installed runtime to `dist/`; OpenClaw uses the source entry for a checkout and the built entry for an installed package. Add integration tests under `test/integration.*.test.ts` whenever you change storage or Cypher behavior; unit tests cover pure logic only.
 
 ## License
 

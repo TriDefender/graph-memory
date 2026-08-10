@@ -1,21 +1,21 @@
 /**
- * graph-memory
+ * graph-memory-pro v2.1 — 类型定义
  *
- * By: adoresever
- * Email: Wywelljob@gmail.com
- */
-
-/**
- * graph-memory 类型定义
- *
- * 节点：TASK / SKILL / EVENT
- * 边：USED_SKILL / SOLVED_BY / REQUIRES / PATCHES / CONFLICTS_WITH
+ * Label 体系：Task / Skill / Event / Community
+ * 去掉 Signal 类型，去掉 GmNode 统一 label
  */
 
 // ─── 节点 ─────────────────────────────────────────────────────
 
 export type NodeType = "TASK" | "SKILL" | "EVENT";
 export type NodeStatus = "active" | "deprecated";
+
+/** Neo4j label 映射：TASK->Task, SKILL->Skill, EVENT->Event */
+export const NODE_TYPE_TO_LABEL: Record<NodeType, string> = {
+  TASK: "Task",
+  SKILL: "Skill",
+  EVENT: "Event",
+};
 
 export interface GmNode {
   id: string;
@@ -34,12 +34,38 @@ export interface GmNode {
 
 // ─── 边 ───────────────────────────────────────────────────────
 
-export type EdgeType =
-  | "USED_SKILL"
-  | "SOLVED_BY"
-  | "REQUIRES"
-  | "PATCHES"
-  | "CONFLICTS_WITH";
+export const EDGE_TYPES = [
+  "USED_SKILL",
+  "SOLVED_BY",
+  "REQUIRES",
+  "PATCHES",
+  "CONFLICTS_WITH",
+] as const;
+
+export type EdgeType = (typeof EDGE_TYPES)[number];
+
+const EDGE_DIRECTION_RULES: Record<EdgeType, {
+  from: readonly NodeType[];
+  to: readonly NodeType[];
+}> = {
+  USED_SKILL:     { from: ["TASK"], to: ["SKILL"] },
+  SOLVED_BY:      { from: ["EVENT", "SKILL"], to: ["SKILL"] },
+  REQUIRES:       { from: ["SKILL"], to: ["SKILL"] },
+  PATCHES:        { from: ["SKILL"], to: ["SKILL"] },
+  CONFLICTS_WITH: { from: ["SKILL"], to: ["SKILL"] },
+};
+
+/** 运行时校验关系白名单及端点方向（LLM/HTTP 输入不能依赖 TS 类型）。 */
+export function isValidEdgeDirection(
+  type: string,
+  fromType: string,
+  toType: string,
+): type is EdgeType {
+  const rule = EDGE_DIRECTION_RULES[type as EdgeType];
+  return !!rule
+    && rule.from.includes(fromType as NodeType)
+    && rule.to.includes(toType as NodeType);
+}
 
 export interface GmEdge {
   id: string;
@@ -50,22 +76,6 @@ export interface GmEdge {
   condition?: string;
   sessionId: string;
   createdAt: number;
-}
-
-// ─── 信号 ─────────────────────────────────────────────────────
-
-export type SignalType =
-  | "tool_error"
-  | "tool_success"
-  | "skill_invoked"
-  | "user_correction"
-  | "explicit_record"
-  | "task_completed";
-
-export interface Signal {
-  type: SignalType;
-  turnIndex: number;
-  data: Record<string, any>;
 }
 
 // ─── 提取结果 ─────────────────────────────────────────────────
@@ -119,30 +129,48 @@ export interface EmbeddingConfig {
   dimensions?: number;
 }
 
+// ─── Neo4j 连接配置 ──────────────────────────────────────────
+
+export interface Neo4jConfig {
+  uri: string;
+  user: string;
+  password: string;
+}
+
 // ─── 插件配置 ─────────────────────────────────────────────────
 
 export interface GmConfig {
-  dbPath: string;
+  neo4j: Neo4jConfig;
   compactTurnCount: number;
   recallMaxNodes: number;
   recallMaxDepth: number;
   freshTailCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
+    provider?: "openai" | "anthropic" | "oauth";
     apiKey?: string;
     baseURL?: string;
     model?: string;
+    timeoutMs?: number;
+    maxTokens?: number;
+    /** OAuth 会话文件路径（provider="oauth" 时必填）。 */
+    oauthPath?: string;
+    /** OAuth 提供商标识（默认 "openai-codex"）。 */
+    oauthProvider?: string;
+    /** 推理模型思考强度（仅 oauth provider 生效；默认 "medium"）。 */
+    reasoningEffort?: "low" | "medium" | "high";
   };
-  /** 向量去重阈值，余弦相似度超过此值视为重复 (0-1) */
   dedupThreshold: number;
-  /** PageRank 阻尼系数 */
   pagerankDamping: number;
-  /** PageRank 迭代次数 */
   pagerankIterations: number;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
-  dbPath: "~/.openclaw/graph-memory.db",
+  neo4j: {
+    uri: "bolt://localhost:7687",
+    user: "neo4j",
+    password: "neo4j",
+  },
   compactTurnCount: 6,
   recallMaxNodes: 6,
   recallMaxDepth: 2,
