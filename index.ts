@@ -261,6 +261,17 @@ const graphMemoryProPlugin = {
       api.logger.error(
         '[graph-memory-pro] llm.provider=openai 需要 llm.apiKey + llm.baseURL — extraction/community summaries 将失败',
       );
+    } else if (llmProvider === "oauth") {
+      if (!cfg.llm?.oauthPath) {
+        api.logger.error(
+          '[graph-memory-pro] llm.provider=oauth 但未配 llm.oauthPath — LLM 调用将失败。' +
+          '请先用 `codex login` 生成 OAuth 会话文件，然后在 config.llm.oauthPath 中指定路径',
+        );
+      } else {
+        api.logger.info(
+          `[graph-memory-pro] llm.provider=oauth 已启用，会话文件: ${cfg.llm.oauthPath}`,
+        );
+      }
     }
 
     // ── 初始化 Neo4j ────────────────────────────────────────

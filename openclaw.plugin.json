@@ -33,7 +33,7 @@
         "properties": {
           "provider": {
             "type": "string",
-            "enum": ["openai", "anthropic"],
+            "enum": ["openai", "anthropic", "oauth"],
             "description": "选择LLM总结 API格式"
           },
           "apiKey": { "type": "string", "description": "API Key" },
@@ -43,7 +43,9 @@
           },
           "model": { "type": "string", "description": "使用的模型名称" },
           "timeoutMs": { "type": "number", "default": 60000, "description": "单次 LLM 请求超时（毫秒）" },
-          "maxTokens": { "type": "number", "default": 4000, "description": "补全 token 预算，如果报错多请适当调高" }
+          "maxTokens": { "type": "number", "default": 4000, "description": "补全 token 预算，如果报错多请适当调高" },
+          "oauthPath": { "type": "string", "description": "OAuth 会话文件路径（provider=oauth 时必填，自动生成）" },
+          "oauthProvider": { "type": "string", "default": "openai-codex", "description": "OAuth 提供商标识（目前仅支持 openai-codex）" }
         }
       },
       "embedding": {

@@ -147,12 +147,14 @@ export interface GmConfig {
   freshTailCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
-    provider?: "openai" | "anthropic";
+    provider?: "openai" | "anthropic" | "oauth";
     apiKey?: string;
     baseURL?: string;
     model?: string;
     timeoutMs?: number;
     maxTokens?: number;
+    oauthPath?: string;
+    oauthProvider?: string;
   };
   dedupThreshold: number;
   pagerankDamping: number;
