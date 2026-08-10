@@ -888,6 +888,37 @@ export async function getUnextracted(driver: Driver, sid: string, limit: number)
   }
 }
 
+export interface UnextractedSessionInfo {
+  sessionId: string;
+  messageCount: number;
+  maxTurn: number;
+  minCreatedAt: number;
+}
+
+export async function listUnextractedSessions(driver: Driver): Promise<UnextractedSessionInfo[]> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      MATCH (m:GmMessage {extracted: false})
+      WITH m.sessionId AS sid,
+           count(*) AS msgCount,
+           max(m.turnIndex) AS maxTurn,
+           min(coalesce(m.createdAt, 0)) AS minCreated
+      WHERE sid IS NOT NULL
+      RETURN sid, msgCount, maxTurn, minCreated
+      ORDER BY minCreated ASC, sid ASC
+    `);
+    return result.records.map(r => ({
+      sessionId: r.get("sid"),
+      messageCount: toInt(r.get("msgCount")),
+      maxTurn: toInt(r.get("maxTurn")),
+      minCreatedAt: toInt(r.get("minCreated")),
+    }));
+  } finally {
+    await session.close();
+  }
+}
+
 export async function markExtracted(driver: Driver, sid: string, upToTurn: number): Promise<void> {
   const session = getSession(driver);
   try {

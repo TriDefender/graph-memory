@@ -258,6 +258,7 @@ const graphMemoryProPlugin = {
           pluginId: "graph-memory-pro",
           pluginConfig: raw as Record<string, unknown> | undefined,
           resolveConfigPath: (p: string) => api.resolvePath?.(p) ?? p,
+          defaultModel: readDefaultModel(api.config),
         }),
         { commands: ["graph-memory"] },
       );
