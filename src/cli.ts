@@ -34,6 +34,7 @@ export interface CliCommand {
   description(text: string): CliCommand;
   option(flags: string, description?: string, defaultValue?: unknown): CliCommand;
   action(handler: (options: Record<string, unknown>) => void | Promise<void>): CliCommand;
+  outputHelp(): void;
 }
 
 export interface GraphMemoryCliRegistrarContext {
@@ -229,11 +230,17 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
 
     const root = program
       .command("graph-memory")
-      .description("graph-memory-pro: Neo4j 知识图谱记忆引擎管理命令");
+      .description("graph-memory-pro: Neo4j 知识图谱记忆引擎管理命令")
+      .action(() => {
+        root.outputHelp();
+      });
 
     const auth = root
       .command("auth")
-      .description("管理用于 LLM 智能抽取的 OAuth 认证");
+      .description("管理用于 LLM 智能抽取的 OAuth 认证")
+      .action(() => {
+        auth.outputHelp();
+      });
 
     auth
       .command("login")
