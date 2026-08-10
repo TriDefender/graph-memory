@@ -233,7 +233,6 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
       .description("graph-memory-pro: Neo4j 知识图谱记忆引擎管理命令")
       .action(() => {
         root.outputHelp();
-        process.exit(0);
       });
 
     const auth = root
@@ -241,7 +240,6 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
       .description("管理用于 LLM 智能抽取的 OAuth 认证")
       .action(() => {
         auth.outputHelp();
-        process.exit(0);
       });
 
     auth
@@ -371,7 +369,6 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
           console.log(
             `已更新 ${pluginId} 配置：llm.provider=oauth, llm.oauthProvider=${selectedProvider.providerId}, llm.oauthPath=${oauthPath}, llm.model=${oauthModel}, llm.reasoningEffort=${reasoningEffort}`,
           );
-          process.exit(0);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           console.error("OAuth 登录失败：", message);

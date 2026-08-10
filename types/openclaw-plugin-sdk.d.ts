@@ -57,6 +57,7 @@ declare module "openclaw/plugin-sdk" {
     logger: OpenClawPluginLogger;
     config: any;
     pluginConfig: unknown;
+    registrationMode?: "full" | "discovery" | "tool-discovery" | "setup-only" | "setup-runtime" | "cli-metadata";
     resolvePath(path: string): string;
     on(event: string, handler: (...args: any[]) => any): void;
     registerContextEngine(id: string, factory: (...args: any[]) => any): void;

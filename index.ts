@@ -28,6 +28,15 @@ import { DEFAULT_CONFIG, type GmConfig, type RecallResult, type EdgeType } from 
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
 
+/**
+ * OpenClaw < 2026.7 does not expose registrationMode and loads the full plugin
+ * while discovering plugin CLI commands. Avoid starting the Neo4j runtime for
+ * an invocation that only needs the graph-memory CLI registrar.
+ */
+export function isGraphMemoryCliInvocation(argv: readonly string[] = process.argv): boolean {
+  return argv.slice(2).includes("graph-memory");
+}
+
 // ─── 从 OpenClaw config 读默认 model 名 ──────────────────────
 
 /**
@@ -239,6 +248,27 @@ const graphMemoryProPlugin = {
       api.pluginConfig && typeof api.pluginConfig === "object"
         ? (api.pluginConfig as any)
         : {};
+
+    // Register CLI metadata before any database, schema, or embedding work.
+    // New OpenClaw versions load plugins in cli-metadata mode; older supported
+    // versions are covered by the argv fallback above.
+    if (typeof api.registerCli === "function") {
+      api.registerCli(
+        createGraphMemoryCli({
+          pluginId: "graph-memory-pro",
+          pluginConfig: raw as Record<string, unknown> | undefined,
+          resolveConfigPath: (p: string) => api.resolvePath?.(p) ?? p,
+        }),
+        { commands: ["graph-memory"] },
+      );
+    }
+    if (
+      api.registrationMode === "cli-metadata" ||
+      isGraphMemoryCliInvocation()
+    ) {
+      return;
+    }
+
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
 
@@ -1114,18 +1144,6 @@ const graphMemoryProPlugin = {
 
     // ── CRUD REST 路由（给 ClawX 前端用） ─────────────────
     registerCrudRoutes(api, driver, recaller);
-
-    // ── CLI：`openclaw graph-memory auth login`（OAuth 触发入口） ──
-    if (typeof api.registerCli === "function") {
-      api.registerCli(
-        createGraphMemoryCli({
-          pluginId: "graph-memory-pro",
-          pluginConfig: raw as Record<string, unknown> | undefined,
-          resolveConfigPath: (p: string) => api.resolvePath?.(p) ?? p,
-        }),
-        { commands: ["graph-memory"] },
-      );
-    }
 
     // ── Neovis 配置接口（给 ClawX 前端用） ──────────────────
 
