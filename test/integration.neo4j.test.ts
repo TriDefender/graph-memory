@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
+import graphMemoryProPlugin from "../index.ts";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
 import {
   upsertNode, findByName, findById, updateNode,
@@ -17,22 +18,63 @@ const ENABLED = !!process.env.NEO4J_INTEGRATION;
 const NEO4J_URI = process.env.NEO4J_TEST_URI ?? "bolt://localhost:7687";
 
 let driver: Driver;
+let contextEngine: any;
 const TEST_SID = `integration-${Date.now()}`;
+
+async function readMessages(sessionId: string): Promise<Array<{ role: string; content: unknown }>> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      `MATCH (m:GmMessage {sessionId: $sessionId})
+       RETURN m.role AS role, m.content AS content
+       ORDER BY m.turnIndex`,
+      { sessionId },
+    );
+    return result.records.map((record) => ({
+      role: record.get("role"),
+      content: JSON.parse(record.get("content")),
+    }));
+  } finally {
+    await session.close();
+  }
+}
 
 describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
   beforeAll(async () => {
     driver = getDriver({ uri: NEO4J_URI, user: "neo4j", password: "graphmemory" });
     await initSchema(driver);
+
+    const engineFactories: Array<() => any> = [];
+    graphMemoryProPlugin.register({
+      registrationMode: "full",
+      pluginConfig: {
+        neo4j: { uri: NEO4J_URI, user: "neo4j", password: "graphmemory" },
+        llm: { provider: "oauth", model: "gpt-5", oauthPath: "/nonexistent/graph-memory-test-oauth.json" },
+      },
+      config: {},
+      resolvePath: (value: string) => value,
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      on() {},
+      registerTool() {},
+      registerHttpRoute() {},
+      registerCli() {},
+      registerContextEngine(_id: string, factory: () => any) {
+        engineFactories.push(factory);
+      },
+    } as any);
+    contextEngine = engineFactories[0]?.();
+    expect(contextEngine).toBeTruthy();
   }, 60000);
 
   afterAll(async () => {
     const session = getSession(driver);
     try {
       await session.run("MATCH (n) WHERE $sid IN n.sourceSessions DETACH DELETE n", { sid: TEST_SID });
-      await session.run("MATCH (m:GmMessage {sessionId: $sid}) DELETE m", { sid: TEST_SID });
+      await session.run("MATCH (m:GmMessage) WHERE m.sessionId STARTS WITH $sid DELETE m", { sid: TEST_SID });
     } finally {
       await session.close();
     }
+    await contextEngine?.dispose?.();
     await closeDriver();
   }, 30000);
 
@@ -182,6 +224,49 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
 
     const after = await getUnextracted(driver, TEST_SID, 10);
     expect(after.length).toBe(0);
+  });
+
+  it("afterTurn backfills messages when OpenClaw skips ingest (#59)", async () => {
+    const sessionId = `${TEST_SID}-after-turn-only`;
+    const messages = [
+      { role: "user", content: "legacy host user message" },
+      { role: "assistant", content: "legacy host assistant message" },
+    ];
+
+    await contextEngine.afterTurn({
+      sessionId,
+      sessionKey: sessionId,
+      sessionFile: "",
+      messages,
+      prePromptMessageCount: 0,
+    });
+
+    const stored = await readMessages(sessionId);
+    expect(stored).toHaveLength(2);
+    expect(stored.map((message) => message.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("afterTurn does not duplicate messages already delivered by ingest (#59)", async () => {
+    const sessionId = `${TEST_SID}-ingest-and-after-turn`;
+    const messages = [
+      { role: "user", content: "modern host user message" },
+      { role: "assistant", content: "modern host assistant message" },
+    ];
+
+    for (const message of messages) {
+      await contextEngine.ingest({ sessionId, sessionKey: sessionId, message });
+    }
+    await contextEngine.afterTurn({
+      sessionId,
+      sessionKey: sessionId,
+      sessionFile: "",
+      messages,
+      prePromptMessageCount: 0,
+    });
+
+    const stored = await readMessages(sessionId);
+    expect(stored).toHaveLength(2);
+    expect(stored.map((message) => message.role)).toEqual(["user", "assistant"]);
   });
 
   it("getStats (#9 去除冗余查询后) 返回完整结构", async () => {
