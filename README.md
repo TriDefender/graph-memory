@@ -147,7 +147,7 @@ Inspect the graph with the bundled Cypher shell:
 | --- | --- |
 | `gm_search` | Recall graph knowledge for a query |
 | `gm_record` | Add a knowledge node manually |
-| `gm_update` | Update an existing node's description and/or content by exact name (throws if not found) |
+| `gm_update` | Update, delete, or deprecate an existing node by exact name. `mode=update` (default) refines description/content; `mode=delete` hard-deletes the node and all its relationships; `mode=deprecate` marks `[DEPRECATED]` and removes all relationships while keeping the node (throws if not found) |
 | `gm_stats` | Show node, relationship, community, and PageRank statistics |
 | `gm_maintain` | Run deduplication, PageRank, and community maintenance |
 

@@ -12,6 +12,7 @@ import {
   saveMessage, getUnextracted,
   markExtracted, isTurnExtracted,
   upsertNode, upsertEdge, findByName, updateNode,
+  deleteNode, deprecateNodeAndDisconnect,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats,
 } from "./src/store/store.ts";
@@ -739,23 +740,76 @@ const graphMemoryProPlugin = {
         name: "gm_update",
         label: "Update Graph Memory Node",
         description:
-          "更新知识图谱中已存在的节点。必须提供精确的节点名称（不存在会报错）。用于 refine 已有经验的描述或内容，避免重复创建节点。",
+          "更新知识图谱中已存在的节点。必须提供精确的节点名称（不存在会报错）。" +
+          "三种模式：(1) 默认 update —— refine description/content；" +
+          "(2) delete —— 硬删除节点及其所有关系；" +
+          "(3) deprecate —— 标记 [DEPRECATED] 并切断所有关系（节点本身保留但被隔离）。",
         parameters: Type.Object({
-          name: Type.String({ description: "要更新的节点名称（必须精确匹配已有节点；名称会被标准化：全小写、空格/下划线转连字符）" }),
+          name: Type.String({ description: "目标节点名称（必须精确匹配已有节点；名称会被标准化：全小写、空格/下划线转连字符）" }),
+          mode: Type.Optional(Type.Union([
+            Type.Literal("update"),
+            Type.Literal("delete"),
+            Type.Literal("deprecate"),
+          ], { description: "操作模式：update（默认，更新 description/content）、delete（硬删除节点+所有关系）、deprecate（标记 [DEPRECATED] 并删除所有关系，节点保留）" })),
           description: Type.Optional(
-            Type.String({ description: "新的一句话说明（one-line summary）。不传则保留原值" }),
+            Type.String({ description: "新的一句话说明（one-line summary）。仅 update 模式生效，不传则保留原值" }),
           ),
           content: Type.Optional(
-            Type.String({ description: "新的知识内容（纯文本）。不传则保留原值" }),
+            Type.String({ description: "新的知识内容（纯文本）。仅 update 模式生效，不传则保留原值" }),
           ),
         }),
         async execute(
           _toolCallId: string,
-          p: { name: string; description?: string; content?: string },
+          p: {
+            name: string;
+            mode?: "update" | "delete" | "deprecate";
+            description?: string;
+            content?: string;
+          },
         ) {
+          const mode = p.mode ?? "update";
+          const notFoundHint =
+            `[graph-memory-pro] 未找到名称为 "${p.name}" 的节点。` +
+            `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
+            `或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。`;
+
+          if (mode === "delete") {
+            const deleted = await deleteNode(driver, p.name);
+            if (!deleted) throw new Error(notFoundHint);
+            return {
+              content: [{
+                type: "text",
+                text: `已删除：${deleted.name} (${deleted.type}) —— 节点及其所有关系已从图谱中移除`,
+              }],
+              details: { mode, name: deleted.name, type: deleted.type, id: deleted.id },
+            };
+          }
+
+          if (mode === "deprecate") {
+            const deprecated = await deprecateNodeAndDisconnect(driver, p.name);
+            if (!deprecated) throw new Error(notFoundHint);
+            recaller.syncEmbed(deprecated).catch(() => {});
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `已标记 [DEPRECATED] 并切断图谱连接：${deprecated.name} (${deprecated.type})\n` +
+                  `节点本身保留（status=deprecated，描述前缀 [DEPRECATED]），但所有入边/出边已删除，不再参与召回或社区分析。`,
+              }],
+              details: {
+                mode,
+                name: deprecated.name,
+                type: deprecated.type,
+                status: "deprecated",
+                description: deprecated.description,
+              },
+            };
+          }
+
           if (p.description === undefined && p.content === undefined) {
             throw new Error(
-              "[graph-memory-pro] gm_update 至少需要提供 description 或 content 中的一个",
+              "[graph-memory-pro] gm_update mode=update 至少需要提供 description 或 content 中的一个" +
+              "（如需删除节点请用 mode=delete，如需弃用请用 mode=deprecate）",
             );
           }
           const updated = await updateNode(driver, p.name, {
@@ -763,11 +817,7 @@ const graphMemoryProPlugin = {
             content: p.content,
           });
           if (!updated) {
-            throw new Error(
-              `[graph-memory-pro] 未找到名称为 "${p.name}" 的节点。` +
-              `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
-              `或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。`,
-            );
+            throw new Error(notFoundHint);
           }
           recaller.syncEmbed(updated).catch(() => {});
           const changes: string[] = [];
@@ -779,6 +829,7 @@ const graphMemoryProPlugin = {
               text: `已更新：${updated.name} (${updated.type})\n变更：${changes.join("，")}`,
             }],
             details: {
+              mode,
               name: updated.name,
               type: updated.type,
               description: updated.description,

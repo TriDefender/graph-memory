@@ -8,6 +8,7 @@ import {
   deprecate, getStats, mergeNodes, searchNodes, topNodes,
   getBySession, saveVector, vectorSearchWithScore, getVectorHash,
   updateCommunities, updatePageranks,
+  deleteNode, deprecateNodeAndDisconnect,
 } from "../src/store/store.ts";
 
 // 仅在 NEO4J_INTEGRATION=1 时运行，避免污染默认 npm test（需要 Docker Neo4j）
@@ -202,6 +203,85 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     const refetch = await findById(driver, node.id);
     expect(refetch).not.toBeNull();
     expect(refetch!.status).toBe("deprecated");
+  });
+
+  it("deleteNode 硬删除：节点 + 所有关系一并消失（gm_update mode=delete）", async () => {
+    const { node: task } = await upsertNode(driver, {
+      type: "TASK", name: "HardDelete Task", description: "victim", content: "victim",
+    }, TEST_SID);
+    const { node: skill } = await upsertNode(driver, {
+      type: "SKILL", name: "HardDelete Skill", description: "neighbor", content: "neighbor",
+    }, TEST_SID);
+    await upsertEdge(driver, {
+      fromId: task.id, toId: skill.id, type: "USED_SKILL",
+      instruction: "uses", sessionId: TEST_SID,
+    });
+
+    const deleted = await deleteNode(driver, task.name);
+    expect(deleted).not.toBeNull();
+    expect(deleted!.id).toBe(task.id);
+
+    expect(await findById(driver, task.id)).toBeNull();
+
+    const remainingOut = await edgesFrom(driver, skill.id);
+    expect(remainingOut.filter(e => e.id === task.id)).toHaveLength(0);
+    const remainingIn = await edgesTo(driver, skill.id);
+    expect(remainingIn.filter(e => e.fromId === task.id)).toHaveLength(0);
+  });
+
+  it("deleteNode 未知 name 返回 null", async () => {
+    expect(await deleteNode(driver, "ghost-node-delete-xyz")).toBeNull();
+  });
+
+  it("deprecateNodeAndDisconnect 标记 [DEPRECATED] + 切边（节点保留，gm_update mode=deprecate）", async () => {
+    const { node: victim } = await upsertNode(driver, {
+      type: "SKILL", name: "DeprecateTarget Skill", description: "原描述", content: "content",
+    }, TEST_SID);
+    const { node: a } = await upsertNode(driver, {
+      type: "TASK", name: "Deprecate Neighbor A", description: "neighbor", content: "neighbor",
+    }, TEST_SID);
+    const { node: b } = await upsertNode(driver, {
+      type: "SKILL", name: "Deprecate Neighbor B", description: "neighbor", content: "neighbor",
+    }, TEST_SID);
+    await upsertEdge(driver, {
+      fromId: a.id, toId: victim.id, type: "USED_SKILL",
+      instruction: "uses", sessionId: TEST_SID,
+    });
+    await upsertEdge(driver, {
+      fromId: victim.id, toId: b.id, type: "REQUIRES",
+      instruction: "needs", sessionId: TEST_SID,
+    });
+
+    const result = await deprecateNodeAndDisconnect(driver, "DeprecateTarget Skill");
+    expect(result).not.toBeNull();
+    expect(result!.status).toBe("deprecated");
+    expect(result!.description).toBe("[DEPRECATED] 原描述");
+
+    const refetch = await findById(driver, victim.id);
+    expect(refetch).not.toBeNull();
+    expect(refetch!.status).toBe("deprecated");
+    expect(refetch!.description).toBe("[DEPRECATED] 原描述");
+
+    const inEdges = await edgesTo(driver, victim.id);
+    expect(inEdges).toHaveLength(0);
+    const outEdges = await edgesFrom(driver, victim.id);
+    expect(outEdges).toHaveLength(0);
+
+    expect((await findById(driver, a.id))!.status).toBe("active");
+    expect((await findById(driver, b.id))!.status).toBe("active");
+  });
+
+  it("deprecateNodeAndDisconnect 幂等：已带前缀不重复添加", async () => {
+    const { node } = await upsertNode(driver, {
+      type: "SKILL", name: "Idempotent Deprecate", description: "[DEPRECATED] 已经弃用", content: "c",
+    }, TEST_SID);
+    const result = await deprecateNodeAndDisconnect(driver, node.name);
+    expect(result).not.toBeNull();
+    expect(result!.description).toBe("[DEPRECATED] 已经弃用");
+  });
+
+  it("deprecateNodeAndDisconnect 未知 name 返回 null", async () => {
+    expect(await deprecateNodeAndDisconnect(driver, "ghost-node-deprecate-xyz")).toBeNull();
   });
 
   // ─── SQLite 时代 store 测试意图移植 ─────────────────────────────

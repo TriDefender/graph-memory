@@ -232,6 +232,67 @@ export async function updateNode(
   return { ...ex, description, content, updatedAt: now };
 }
 
+/**
+ * 给描述加上 [DEPRECATED] 前缀；已存在则原样返回。
+ * 抽成纯函数便于单元测试（Cypher 路径在 integration test 覆盖）。
+ */
+export function applyDeprecateMarker(description: string): string {
+  const prefix = "[DEPRECATED]";
+  if (!description) return prefix;
+  if (description.startsWith(prefix)) return description;
+  return `${prefix} ${description}`;
+}
+
+/**
+ * 按 name 硬删除节点：DETACH DELETE —— 节点 + 所有关系一并删除。
+ * 找不到返回 null（调用方决定报错语义）。
+ */
+export async function deleteNode(driver: Driver, name: string): Promise<GmNode | null> {
+  const ex = await findByName(driver, name);
+  if (!ex) return null;
+  const session = getSession(driver);
+  try {
+    await session.run(
+      "MATCH (n:Task|Skill|Event {id: $id}) DETACH DELETE n",
+      { id: ex.id },
+    );
+  } finally {
+    await session.close();
+  }
+  return ex;
+}
+
+/**
+ * 按 name deprecate 并切断：status='deprecated' + 描述加 [DEPRECATED] 前缀 + 删除所有边。
+ * 节点本身保留（不硬删），但完全从知识图谱中隔离。
+ * 找不到返回 null。
+ */
+export async function deprecateNodeAndDisconnect(
+  driver: Driver,
+  name: string,
+): Promise<GmNode | null> {
+  const ex = await findByName(driver, name);
+  if (!ex) return null;
+  const now = Date.now();
+  const description = applyDeprecateMarker(ex.description);
+  const session = getSession(driver);
+  try {
+    await session.run(
+      `MATCH (n:Task|Skill|Event {id: $id})
+       SET n.status = 'deprecated',
+           n.description = $description,
+           n.updatedAt = $now
+       WITH n
+       OPTIONAL MATCH (n)-[r]-()
+       DELETE r`,
+      { id: ex.id, description, now },
+    );
+  } finally {
+    await session.close();
+  }
+  return { ...ex, status: "deprecated", description, updatedAt: now };
+}
+
 export async function deprecate(driver: Driver, nodeId: string): Promise<void> {
   const session = getSession(driver);
   try {
