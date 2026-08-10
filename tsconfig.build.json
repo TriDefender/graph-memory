@@ -5,6 +5,6 @@
     "rewriteRelativeImportExtensions": true,
     "noEmit": false
   },
-  "include": ["src/**/*.ts", "index.ts"],
+  "include": ["src/**/*.ts", "index.ts", "types/**/*.d.ts"],
   "exclude": ["test/**/*.ts", "dist", "node_modules"]
 }
