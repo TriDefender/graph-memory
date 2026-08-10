@@ -51,8 +51,8 @@ export interface ParsedTimeRange {
  */
 export function parseTimeRange(opts: RecallOptions): ParsedTimeRange {
   const field = opts.timeField ?? "createdAt";
-  const sinceMs = opts.after ? Date.parse(opts.after) : 0;
-  const untilMs = opts.before ? Date.parse(opts.before) : Number.MAX_SAFE_INTEGER;
+  const sinceMs = opts.after ? parseIso(opts.after) : 0;
+  const untilMs = opts.before ? parseIso(opts.before) : Number.MAX_SAFE_INTEGER;
   if (opts.after && Number.isNaN(sinceMs)) {
     throw new Error(`[graph-memory-pro] invalid "after" time: ${opts.after}`);
   }
@@ -63,6 +63,13 @@ export function parseTimeRange(opts: RecallOptions): ParsedTimeRange {
     throw new Error(`[graph-memory-pro] "after" must be earlier than "before"`);
   }
   return { sinceMs, untilMs, field };
+}
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseIso(s: string): number {
+  if (DATE_ONLY_RE.test(s)) return Date.parse(`${s}T00:00:00Z`);
+  return Date.parse(s);
 }
 
 /** 判断节点是否落在时间区间内（闭区间，含两端） */

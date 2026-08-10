@@ -39,6 +39,17 @@ describe("parseTimeRange", () => {
     expect(r.sinceMs).toBe(Date.parse("2024-01-01"));
   });
 
+  it("date-only 与同日 UTC datetime 等价（消除本地时区歧义）", () => {
+    const dateOnly = parseTimeRange({ after: "2024-01-01" });
+    const utcExplicit = parseTimeRange({ after: "2024-01-01T00:00:00Z" });
+    expect(dateOnly.sinceMs).toBe(utcExplicit.sinceMs);
+  });
+
+  it("带时间的字符串不被 date-only 归一化影响", () => {
+    const withTime = parseTimeRange({ after: "2024-01-01T12:00:00Z" });
+    expect(withTime.sinceMs).toBe(Date.parse("2024-01-01T12:00:00Z"));
+  });
+
   it("尊重 timeField: 'updatedAt'", () => {
     const r = parseTimeRange({ timeField: "updatedAt" });
     expect(r.field).toBe("updatedAt");

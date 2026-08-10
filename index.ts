@@ -19,7 +19,7 @@ import {
 } from "./src/store/store.ts";
 import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
-import { Recaller } from "./src/recaller/recall.ts";
+import { Recaller, parseTimeRange } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
@@ -711,6 +711,21 @@ const graphMemoryProPlugin = {
           timeField?: "createdAt" | "updatedAt";
         }) {
           let res;
+          const hasTimeFilter = !!(params.after || params.before);
+          if (hasTimeFilter) {
+            try {
+              parseTimeRange({
+                after: params.after,
+                before: params.before,
+                timeField: params.timeField,
+              });
+            } catch (e: any) {
+              return {
+                content: [{ type: "text", text: `时间筛选参数错误：${e?.message ?? e}` }],
+                details: { count: 0, query: params.query, error: true },
+              };
+            }
+          }
           try {
             res = await recaller.recall(params.query, {
               after: params.after,
@@ -719,7 +734,7 @@ const graphMemoryProPlugin = {
             });
           } catch (e: any) {
             return {
-              content: [{ type: "text", text: `时间筛选参数错误：${e?.message ?? e}` }],
+              content: [{ type: "text", text: `召回失败：${e?.message ?? e}` }],
               details: { count: 0, query: params.query, error: true },
             };
           }
