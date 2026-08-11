@@ -120,6 +120,12 @@ export function normalizeMessageContent(messages: any[]): any[] {
   });
 }
 
+/** Return only the completed-turn messages not already delivered by ingest(). */
+export function missingIngestMessages(messages: any[], ingestedCount: number): any[] {
+  const delivered = Math.max(0, Math.min(messages.length, ingestedCount));
+  return messages.slice(delivered);
+}
+
 // ─── assemble 消息裁剪：保留最近 N 轮，旧轮只留文本 ──────────
 
 const KEEP_TURNS = 5;
@@ -402,6 +408,7 @@ const graphMemoryProPlugin = {
     const recalled = new Map<string, RecallResult>();
     const sessionIdsByKey = new Map<string, string>();
     const pendingSubagentRecall = new Map<string, RecallResult>();
+    const ingestedSinceTurn = new Map<string, number>();
 
     function bindSessionIdentity(sessionId: string, sessionKey?: string): void {
       if (!sessionKey) return;
@@ -463,6 +470,7 @@ const graphMemoryProPlugin = {
         if (isHeartbeat) return { ingested: false };
         bindSessionIdentity(sessionId, sessionKey);
         await ingestMessage(sessionId, message);
+        ingestedSinceTurn.set(sessionId, (ingestedSinceTurn.get(sessionId) ?? 0) + 1);
         return { ingested: true };
       },
 
@@ -596,14 +604,28 @@ const graphMemoryProPlugin = {
         bindSessionIdentity(sessionId, sessionKey);
 
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
-        if (!newMessages.length) return;
+        if (!newMessages.length) {
+          ingestedSinceTurn.delete(sessionId);
+          return;
+        }
 
-        // 轮次计数
-        const turnNum = (msgSeq.get(sessionId) ?? 0) + 1;
-        msgSeq.set(sessionId, turnNum);
+        // Official OpenClaw delivers ingest() and afterTurn() as separate
+        // lifecycle phases. Older downstream builds incorrectly call only
+        // afterTurn(). Persist just the missing suffix so neither host loses
+        // messages and modern hosts do not create duplicate GmMessage rows.
+        const ingestedCount = ingestedSinceTurn.get(sessionId) ?? 0;
+        const missingMessages = missingIngestMessages(newMessages, ingestedCount);
+        for (const message of missingMessages) {
+          await ingestMessage(sessionId, message);
+        }
+        if (missingMessages.length > 0) {
+          api.logger.warn(
+            `[graph-memory-pro] afterTurn backfilled ${missingMessages.length} message(s) missing from ingest lifecycle`,
+          );
+        }
+        ingestedSinceTurn.delete(sessionId);
 
-        // 整轮存为 1 条 GmMessage（溯源用）
-        await saveMessage(driver, sessionId, turnNum, "turn", newMessages);
+        const turnNum = msgSeq.get(sessionId) ?? 0;
 
         api.logger.info(`[graph-memory-pro] afterTurn sid=${sessionId.slice(0, 8)} turn=${turnNum} rawMsgs=${newMessages.length}`);
 
@@ -627,6 +649,7 @@ const graphMemoryProPlugin = {
         if (childSessionId) {
           recalled.delete(childSessionId);
           msgSeq.delete(childSessionId);
+          ingestedSinceTurn.delete(childSessionId);
         }
         sessionIdsByKey.delete(childSessionKey);
         pendingSubagentRecall.delete(childSessionKey);
@@ -637,6 +660,7 @@ const graphMemoryProPlugin = {
         recalled.clear();
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
+        ingestedSinceTurn.clear();
         // 不关闭 Neo4j driver — 连接池自管理生命周期，进程退出时由 OS 回收
       },
     };
@@ -710,6 +734,7 @@ const graphMemoryProPlugin = {
       } finally {
         msgSeq.delete(sid);
         recalled.delete(sid);
+        ingestedSinceTurn.delete(sid);
         if (sessionKey && sessionIdsByKey.get(sessionKey) === sid) {
           sessionIdsByKey.delete(sessionKey);
           pendingSubagentRecall.delete(sessionKey);
