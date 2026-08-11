@@ -31,7 +31,8 @@ export interface GmNode {
   description: string;
   content: string;
   status: NodeStatus;
-  tier: NodeTier;
+  /** 与 NodeStatus 正交的衰减分层；旧节点/新节点缺省时按 working 处理。 */
+  tier?: NodeTier;
   validatedCount: number;
   sourceSessions: string[];
   communityId: string | null;
@@ -43,8 +44,9 @@ export interface GmNode {
    * （重新提取、gm_record、gm_update、CRUD POST）。是衰减判定的基准。
    * 与 updatedAt 的区别：updatedAt 在 deprecate/merge 时也会变，不能代表相关性；
    * 而 mergeNodes 故意不更新 lastAccessedAt（合并 ≠ 用户重新激活）。
+   * 缺省时回退到 updatedAt / createdAt。
    */
-  lastAccessedAt: number;
+  lastAccessedAt?: number;
   /** 最近一次 decay 评分（0~1，越大越鲜活/重要）。仅 applyDecay 写入。 */
   decayScore?: number;
   /** decayScore 的计算时间戳（epoch ms）。 */

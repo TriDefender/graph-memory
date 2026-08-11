@@ -52,6 +52,15 @@ export function computeConfidence(validatedCount: number): number {
 
 // ─── 三因子评分（纯函数） ────────────────────────────────────
 
+/** 选 lastAccessedAt → updatedAt → createdAt 中第一个 > 0 的，用于回退旧节点缺字段。 */
+function pickLastActive(node: Pick<GmNode, "lastAccessedAt" | "updatedAt" | "createdAt">): number {
+  const la = node.lastAccessedAt ?? 0;
+  const up = node.updatedAt ?? 0;
+  if (la > 0) return la;
+  if (up > 0) return up;
+  return node.createdAt ?? 0;
+}
+
 /** β 随 tier 变化：core 缓衰、peripheral 促衰。 */
 export function computeBeta(tier: NodeTier, cfg: DecayConfig): number {
   switch (tier) {
@@ -71,9 +80,7 @@ export function scoreRecency(
   now: number,
   cfg: DecayConfig,
 ): number {
-  const lastActive = node.lastAccessedAt > 0
-    ? node.lastAccessedAt
-    : (node.updatedAt > 0 ? node.updatedAt : node.createdAt);
+  const lastActive = pickLastActive(node);
   const daysSince = Math.max(0, (now - lastActive) / MS_PER_DAY);
 
   const effectiveHL = cfg.recencyHalfLifeDays * Math.exp(cfg.importanceModulation * importance);
@@ -94,9 +101,7 @@ export function scoreFrequency(
   const base = 1 - Math.exp(-count / 5);
   if (count <= 1) return base;
 
-  const lastActive = node.lastAccessedAt > 0
-    ? node.lastAccessedAt
-    : (node.updatedAt > 0 ? node.updatedAt : node.createdAt);
+  const lastActive = pickLastActive(node);
   const accessSpanDays = Math.max(1, (lastActive - node.createdAt) / MS_PER_DAY);
   const avgGapDays = accessSpanDays / Math.max(count - 1, 1);
   const recentnessBonus = Math.exp(-avgGapDays / 30);
