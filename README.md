@@ -108,6 +108,29 @@ Anthropic direct (Claude) — drop `baseURL`, switch `provider`:
 
 `embedding` is optional. When present, `dimensions` must match the Neo4j vector index dimension. For a fresh database, the plugin creates matching indexes during startup. If you change dimensions later, recreate the vector indexes or the Neo4j database.
 
+### Memory decay (forgetting curve)
+
+Each maintenance cycle scores every active node with a three-factor weighted model (recency + frequency + intrinsic) and bidirectionally transitions nodes across three tiers: `core` / `working` / `peripheral`. Nodes never get `status=deprecated` from decay — only manual deprecate / merge does that. Decay only adjusts `tier`, so all active nodes remain searchable.
+
+The full formula, field mapping from the reference implementation, default-value rationale, and tuning guide live in **[`docs/decay.md`](docs/decay.md)**.
+
+Minimal config (all fields optional, defaults shown):
+
+```json
+"decay": { "enabled": true }
+```
+
+Common overrides — for fuller control see `docs/decay.md` §4:
+
+```json
+"decay": {
+  "enabled": true,
+  "recencyHalfLifeDays": 30,
+  "peripheralCompositeThreshold": 0.15,
+  "workingAccessThreshold": 3
+}
+```
+
 ### OAuth login (experimental)
 
 ```bash
@@ -127,7 +150,7 @@ conversation messages -> GmMessage nodes -> LLM triple extraction
   -> embeddings -> vector recall + community expansion + GDS PPR
   -> XML context injection
 
-session end -> dedup -> global PageRank -> communities -> summaries
+session end -> decay (forgetting curve) -> dedup -> global PageRank -> communities -> summaries
 ```
 
 ## Verify

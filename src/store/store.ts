@@ -8,7 +8,7 @@
 import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { createHash } from "crypto";
-import type { GmNode, GmEdge, EdgeType, NodeType } from "../types.ts";
+import type { GmNode, GmEdge, EdgeType, NodeType, NodeTier } from "../types.ts";
 import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
 import { getSession } from "./db.ts";
 
@@ -32,6 +32,8 @@ function toNode(r: any): GmNode {
     description: n.description ?? "",
     content: n.content,
     status: n.status,
+    tier: (n.tier === "core" || n.tier === "working" || n.tier === "peripheral"
+      ? n.tier : "working") as NodeTier,
     validatedCount: toInt(n.validatedCount ?? n.validated_count ?? 1),
     sourceSessions: typeof n.sourceSessions === "string"
       ? JSON.parse(n.sourceSessions)
@@ -40,6 +42,9 @@ function toNode(r: any): GmNode {
     pagerank: toFloat(n.pagerank ?? 0),
     createdAt: toInt(n.createdAt ?? n.created_at ?? 0),
     updatedAt: toInt(n.updatedAt ?? n.updated_at ?? 0),
+    lastAccessedAt: toInt(n.lastAccessedAt ?? n.last_accessed_at ?? n.updatedAt ?? n.updated_at ?? n.createdAt ?? 0),
+    decayScore: typeof n.decayScore === "number" ? n.decayScore : undefined,
+    decayComputedAt: n.decayComputedAt ? toInt(n.decayComputedAt) : undefined,
   };
 }
 
@@ -164,6 +169,7 @@ export async function upsertNode(
               THEN n.sourceSessions + $sessionId
               ELSE n.sourceSessions
             END,
+            n.lastAccessedAt = $now,
             n.updatedAt = $now
         RETURN n
       `, { name, content: c.content, description: c.description, sessionId, now: Date.now() });
@@ -180,9 +186,10 @@ export async function upsertNode(
         CREATE (n:MemoryNode:${label} {
           id: $id, name: $name, type: $type,
           description: $description, content: $content,
-          status: 'active', validatedCount: 1,
+          status: 'active', tier: 'working', validatedCount: 1,
           sourceSessions: $sessions, communityId: null,
-          pagerank: 0.0, createdAt: $now, updatedAt: $now
+          pagerank: 0.0, createdAt: $now, updatedAt: $now,
+          lastAccessedAt: $now
         })
         RETURN n
       `, {

@@ -272,6 +272,7 @@ const graphMemoryProPlugin = {
 
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
+    if (raw.decay) cfg.decay = { ...DEFAULT_CONFIG.decay, ...raw.decay };
 
     const providerModel = readDefaultModel(api.config);
 
@@ -1121,13 +1122,21 @@ const graphMemoryProPlugin = {
       (_ctx: any) => ({
         name: "gm_maintain",
         label: "Graph Memory Maintenance",
-        description: "手动触发图维护：去重、PageRank、社区检测。",
+        description: "手动触发图维护：衰减评分 + tier 转换、去重、PageRank、社区检测。",
         parameters: Type.Object({}),
         async execute() {
           const embedFn = (recaller as any).embed ?? undefined;
           const result = await runMaintenance(driver, cfg, llm, embedFn);
+          const t = result.decay.tierTransitions;
+          const totalTransitions = t.coreToWorking + t.workingToPeripheral + t.peripheralToWorking + t.workingToCore;
           const text = [
             `🔧 图维护完成（${result.durationMs}ms）`,
+            result.decay.enabled
+              ? `衰减：扫描 ${result.decay.scanned} 个节点，tier 转换 ${totalTransitions} 次` +
+                (totalTransitions > 0
+                  ? `（core→working ${t.coreToWorking}，working→peripheral ${t.workingToPeripheral}，peripheral→working ${t.peripheralToWorking}，working→core ${t.workingToCore}）`
+                  : "")
+              : `衰减：已禁用`,
             `去重：${result.dedup.pairs.length} 对相似，合并 ${result.dedup.merged} 对`,
             ...(result.dedup.pairs.length > 0
               ? result.dedup.pairs.slice(0, 5).map(p => `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
@@ -1137,7 +1146,7 @@ const graphMemoryProPlugin = {
             `PageRank Top 5：`,
             ...result.pagerank.topK.slice(0, 5).map((n, i) => `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
           ].join("\n");
-          return { content: [{ type: "text", text }], details: { durationMs: result.durationMs, dedupMerged: result.dedup.merged, communities: result.community.count } };
+          return { content: [{ type: "text", text }], details: { durationMs: result.durationMs, decayTransitions: totalTransitions, dedupMerged: result.dedup.merged, communities: result.community.count } };
         },
       }),
       { name: "gm_maintain" },

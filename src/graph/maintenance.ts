@@ -2,7 +2,7 @@
  * graph-memory-pro — 图谱维护
  *
  * 调用时机：session_end（finalize 之后）
- * 执行顺序：去重 → 全局 PageRank → 社区检测 → 社区描述
+ * 执行顺序：衰减 → 去重 → 全局 PageRank → 社区检测 → 社区描述
  */
 
 import type { Driver } from "neo4j-driver";
@@ -12,8 +12,10 @@ import type { EmbedFn } from "../engine/embed.ts";
 import { computeGlobalPageRank, type GlobalPageRankResult } from "./pagerank.ts";
 import { detectCommunities, summarizeCommunities, type CommunityResult } from "./community.ts";
 import { dedup, type DedupResult } from "./dedup.ts";
+import { applyDecay, type DecayResult } from "./decay.ts";
 
 export interface MaintenanceResult {
+  decay: DecayResult;
   dedup: DedupResult;
   pagerank: GlobalPageRankResult;
   community: CommunityResult;
@@ -25,6 +27,9 @@ export async function runMaintenance(
   driver: Driver, cfg: GmConfig, llm?: CompleteFn, embedFn?: EmbedFn,
 ): Promise<MaintenanceResult> {
   const start = Date.now();
+
+  // 0. 衰减（柔性评分 + tier 转换）—— 先于其他步骤，让后续基于最新 tier 集合运算
+  const decayResult = await applyDecay(driver, cfg);
 
   // 1. 去重
   const dedupResult = await dedup(driver, cfg);
@@ -44,6 +49,7 @@ export async function runMaintenance(
   }
 
   return {
+    decay: decayResult,
     dedup: dedupResult,
     pagerank: pagerankResult,
     community: communityResult,
