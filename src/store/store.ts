@@ -859,6 +859,9 @@ export async function saveMessage(
         m.content = $content,
         m.extracted = false,
         m.createdAt = $now
+      ON MATCH SET
+        m.role = $role,
+        m.content = $content
     `, {
       id: uid("m"),
       sid,
@@ -867,6 +870,22 @@ export async function saveMessage(
       content: JSON.stringify(content),
       now: Date.now(),
     });
+  } finally {
+    await session.close();
+  }
+}
+
+/** 该会话当前最大 turnIndex（无消息返回 0）。用于插件重启后恢复内存 msgSeq；
+ *  否则 turnIndex 从 1 重计 → MERGE 命中旧行 → ON CREATE 被跳过 → 新消息被静默丢弃。 */
+export async function getMaxTurnIndex(driver: Driver, sid: string): Promise<number> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      `MATCH (m:GmMessage {sessionId: $sid})
+       RETURN coalesce(max(m.turnIndex), 0) AS maxTurn`,
+      { sid },
+    );
+    return toInt(result.records[0].get("maxTurn"));
   } finally {
     await session.close();
   }

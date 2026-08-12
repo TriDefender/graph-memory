@@ -9,7 +9,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { getDriver, initSchema, getSession } from "./src/store/db.ts";
 import {
-  saveMessage, getUnextracted,
+  saveMessage, getUnextracted, getMaxTurnIndex,
   markExtracted, isTurnExtracted,
   upsertNode, upsertEdge, findByName, updateNode,
   deleteNode, deprecateNodeAndDisconnect,
@@ -352,13 +352,30 @@ const graphMemoryProPlugin = {
     /**
      * 每轮结束后直接从原始消息提取知识图谱
      * 一轮 = 用户发一条消息 → agent 不管调了多少工具 → 最终回复用户
+     *
+     * compact() 与本函数对同一 session 存在 TOCTOU 竞争：两条路径都先
+     * isTurnExtracted/getUnextracted → 调 LLM → 最后 markExtracted，中间窗口
+     * 允许另一条路径重复提取同一批消息（重复 LLM 调用 + validatedCount 双递增）。
+     * 用 per-session async 互斥锁串行化两条路径的提取体。
      */
+    const extractLocks = new Map<string, Promise<void>>();
+    function withExtractLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+      const prev = extractLocks.get(sessionId) ?? Promise.resolve();
+      const chain = prev.catch(() => {});
+      const result = chain.then(() => fn());
+      // 链上只保留"上一轮是否结束"的状态，丢弃返回值并吞掉错误，
+      // 否则一次失败会永久污染链 → 后续 acquire 直接 reject。
+      extractLocks.set(sessionId, result.then(() => undefined, () => undefined));
+      return result;
+    }
+
     async function extractTurnKnowledge(sessionId: string, turnNum: number, rawMessages: any[]): Promise<void> {
-      try {
-        if (await isTurnExtracted(driver, sessionId, turnNum)) {
-          api.logger.info(`[graph-memory-pro] turn ${turnNum}: already extracted (compact), skipping`);
-          return;
-        }
+      return withExtractLock(sessionId, async () => {
+        try {
+          if (await isTurnExtracted(driver, sessionId, turnNum)) {
+            api.logger.info(`[graph-memory-pro] turn ${turnNum}: already extracted (compact), skipping`);
+            return;
+          }
         const existing = (await getBySession(driver, sessionId)).map(n => n.name);
         const result = await extractor.extract({
           messages: rawMessages,
@@ -401,10 +418,12 @@ const graphMemoryProPlugin = {
       } catch (err) {
         api.logger.error(`[graph-memory-pro] turn ${turnNum} extract failed: ${err}`);
       }
+      });
     }
 
     // ── Session 运行时状态 ──────────────────────────────────
     const msgSeq = new Map<string, number>();
+    const msgSeqLoaders = new Map<string, Promise<number>>();
     const recalled = new Map<string, RecallResult>();
     const sessionIdsByKey = new Map<string, string>();
     const pendingSubagentRecall = new Map<string, RecallResult>();
@@ -421,6 +440,24 @@ const graphMemoryProPlugin = {
     }
 
     async function ingestMessage(sessionId: string, message: any): Promise<void> {
+      if (!msgSeq.has(sessionId)) {
+        // 插件重启后内存 Map 会丢，必须从 DB 恢复 MAX(turnIndex)，否则下一条消息
+        // turnIndex=1 → MERGE 命中旧行 → ON CREATE 被跳过 → 新消息静默丢失。
+        // in-flight Promise 去重，避免并发 ingest 同时查询 + 互相覆盖 seq。
+        let loader = msgSeqLoaders.get(sessionId);
+        if (!loader) {
+          loader = getMaxTurnIndex(driver, sessionId).then(max => {
+            msgSeq.set(sessionId, max);
+            msgSeqLoaders.delete(sessionId);
+            return max;
+          }).catch(err => {
+            msgSeqLoaders.delete(sessionId);
+            throw err;
+          });
+          msgSeqLoaders.set(sessionId, loader);
+        }
+        await loader;
+      }
       const seq = (msgSeq.get(sessionId) ?? 0) + 1;
       msgSeq.set(sessionId, seq);
       await saveMessage(driver, sessionId, seq, message.role ?? "unknown", message);
@@ -548,51 +585,53 @@ const graphMemoryProPlugin = {
 
       async compact({ sessionId, sessionKey, currentTokenCount }: { sessionId: string; sessionKey?: string; sessionFile: string; tokenBudget?: number; force?: boolean; currentTokenCount?: number }) {
         bindSessionIdentity(sessionId, sessionKey);
-        const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
+        return withExtractLock(sessionId, async () => {
+          const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
 
-        if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
+          if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
 
-        try {
-          const existing = (await getBySession(driver, sessionId)).map(n => n.name);
-          const result = await extractor.extract({ messages: msgs, existingNames: existing });
+          try {
+            const existing = (await getBySession(driver, sessionId)).map(n => n.name);
+            const result = await extractor.extract({ messages: msgs, existingNames: existing });
 
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = await upsertNode(driver, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromNode = await findByName(driver, ec.from);
-            const toNode = await findByName(driver, ec.to);
-            const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-            const toId = nameToId.get(ec.to) ?? toNode?.id;
-            if (fromId && toId) {
-              await upsertEdge(driver, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
+            const nameToId = new Map<string, string>();
+            for (const nc of result.nodes) {
+              const { node } = await upsertNode(driver, {
+                type: nc.type, name: nc.name,
+                description: nc.description, content: nc.content,
+              }, sessionId);
+              nameToId.set(node.name, node.id);
+              recaller.syncEmbed(node).catch(() => {});
             }
+
+            for (const ec of result.edges) {
+              const fromNode = await findByName(driver, ec.from);
+              const toNode = await findByName(driver, ec.to);
+              const fromId = nameToId.get(ec.from) ?? fromNode?.id;
+              const toId = nameToId.get(ec.to) ?? toNode?.id;
+              if (fromId && toId) {
+                await upsertEdge(driver, {
+                  fromId, toId, type: ec.type,
+                  instruction: ec.instruction, condition: ec.condition, sessionId,
+                });
+              }
+            }
+
+            const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
+            await markExtracted(driver, sessionId, maxTurn);
+
+            return {
+              ok: true, compacted: true,
+              result: {
+                summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
+                tokensBefore: currentTokenCount ?? 0,
+              },
+            };
+          } catch (err) {
+            api.logger.error(`[graph-memory-pro] compact failed: ${err}`);
+            return { ok: false, compacted: false, reason: String(err) };
           }
-
-          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-          await markExtracted(driver, sessionId, maxTurn);
-
-          return {
-            ok: true, compacted: true,
-            result: {
-              summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
-              tokensBefore: currentTokenCount ?? 0,
-            },
-          };
-        } catch (err) {
-          api.logger.error(`[graph-memory-pro] compact failed: ${err}`);
-          return { ok: false, compacted: false, reason: String(err) };
-        }
+        });
       },
 
       async afterTurn({ sessionId, sessionKey, messages, prePromptMessageCount, isHeartbeat }: {
@@ -649,6 +688,8 @@ const graphMemoryProPlugin = {
         if (childSessionId) {
           recalled.delete(childSessionId);
           msgSeq.delete(childSessionId);
+          msgSeqLoaders.delete(childSessionId);
+          extractLocks.delete(childSessionId);
           ingestedSinceTurn.delete(childSessionId);
         }
         sessionIdsByKey.delete(childSessionKey);
@@ -657,6 +698,8 @@ const graphMemoryProPlugin = {
 
       async dispose() {
         msgSeq.clear();
+        msgSeqLoaders.clear();
+        extractLocks.clear();
         recalled.clear();
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
@@ -733,6 +776,8 @@ const graphMemoryProPlugin = {
         api.logger.error(`[graph-memory-pro] session_end error: ${err}`);
       } finally {
         msgSeq.delete(sid);
+        msgSeqLoaders.delete(sid);
+        extractLocks.delete(sid);
         recalled.delete(sid);
         ingestedSinceTurn.delete(sid);
         if (sessionKey && sessionIdsByKey.get(sessionKey) === sid) {
