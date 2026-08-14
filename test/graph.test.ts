@@ -274,6 +274,14 @@ describe("Vector Dedup", () => {
     expect(pairs).toHaveLength(0);
   });
 
+  it("不同维度的向量不参与去重", () => {
+    const a = insertNode(db, { name: "dimension-a", type: "SKILL" });
+    const b = insertNode(db, { name: "dimension-b", type: "SKILL" });
+    saveVector(db, a, "a", [1, 0]);
+    saveVector(db, b, "b", [1, 0, 0]);
+    expect(detectDuplicates(db, { ...cfg, dedupThreshold: 0.9 })).toEqual([]);
+  });
+
   it("dedup 自动合并同类型重复节点", () => {
     const a = insertNode(db, { name: "skill-v1", type: "SKILL", validatedCount: 5 });
     const b = insertNode(db, { name: "skill-v1-dup", type: "SKILL", validatedCount: 2 });

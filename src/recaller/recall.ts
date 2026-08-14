@@ -31,10 +31,14 @@ import { personalizedPageRank } from "../graph/pagerank.ts";
 
 export class Recaller {
   private embed: EmbedFn | null = null;
+  private embeddingFingerprint = "";
 
   constructor(private db: DatabaseSyncInstance, private cfg: GmConfig) {}
 
-  setEmbedFn(fn: EmbedFn): void { this.embed = fn; }
+  setEmbedFn(fn: EmbedFn, fingerprint = ""): void {
+    this.embed = fn;
+    this.embeddingFingerprint = fingerprint;
+  }
 
   async recall(query: string): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
@@ -216,11 +220,12 @@ export class Recaller {
   async syncEmbed(node: GmNode): Promise<void> {
     if (!this.embed) return;
     const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
-    const hash = createHash("md5").update(text).digest("hex");
+    const hashInput = this.embeddingFingerprint ? `${this.embeddingFingerprint}\0${text}` : text;
+    const hash = createHash("md5").update(hashInput).digest("hex");
     if (getVectorHash(this.db, node.id) === hash) return;
     try {
       const vec = await this.embed(text, "db");
-      if (vec.length) saveVector(this.db, node.id, text, vec);
+      if (vec.length) saveVector(this.db, node.id, hashInput, vec);
     } catch { /* 不影响主流程 */ }
   }
 }

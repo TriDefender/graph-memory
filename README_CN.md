@@ -1,411 +1,199 @@
-<p align="center">
-  <img src="docs/images/banner.jpg" alt="graph-memory" width="100%" />
-</p>
+# Graph Memory
 
-<h1 align="center">graph-memory</h1>
+![Graph Memory × DeepSeek Harness](docs/images/dsh-native-hero.png)
 
-<p align="center">
-  <strong>OpenClaw 知识图谱上下文引擎插件</strong><br>
-  作者 <a href="mailto:Wywelljob@gmail.com">adoresever</a> · MIT 许可证
-</p>
+![DeepSeek Harness](docs/images/deepseek-harness-wordmark.svg)
 
-<p align="center">
-  <a href="#安装">安装</a> ·
-  <a href="#工作原理">工作原理</a> ·
-  <a href="#配置参数">配置</a> ·
-  <a href="README.md">English</a>
-</p>
+**面向 DeepSeek Harness 的原生知识图谱记忆插件，同时保留 OpenClaw 兼容入口。**
 
----
+[English](README.md) · [DSH 原生架构与 Pro 路线图](docs/DSH_NATIVE_PLAN.md) · [演示视频](https://b23.tv/ebzZ9gb) · [Pro / 清华分享](https://b23.tv/MIZCh0a)
 
-<p align="center">
-  <img src="docs/images/hero.png" alt="graph-memory 概览" width="90%" />
-</p>
+> 当前版本：`1.6.0-beta.1`。DSH 原生适配、跨会话召回、SQLite 持久化和向量检索已经实测；DSH 前端 3D 图谱仍属于第二阶段路线图，不是当前开源版已交付功能。
 
-## 记忆、Skills、Agent——难道不是一个东西吗？
+## 它解决什么问题
 
-大道至简——其实都是**上下文工程**。但现在有三个致命问题：
+普通会话压缩只保留一段摘要，跨会话复用仍然弱，而且容易把无关上下文重新塞回模型。Graph Memory 把可复用信息提取成 `TASK`、`SKILL`、`EVENT` 节点及带类型的关系边，在下一次对话中只召回与当前问题相关的局部子图。
 
-🔴 **上下文爆炸** — Agent 执行任务反复试错，pip 日志、git 输出、报错堆栈疯狂堆积。174 条消息吃掉 95K token，噪音远大于信号，且无法祛除。
+- 跨会话持久记忆：关闭或重启 DSH 后仍可召回。
+- 双路检索：向量语义检索与 FTS5 全文检索自动降级。
+- 图排序：社区发现、PageRank、个性化 PageRank 与深度限制。
+- 可追溯：节点保留来源会话，召回内容以独立上下文注入。
+- 本地优先：SQLite 默认存储在用户目录，不要求 Neo4j。
+- 双宿主：DSH 使用 Cordis 原生插件入口；OpenClaw 入口继续保留。
 
-🔴 **跨对话失忆** — 昨天踩过的坑、解过的 bug，新对话全部归零。MEMORY.md 全量加载？单次召回成本 49 万 token。不加载？同样的错误来一遍。
+## DSH 原生集成
 
-🔴 **技能孤岛** — self-improving-agent 记录的学习条目是孤立的 markdown 列表，没有因果关系、没有依赖链、没有知识体系。"装了 libgl1" 和 "ImportError: libGL.so.1" 之间毫无关联。
+Graph Memory 不是通过 MCP 旁路模拟插件，而是由 DSH/Cordis 直接加载：
 
-**graph-memory 用一个方案同时解决这三个问题。**
-
-<p align="center">
-  <img src="docs/images/graph-ui.png" alt="graph-memory 知识图谱可视化与社区检测" width="95%" />
-</p>
-
-> *58 个节点、40 条边、3 个社区——全部从对话中自动提取。右侧面板展示知识图谱的社区聚类（GitHub 操作、B站 MCP、会话管理）。左侧面板展示 Agent 使用 `gm_stats` 和 `gm_search` 工具查询图谱。*
-
-## v2.0 新特性
-
-### 社区感知召回（双路径并行）
-
-召回现在有**两条并行路径**，结果合并去重：
-
-- **精确路径**：向量/FTS5 搜索 → 社区扩展 → 图遍历 → 个性化 PageRank 排序
-- **泛化路径**：查询向量 vs 社区摘要 embedding → 匹配社区成员 → 个性化 PageRank 排序
-
-社区摘要在每次社区检测（每 7 轮）后**立即生成**，泛化路径从第一个维护窗口开始就可用。
-
-### 溯源片段（Episodic Context）
-
-PPR 排名前 3 的节点会拉取**原始 user/assistant 对话片段**注入上下文。Agent 不仅看到结构化的三元组，还能看到产生这些知识的实际对话——提高复用过去方案时的准确性。
-
-### 通用 Embedding 兼容
-
-Embedding 模块改用原生 `fetch` 替代 `openai` SDK，开箱即用兼容**所有 OpenAI 兼容端点**：
-
-- OpenAI、Azure OpenAI
-- 阿里云 DashScope（`text-embedding-v4`）
-- MiniMax（`embo-01`，1536 维 —— 使用 `texts` + `type` 请求体，不是 OpenAI 的 `input`）
-- Ollama、llama.cpp、vLLM（本地模型）
-- 任何实现了 `POST /embeddings` 的端点
-
-### Windows 一键安装包
-
-v2.0 提供 **Windows 安装包**（`.exe`）。从 [Releases](https://github.com/adoresever/graph-memory/releases) 页面下载：
-
-1. 下载 `graph-memory-installer-win-x64.exe`
-2. 运行安装包——自动检测 OpenClaw 安装路径
-3. 安装包自动配置 `plugins.slots.contextEngine`、添加插件条目、重启 gateway
-
-## 实测数据
-
-<p align="center">
-  <img src="docs/images/token-comparison.png" alt="7 轮对话 Token 逐轮对比" width="85%" />
-</p>
-
-7 轮对话实测（安装 bilibili-mcp + 登录 + 查询）：
-
-| 轮次 | 无 graph-memory | 有 graph-memory |
-|------|----------------|-----------------|
-| R1 | 14,957 | 14,957 |
-| R4 | 81,632 | 29,175 |
-| R7 | **95,187** | **23,977** |
-
-**压缩 75%。** 红色 = 无 graph-memory（线性增长）。蓝色 = 有 graph-memory（图谱替代后收敛）。
-
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="跨对话召回" width="85%" />
-</p>
-
-## 工作原理
-
-### 知识图谱
-
-graph-memory 从对话中构建类型化属性图：
-
-- **3 种节点**: `TASK`（做了什么）、`SKILL`（怎么做的）、`EVENT`（出了什么问题）
-- **5 种边**: `USED_SKILL`、`SOLVED_BY`、`REQUIRES`、`PATCHES`、`CONFLICTS_WITH`
-- **个性化 PageRank**: 根据当前查询动态排序，不是全局固定排名
-- **社区检测**: 自动将相关技能分组（Docker 集群、Python 集群等）
-- **社区摘要**: LLM 生成每个社区的描述 + embedding，实现语义级社区召回
-- **溯源片段**: 链接到图谱节点的原始对话片段，忠实还原上下文
-- **向量去重**: 通过余弦相似度合并语义重复的节点
-
-### 双路径召回
-
-```
-用户查询
-  │
-  ├─ 精确路径（实体级）
-  │    向量/FTS5 搜索 → 种子节点
-  │    → 社区同伴扩展
-  │    → 图遍历（N 跳）
-  │    → 个性化 PageRank 排序
-  │
-  ├─ 泛化路径（社区级）
-  │    查询 embedding vs 社区摘要 embedding
-  │    → 匹配社区的成员节点
-  │    → 图遍历（1 跳）
-  │    → 个性化 PageRank 排序
-  │
-  └─ 合并去重 → 最终上下文
+```mermaid
+flowchart LR
+  U[用户消息] --> E[DSH session/event]
+  E --> P[Graph Memory Cordis 插件]
+  P --> X[结构化抽取]
+  X --> S[(SQLite + FTS5 + Vectors)]
+  U --> R[语义/全文召回]
+  S --> R
+  R --> G[局部子图 + PPR]
+  G --> A[system-prompt/assemble]
+  A --> L[Agent Loop]
 ```
 
-两条路径并行执行。精确路径结果优先，泛化路径补充精确路径未覆盖的知识域。
+插件通过 Cordis 依赖注入使用 `tools`、`llm`、`systemPrompt`、`agentLoop`、`sessions` 和 `credentials`，并在 fiber 卸载时关闭数据库。它不修改 DSH 核心源代码。
 
-### 数据流
+### 当前 DSH 工具
 
-```
-消息进入 → ingest（零 LLM）
-  ├─ 所有消息存入 gm_messages
-  └─ turn_index 从数据库最大值续接（重启不归零）
+| 工具 | 用途 |
+|---|---|
+| `gm_status` | 查看原生加载状态、数据库、节点/边、向量模式、数量和维度 |
+| `gm_search` | 主动搜索跨会话知识图谱 |
+| `gm_record` | 显式写入 `TASK` / `SKILL` / `EVENT` |
+| `gm_stats` | 查看节点、边、社区统计 |
 
-assemble（零 LLM）
-  ├─ 图谱节点 → 按社区分组的 XML 注入 systemPrompt
-  ├─ PPR 排序决定注入优先级
-  ├─ PPR Top 3 节点拉取溯源片段
-  ├─ Content 规范化（防止 OpenClaw content.filter 崩溃）
-  └─ 保留最后一轮完整对话
+`gm_update` 与 `gm_maintain` 目前仍是 OpenClaw 入口能力，不能把它们当成 DSH 已实现工具。
 
-afterTurn（后台异步，不阻塞用户对话）
-  ├─ LLM 提取三元组 → gm_nodes + gm_edges
-  ├─ 每 7 轮：PageRank + 社区检测 + 社区摘要生成
-  └─ 用户发新消息时自动中断提取
+## 60 秒安装到 DeepSeek Harness
 
-session_end
-  ├─ finalize（LLM）：EVENT → SKILL 升级
-  └─ maintenance：去重 → PageRank → 社区检测
-
-下次新对话 → before_prompt_build
-  ├─ 双路径召回（精确 + 泛化）
-  └─ 个性化 PageRank 排序 → 注入上下文
-```
-
-### 个性化 PageRank (PPR)
-
-区别于全局 PageRank，PPR **根据你当前的问题动态排序**：
-
-- 问 "Docker 部署" → Docker 相关 SKILL 分数最高
-- 问 "conda 环境" → conda 相关 SKILL 分数最高
-- 同一个图谱，完全不同的排名
-- 召回时实时计算（几千节点 < 5ms）
-
-## 安装
-
-### 前置条件
-
-- [OpenClaw](https://github.com/openclaw/openclaw)（v2026.4.2+）
-- Node.js 22+
-
-### Windows 用户
-
-从 [Releases](https://github.com/adoresever/graph-memory/releases) 下载安装包：
-
-```
-graph-memory-installer-win-x64.exe
-```
-
-安装包自动完成：插件安装、上下文引擎激活、gateway 重启。运行后直接跳到[第三步：配置 LLM 和 Embedding](#第三步配置-llm-和-embedding)。
-
-### 第一步：安装插件
-
-三种方式任选：
-
-**方式 A — 从 npm 仓库安装**（推荐）：
-
-```bash
-pnpm openclaw plugins install graph-memory
-```
-
-不需要 `node-gyp`，不需要手动编译。SQLite 驱动（`@photostructure/sqlite`）将预编译二进制打包在 npm tarball 内。
-
-**方式 B — 从 GitHub 安装**：
-
-```bash
-pnpm openclaw plugins install github:adoresever/graph-memory
-```
-
-**方式 C — 从源码安装**（开发或自定义修改时使用）：
+当前 beta 建议从源码打包安装。安装动作走 DSH CLI，不是在对话框里粘贴代码：
 
 ```bash
 git clone https://github.com/adoresever/graph-memory.git
 cd graph-memory
-npm install
-npx vitest run   # 验证 80 个测试通过
-pnpm openclaw plugins install .
+npm ci
+npm test
+npm run build
+npm pack
+
+# 在 deepseek-harness 仓库中运行；也可以使用已安装的 dsh 命令
+pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+pnpm dsh web
 ```
 
-### 第二步：激活上下文引擎（关键！）
-
-这是**最容易遗漏的一步**。graph-memory 必须被注册为上下文引擎，否则 OpenClaw 只会用它做召回，**不会触发消息入库和知识提取**。
-
-编辑 `~/.openclaw/openclaw.json`，在 `plugins` 中添加 `slots`：
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
-        "enabled": true
-      }
-    }
-  }
-}
-```
-
-如果没有 `plugins.slots.contextEngine`，插件虽然注册成功，但 `ingest` / `assemble` / `compact` 管线不会启动——你会在日志里看到 `recall`，但数据库里没有任何数据。
-
-### 第三步：配置 LLM 和 Embedding
-
-在 `plugins.entries.graph-memory.config` 中添加 API 密钥：
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
-        "enabled": true,
-        "config": {
-          "llm": {
-            "apiKey": "你的LLM-API密钥",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "gpt-4o-mini"
-          },
-          "embedding": {
-            "apiKey": "你的Embedding-API密钥",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "text-embedding-3-small",
-            "dimensions": 512
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-**LLM**（`config.llm`）— 必填。用于知识提取和社区摘要生成。支持任何 OpenAI 兼容端点。建议用便宜/快速的模型。
-
-**Embedding**（`config.embedding`）— 可选但推荐。启用语义向量搜索、社区级召回和向量去重。不配则降级为 FTS5 全文搜索（仍然可用，只是基于关键词匹配）。
-
-> **⚠️ 注意**：`pnpm openclaw plugins install` 可能会重置你的配置。每次重装插件后请检查 `config.llm` 和 `config.embedding` 是否还在。
-
-Anthropic 直连可只配置 `config.llm.apiKey` 而不配置 `baseUrl`；graph-memory 不会从环境变量读取凭证。
-
-### 支持的 Embedding 服务商
-
-| 服务商 | baseURL | 模型 | dimensions |
-|--------|---------|------|------------|
-| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
-| 阿里云 DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax (MiniMax CodePlan) | `https://api.minimaxi.com/v1` | `embo-01` | 1536 |
-| Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
-| llama.cpp | `http://127.0.0.1:8080/v1` | 你的模型名 | 视模型而定 |
-
-模型不支持 `dimensions` 参数时，设为 `0` 或直接不填。
-`baseUrl` 和旧拼写 `baseURL` 均受支持。本地 Ollama、llama.cpp 等无需鉴权的兼容端点可以省略 `apiKey`。
-
-### 重启并验证
+发布到 npm 后，安装命令会简化为：
 
 ```bash
-pnpm openclaw gateway --verbose
+dsh plugin --profile web add graph-memory@1.6.0-beta.1
+dsh web
 ```
 
-启动日志中应该看到这两行：
+安装成功后可以在 DSH 的“设置 → 插件清单”看到 `graph-memory/dsh`，也可以在对话中让模型调用 `gm_status`。
 
+![DSH plugin inventory](docs/images/dsh/plugin-inventory-active.png)
+
+默认数据库：
+
+```text
+$DSH_HOME/graph-memory/graph-memory.db
 ```
-[graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
-[graph-memory] vector search ready
-```
 
-如果看到 `FTS5 search mode` 而不是 `vector search ready`，说明 embedding 配置缺失或 API Key 无效。
+未设置 `DSH_HOME` 时通常是 `~/.dsh/graph-memory/graph-memory.db`。
 
-对话几轮后验证：
+## 配置 Embedding
+
+Embedding 是可选项。未配置时自动使用 FTS5；配置后启用语义向量召回，并在启动时为旧节点补齐向量。
+
+DSH 配置只保存凭据引用 `GRAPH_MEMORY_EMBEDDING_API_KEY`，不会保存密钥值。**不要把 API key 发到对话框**，因为会话可能被持久化或进入记忆抽取。
+
+以 DashScope OpenAI-compatible 接口为例：
 
 ```bash
-# 检查消息是否入库
-sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
-
-# 检查知识三元组是否提取成功
-sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
-
-# 检查社区是否被检测和描述
-sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
-
-# 在 gateway 日志中确认：
-# [graph-memory] extracted N nodes, M edges
-# [graph-memory] recalled N nodes, M edges
+export GRAPH_MEMORY_EMBEDDING_API_KEY='replace-with-your-new-key'
+export GRAPH_MEMORY_EMBEDDING_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export GRAPH_MEMORY_EMBEDDING_MODEL='text-embedding-v4'
+export GRAPH_MEMORY_EMBEDDING_DIMENSIONS='1024'
+dsh web
 ```
 
-### 常见问题
+如果使用源码版 DSH：
 
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `recall` 正常但 `gm_messages` 为空 | 没设置 `plugins.slots.contextEngine` | 在 `plugins.slots` 中添加 `"contextEngine": "graph-memory"` |
-| 显示 `FTS5 search mode` | Embedding 未配置或 API Key 无效 | 检查 `config.embedding` 的密钥和地址 |
-| `No LLM available` 错误 | 重装插件后 LLM 配置丢失 | 重新添加 `config.llm` 到 `plugins.entries.graph-memory` |
-| `afterTurn` 后没有 `extracted` 日志 | Gateway 跳过了 `ingest`，或旧版本复用了 turn_index | 升级到最新插件版 |
-| `content.filter is not a function` | OpenClaw 要求 content 为数组 | 升级到最新插件版（已添加 content 规范化） |
-| 对话很多轮但节点为空 | 消息数未达到提取阈值 | 默认需要积累消息。继续对话或调低 `compactTurnCount` |
+```bash
+pnpm dsh web
+```
 
-## Agent 工具
+插件通过 DSH `credentials` 服务在每次请求时解析凭据，因此轮换密钥后下一次 embedding 操作即可生效。切换模型或维度会触发旧节点重新向量化；不同维度的向量不会被静默混算。
 
-| 工具 | 用途 |
-|------|------|
-| `gm_search` | 搜索图谱中的相关经验、技能和解决方案 |
-| `gm_record` | 手动记录经验到图谱 |
-| `gm_update` | 按精确节点名称更新已有节点的描述和/或内容（不存在则报错） |
-| `gm_stats` | 查看图谱统计：节点数、边数、社区数、PageRank Top 节点 |
-| `gm_maintain` | 手动触发图维护：去重 → PageRank → 社区检测 + 摘要生成 |
+![Vector mode ready](docs/images/dsh/vector-status.png)
 
-## 配置参数
+## 已验证的真实链路
 
-所有参数都有默认值，只需设置想要覆盖的。
+本机 DSH Web 验收结果：
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `dbPath` | `~/.openclaw/graph-memory.db` | 数据库路径 |
-| `compactTurnCount` | `7` | 维护周期（每隔多少轮触发 PageRank + 社区检测 + 摘要） |
-| `recallMaxNodes` | `6` | 每次召回最多注入的节点数 |
-| `recallMaxDepth` | `2` | 图遍历跳数 |
-| `dedupThreshold` | `0.90` | 向量去重的余弦相似度阈值 |
-| `pagerankDamping` | `0.85` | PPR 阻尼系数 |
-| `pagerankIterations` | `20` | PPR 迭代次数 |
+1. 原生插件在插件清单中处于 active。
+2. 15 个已有节点启动后自动回填为 15 个 1024 维向量。
+3. 在会话 A 用 `gm_record` 写入“主节点失效时，将只读副本提升为写入节点”。
+4. 在全新会话 B 用“线上数据库挂掉以后，备用机器怎样接管？”提问。
+5. 问题没有复用原句，也没有显式调用 `gm_search`；Graph Memory 仍自动注入对应 SKILL、TASK 和关系证据。
 
-## 数据库
+![Cross-session semantic recall](docs/images/dsh/vector-cross-session-recall.png)
 
-SQLite 通过 `@photostructure/sqlite`（预编译二进制，零编译）。默认路径：`~/.openclaw/graph-memory.db`。
+自动抽取仍受模型输出稳定性影响，因此 beta 阶段建议对关键知识使用 `gm_record`；抽取失败的消息会保留为未提取状态，后续可以重试。
 
-| 表 | 用途 |
-|----|------|
-| `gm_nodes` | 知识节点（含 pagerank + community_id） |
-| `gm_edges` | 类型化关系 |
-| `gm_nodes_fts` | FTS5 全文索引 |
-| `gm_messages` | 原始对话消息 |
-| `gm_signals` | 检测到的信号 |
-| `gm_vectors` | Embedding 向量（可选） |
-| `gm_communities` | 社区摘要 + embedding |
+## DSH 与 OpenClaw 能力矩阵
 
-## 与 lossless-claw 的对比
+| 能力 | DeepSeek Harness | OpenClaw |
+|---|---:|---:|
+| 原生生命周期 | Cordis fiber | Plugin hooks |
+| 跨会话记录与召回 | ✅ | ✅ |
+| SQLite / FTS5 | ✅ | ✅ |
+| OpenAI-compatible embedding | ✅ | ✅ |
+| 凭据引用、运行时解析 | ✅ | 由宿主配置管理 |
+| `gm_status/search/record/stats` | ✅ | ✅ |
+| `gm_update/maintain` | 规划中 | ✅ |
+| DSH 3D 分屏图谱 | 第二阶段 | 不适用 |
 
-| | lossless-claw | graph-memory |
-|--|---|---|
-| **方法** | 摘要 DAG | 知识图谱（三元组） |
-| **召回** | FTS grep + 子代理展开 | 双路径：实体 PPR + 社区向量匹配 |
-| **跨会话** | 仅当前对话 | 自动跨会话召回 |
-| **压缩** | 摘要（有损文本） | 结构化三元组（无损语义） |
-| **图算法** | 无 | PageRank、社区检测、向量去重 |
-| **上下文溯源** | 无 | 溯源片段（原始对话片段） |
+## OpenClaw 兼容入口
+
+OpenClaw 没有被删除。原有 `index.ts`、`openclaw.plugin.json` 和运行时行为继续保留：
+
+```bash
+openclaw plugins install graph-memory
+openclaw plugins enable graph-memory
+openclaw gateway restart
+```
+
+Graph Memory 的存储、抽取、召回和图算法是宿主无关核心；`dsh.ts` 与 `index.ts` 只是不同宿主适配器。因此后续升级 DSH 不需要牺牲已有 OpenClaw 用户。
+
+## 从清华分享到 DSH 生态
+
+Graph Memory 曾以 OpenClaw 插件与 Pro 知识图谱形态进行公开分享。现在项目进入第二阶段：把已经验证的记忆算法迁移为 DSH 原生插件，并逐步利用 Cordis 的客户端插件能力建设可视化工作台。
+
+- [开源版：跨会话记忆与上下文去噪演示](https://b23.tv/ebzZ9gb)
+- [Pro：Neo4j 知识图谱与清华分享视频](https://b23.tv/MIZCh0a)
+
+这里的“清华分享”描述的是作者的技术分享经历，不表示清华大学或 DeepSeek 对本项目的官方背书。
+
+## Pro 第二阶段：3D 图谱与拖拽上下文
+
+![Graph Memory Pro reference](docs/images/pro-reference/graph-memory-pro-video-frame.jpg)
+
+上图是现有 Pro/OpenClaw 视频素材，用于说明目标体验，并非 DSH 前端已经完成的截图。DSH 版本计划作为独立客户端插件进入会话分屏：
+
+- 左侧保持对话，右侧展示可搜索的 2D/3D 记忆图谱。
+- 节点覆盖记忆、Session、Skill、MCP Server 和 Tool，但不保存密钥。
+- 把节点拖入输入区时只提交受控的节点 ID；Host 校验后加载内容，并写入可追溯 session event。
+- 默认使用 SQLite 图存储即可，不强制安装 Neo4j。
+- Neo4j/GDS 作为可选 Pro 后端，用于超大图、多用户和复杂图分析。
+
+完整分期、接口边界和验收标准见 [DSH_NATIVE_PLAN.md](docs/DSH_NATIVE_PLAN.md)。
 
 ## 开发
 
 ```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
-npm install
-npm test        # 80 个测试
-npx vitest      # 监听模式
+npm ci
+npm test       # 当前 107 项
+npm run build
 ```
 
-### 项目结构
+发布前必须确认：测试与构建通过、tarball 包含 `dsh.ts`/`cordis.patch.yml`/文档、仓库不存在 API key 或本地数据库。
 
-```
-graph-memory/
-├── index.ts                     # 插件入口
-├── openclaw.plugin.json         # 插件清单
-├── src/
-│   ├── types.ts                 # 类型定义
-│   ├── store/                   # SQLite CRUD / FTS5 / CTE 遍历 / 社区 CRUD
-│   ├── engine/                  # LLM（fetch）+ Embedding（fetch，无 SDK 依赖）
-│   ├── extractor/               # 知识提取 prompt
-│   ├── recaller/                # 双路径召回（精确 + 泛化 + PPR）
-│   ├── format/                  # 上下文组装 + 消息修复 + content 规范化
-│   └── graph/                   # PageRank、社区检测 + 摘要、去重、维护
-└── test/                        # 80 个 vitest 测试
-```
+## 隐私与安全
 
-## 许可证
+- 数据默认保存在本机 SQLite。
+- 召回内容被标记为“不可信历史参考”，当前用户指令始终优先。
+- API key 只通过宿主凭据系统或环境变量提供，不写入 README、Cordis patch、日志或数据库。
+- 如果密钥曾出现在聊天、截图或终端输出中，应立即在供应商控制台轮换。
 
-MIT
+## License
+
+[MIT](LICENSE) © 2026 adoresever
+
+素材与商标说明见 [docs/ATTRIBUTIONS.md](docs/ATTRIBUTIONS.md)。

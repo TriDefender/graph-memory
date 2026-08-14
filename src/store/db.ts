@@ -16,8 +16,14 @@ export function resolvePath(p: string): string {
   return p.replace(/^~/, homedir());
 }
 
-export function getDb(dbPath: string): DatabaseSyncInstance {
-  if (_db) return _db;
+/**
+ * Open an independently owned database instance.
+ *
+ * Host adapters with explicit lifecycles (for example a DSH Cordis fiber)
+ * should use this API and close the returned instance from their disposer.
+ * The legacy OpenClaw adapter continues to use getDb() below.
+ */
+export function openDb(dbPath: string): DatabaseSyncInstance {
   const resolved = resolvePath(dbPath);
   
   // 修复：同时处理 Windows 和 Unix 路径分隔符
@@ -37,10 +43,21 @@ export function getDb(dbPath: string): DatabaseSyncInstance {
     // 像是 "file.db"，使用当前目录，不需要创建目录
   }
 
-  _db = new DatabaseSync(resolved);
-  _db.exec("PRAGMA journal_mode = WAL");
-  _db.exec("PRAGMA foreign_keys = ON");
-  migrate(_db);
+  const db = new DatabaseSync(resolved);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  migrate(db);
+  return db;
+}
+
+/**
+ * Legacy process-wide database accessor retained for OpenClaw compatibility.
+ * New host adapters must prefer openDb() so each plugin instance owns its
+ * connection and can dispose it without affecting another profile/fiber.
+ */
+export function getDb(dbPath: string): DatabaseSyncInstance {
+  if (_db) return _db;
+  _db = openDb(dbPath);
   return _db;
 }
 

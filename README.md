@@ -1,409 +1,185 @@
-<p align="center">
-  <img src="docs/images/banner.jpg" alt="graph-memory" width="100%" />
-</p>
+# Graph Memory
 
-<h1 align="center">graph-memory</h1>
+![Graph Memory × DeepSeek Harness](docs/images/dsh-native-hero.png)
 
-<p align="center">
-  <strong>Knowledge Graph Context Engine for OpenClaw</strong><br>
-  By <a href="mailto:Wywelljob@gmail.com">adoresever</a> · MIT License
-</p>
+![DeepSeek Harness](docs/images/deepseek-harness-wordmark.svg)
 
-<p align="center">
-  <a href="#installation">Installation</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="#configuration">Configuration</a> ·
-  <a href="README_CN.md">中文文档</a>
-</p>
+**Native knowledge-graph memory for DeepSeek Harness, with the OpenClaw adapter retained.**
 
----
+[中文](README_CN.md) · [DSH architecture and Pro roadmap](docs/DSH_NATIVE_PLAN.md) · [Community demo](https://b23.tv/ebzZ9gb) · [Pro / Tsinghua talk](https://b23.tv/MIZCh0a)
 
-<p align="center">
-  <img src="docs/images/hero.png" alt="graph-memory overview" width="90%" />
-</p>
+> Current release target: `1.6.0-beta.1`. Native DSH loading, persistent cross-session recall, SQLite storage, and semantic vector search are tested. The DSH 3D graph workspace is a phase-two roadmap item, not a shipped Community feature.
 
-## What it does
+## Why Graph Memory
 
-When conversations grow long, agents lose track of what happened. graph-memory solves three problems at once:
+Conversation compaction keeps a summary; it does not build durable, selectively retrievable knowledge. Graph Memory extracts reusable facts into `TASK`, `SKILL`, and `EVENT` nodes plus typed edges, then injects only the relevant local subgraph into a later conversation.
 
-1. **Context explosion** — 174 messages eat 95K tokens. graph-memory compresses to ~24K by replacing raw history with structured knowledge graph nodes
-2. **Cross-session amnesia** — Yesterday's bugs, solved problems, all gone in a new session. graph-memory recalls relevant knowledge automatically via FTS5/vector search + graph traversal
-3. **Skill islands** — Self-improving agents record learnings as isolated markdown. graph-memory connects them: "installed libgl1" and "ImportError: libGL.so.1" are linked by a `SOLVED_BY` edge
+- Persistent cross-session memory that survives DSH restarts.
+- Semantic vector retrieval with FTS5 fallback.
+- Community detection, PageRank, personalized PageRank, and bounded traversal.
+- Traceable source sessions and isolated prompt injection.
+- Local-first SQLite storage; Neo4j is not required.
+- Two host adapters: native DSH/Cordis and backward-compatible OpenClaw.
 
-**It feels like talking to an agent that learns from experience. Because it does.**
+## Native DSH architecture
 
-<p align="center">
-  <img src="docs/images/graph-ui.png" alt="graph-memory knowledge graph visualization with community detection" width="95%" />
-</p>
-
-> *58 nodes, 40 edges, 3 communities — automatically extracted from conversations. Right panel shows the knowledge graph with community clusters (GitHub ops, B站 MCP, session management). Left panel shows agent using `gm_stats` and `gm_search` tools.*
-
-## What's new in v2.0
-
-### Community-aware recall
-
-Recall now runs **two parallel paths** that merge results:
-
-- **Precise path**: vector/FTS5 search → community expansion → graph walk → PPR ranking
-- **Generalized path**: query vector vs community summary embeddings → community members → PPR ranking
-
-Community summaries are generated immediately after each community detection cycle (every 7 turns), so the generalized path is available from the first maintenance window.
-
-### Episodic context (conversation traces)
-
-The top 3 PPR-ranked nodes now pull their **original user/assistant conversation snippets** into the context. The agent sees not just structured triples, but the actual dialogue that produced them — improving accuracy when reapplying past solutions.
-
-### Universal embedding support
-
-The embedding module now uses raw `fetch` instead of the `openai` SDK, making it compatible with **any OpenAI-compatible endpoint** out of the box:
-
-- OpenAI, Azure OpenAI
-- Alibaba DashScope (`text-embedding-v4`)
-- MiniMax (`embo-01`, 1536d — uses `texts` + `type` body format, not OpenAI `input`)
-- Ollama, llama.cpp, vLLM (local models)
-- Any endpoint that implements `POST /embeddings`
-
-### Windows one-click installer
-
-v2.0 ships a **Windows installer** (`.exe`). Download from [Releases](https://github.com/adoresever/graph-memory/releases):
-
-1. Download `graph-memory-installer-win-x64.exe`
-2. Run the installer — it auto-detects your OpenClaw installation
-3. The installer configures `plugins.slots.contextEngine`, adds the plugin entry, and restarts the gateway
-
-## Real-world results
-
-<p align="center">
-  <img src="docs/images/token-comparison.png" alt="Token comparison: 7 rounds" width="85%" />
-</p>
-
-7-round conversation installing bilibili-mcp + login + query:
-
-| Round | Without graph-memory | With graph-memory |
-|-------|---------------------|-------------------|
-| R1 | 14,957 | 14,957 |
-| R4 | 81,632 | 29,175 |
-| R7 | **95,187** | **23,977** |
-
-**75% compression.** Red = linear growth without graph-memory. Blue = stabilized with graph-memory.
-
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="Cross-session recall" width="85%" />
-</p>
-
-## How it works
-
-### The Knowledge Graph
-
-graph-memory builds a typed property graph from conversations:
-
-- **3 node types**: `TASK` (what was done), `SKILL` (how to do it), `EVENT` (what went wrong)
-- **5 edge types**: `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, `CONFLICTS_WITH`
-- **Personalized PageRank**: ranks nodes by relevance to the current query, not global popularity
-- **Community detection**: automatically groups related skills (Docker cluster, Python cluster, etc.)
-- **Community summaries**: LLM-generated descriptions + embeddings for each community, enabling semantic community-level recall
-- **Episodic traces**: original conversation snippets linked to graph nodes for faithful context reconstruction
-- **Vector dedup**: merges semantically duplicate nodes via cosine similarity
-
-### Dual-path recall
-
-```
-User query
-  │
-  ├─ Precise path (entity-level)
-  │    vector/FTS5 search → seed nodes
-  │    → community peer expansion
-  │    → graph walk (N hops)
-  │    → Personalized PageRank ranking
-  │
-  ├─ Generalized path (community-level)
-  │    query embedding vs community summary embeddings
-  │    → matched community members
-  │    → graph walk (1 hop)
-  │    → Personalized PageRank ranking
-  │
-  └─ Merge & deduplicate → final context
+```mermaid
+flowchart LR
+  U[User message] --> E[DSH session/event]
+  E --> P[Graph Memory Cordis plugin]
+  P --> X[Structured extraction]
+  X --> S[(SQLite + FTS5 + vectors)]
+  U --> R[Semantic / lexical recall]
+  S --> R
+  R --> G[Local subgraph + PPR]
+  G --> A[system-prompt/assemble]
+  A --> L[Agent loop]
 ```
 
-Both paths run in parallel. Precise results take priority; generalized results fill gaps from uncovered knowledge domains.
+The adapter is loaded by Cordis and injects `tools`, `llm`, `systemPrompt`, `agentLoop`, `sessions`, and `credentials`. It closes its owned database with the Cordis fiber and does not patch DSH core source.
 
-### Data flow
+### DSH tools
 
-```
-Message in → ingest (zero LLM)
-  ├─ All messages saved to gm_messages
-  └─ turn_index continues from DB max (survives gateway restart)
+| Tool | Purpose |
+|---|---|
+| `gm_status` | Native status, store path, node/edge counts, vector mode/count/dimensions |
+| `gm_search` | Explicit long-term graph search |
+| `gm_record` | Persist a `TASK`, `SKILL`, or `EVENT` |
+| `gm_stats` | Node, edge, and community statistics |
 
-assemble (zero LLM)
-  ├─ Graph nodes → XML with community grouping (systemPromptAddition)
-  ├─ PPR ranking decides injection priority
-  ├─ Episodic traces for top 3 nodes
-  ├─ Content normalization (prevents OpenClaw content.filter crash)
-  └─ Keep last turn raw messages
+`gm_update` and `gm_maintain` remain OpenClaw-only today.
 
-afterTurn (async, non-blocking)
-  ├─ LLM extracts triples → gm_nodes + gm_edges
-  ├─ Every 7 turns: PageRank + community detection + community summaries
-  └─ User sends new message → extract auto-interrupted
+## Install into DeepSeek Harness
 
-session_end
-  ├─ finalize (LLM): EVENT → SKILL promotion
-  └─ maintenance: dedup → PageRank → community detection
-
-Next session → before_prompt_build
-  ├─ Dual-path recall (precise + generalized)
-  └─ Personalized PageRank ranking → inject into context
-```
-
-### Personalized PageRank (PPR)
-
-Unlike global PageRank, PPR ranks nodes **relative to your current query**:
-
-- Ask about "Docker deployment" → Docker-related SKILLs rank highest
-- Ask about "conda environment" → conda-related SKILLs rank highest
-- Same graph, completely different rankings per query
-- Computed in real-time at recall (~5ms for thousands of nodes)
-
-## Installation
-
-### Prerequisites
-
-- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.4.2+)
-- Node.js 22+
-
-### Windows users
-
-Download the installer from [Releases](https://github.com/adoresever/graph-memory/releases):
-
-```
-graph-memory-installer-win-x64.exe
-```
-
-The installer handles everything: plugin installation, context engine activation, and gateway restart. After running, skip to [Step 3: Configure LLM and Embedding](#step-3-configure-llm-and-embedding).
-
-### Step 1: Install the plugin
-
-Choose one of three methods:
-
-**Option A — From npm registry** (recommended):
-
-```bash
-pnpm openclaw plugins install graph-memory
-```
-
-No `node-gyp`, no manual compilation. The SQLite driver (`@photostructure/sqlite`) ships prebuilt binaries — works with OpenClaw's `--ignore-scripts` install.
-
-**Option B — From GitHub**:
-
-```bash
-pnpm openclaw plugins install github:adoresever/graph-memory
-```
-
-**Option C — From source** (for development or custom modifications):
+For this beta, build a tarball from source and install it through the DSH CLI:
 
 ```bash
 git clone https://github.com/adoresever/graph-memory.git
 cd graph-memory
-npm install
-npx vitest run   # verify 80 tests pass
-pnpm openclaw plugins install .
+npm ci
+npm test
+npm run build
+npm pack
+
+# Run from the deepseek-harness repository, or use an installed dsh binary.
+pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+pnpm dsh web
 ```
 
-### Step 2: Activate context engine
-
-This is the **critical step** most people miss. graph-memory must be registered as the context engine, otherwise OpenClaw will only use it for recall but **won't ingest messages or extract knowledge**.
-
-Edit `~/.openclaw/openclaw.json` and add `plugins.slots`:
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
-        "enabled": true
-      }
-    }
-  }
-}
-```
-
-Without `"contextEngine": "graph-memory"` in `plugins.slots`, the plugin registers but the `ingest` / `assemble` / `compact` pipeline never fires — you'll see `recall` in logs but zero data in the database.
-
-### Step 3: Configure LLM and Embedding
-
-Add your API credentials inside `plugins.entries.graph-memory.config`:
-
-```json
-{
-  "plugins": {
-    "slots": {
-      "contextEngine": "graph-memory"
-    },
-    "entries": {
-      "graph-memory": {
-        "enabled": true,
-        "config": {
-          "llm": {
-            "apiKey": "your-llm-api-key",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "gpt-4o-mini"
-          },
-          "embedding": {
-            "apiKey": "your-embedding-api-key",
-            "baseURL": "https://api.openai.com/v1",
-            "model": "text-embedding-3-small",
-            "dimensions": 512
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-**LLM** (`config.llm`) — Required. Used for knowledge extraction and community summaries. Any OpenAI-compatible endpoint works. Use a cheap/fast model.
-
-**Embedding** (`config.embedding`) — Optional but recommended. Enables semantic vector search, community-level recall, and vector dedup. Without it, falls back to FTS5 full-text search (still works, just keyword-based).
-
-> **⚠️ Important**: `pnpm openclaw plugins install` may reset your config. Always verify `config.llm` and `config.embedding` are present after reinstalling.
-
-For Anthropic direct access, set `config.llm.apiKey` without `baseUrl`; graph-memory does not read credentials from environment variables.
-
-### Supported embedding providers
-
-| Provider | baseURL | Model | dimensions |
-|----------|---------|-------|------------|
-| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
-| Alibaba DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax (MiniMax CodePlan) | `https://api.minimaxi.com/v1` | `embo-01` | 1536 |
-| Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
-| llama.cpp | `http://127.0.0.1:8080/v1` | your model name | varies |
-
-Set `dimensions: 0` or omit it entirely if the model doesn't support the `dimensions` parameter.
-Both `baseUrl` and the legacy spelling `baseURL` are supported. Local compatible endpoints such as Ollama and llama.cpp may omit `apiKey` when authentication is disabled.
-
-### Restart and verify
+After npm publication:
 
 ```bash
-pnpm openclaw gateway --verbose
+dsh plugin --profile web add graph-memory@1.6.0-beta.1
+dsh web
 ```
 
-You should see these two lines in the startup log:
+The plugin appears under **Settings → Plugin inventory** as `graph-memory/dsh`. You can also ask the model to call `gm_status`.
 
-```
-[graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
-[graph-memory] vector search ready
-```
+![DSH plugin inventory](docs/images/dsh/plugin-inventory-active.png)
 
-If you see `FTS5 search mode` instead of `vector search ready`, your embedding config is missing or the API key is invalid.
+The default store is `$DSH_HOME/graph-memory/graph-memory.db`, normally `~/.dsh/graph-memory/graph-memory.db`.
 
-After a few rounds of conversation, verify:
+## Optional embeddings
+
+Without embedding configuration, Graph Memory falls back to FTS5. With embeddings enabled, it automatically backfills existing nodes.
+
+The Cordis config stores only the credential reference `GRAPH_MEMORY_EMBEDDING_API_KEY`; it never stores the secret value. **Do not send API keys in a chat**, because sessions can be persisted or extracted.
+
+DashScope OpenAI-compatible example:
 
 ```bash
-# Check messages are being ingested
-sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
-
-# Check knowledge triples are being extracted
-sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
-
-# Check communities are detected
-sqlite3 ~/.openclaw/graph-memory.db "SELECT id, summary FROM gm_communities;"
-
-# In gateway logs, look for:
-# [graph-memory] extracted N nodes, M edges
-# [graph-memory] recalled N nodes, M edges
+export GRAPH_MEMORY_EMBEDDING_API_KEY='replace-with-your-new-key'
+export GRAPH_MEMORY_EMBEDDING_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
+export GRAPH_MEMORY_EMBEDDING_MODEL='text-embedding-v4'
+export GRAPH_MEMORY_EMBEDDING_DIMENSIONS='1024'
+dsh web
 ```
 
-### Troubleshooting
+The adapter resolves the credential through DSH `credentials` for every operation, so rotation reaches the next request. A model or dimension change triggers re-embedding, and mixed vector dimensions are never silently compared.
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `recall` works but `gm_messages` is empty | `plugins.slots.contextEngine` not set | Add `"contextEngine": "graph-memory"` to `plugins.slots` |
-| `FTS5 search mode` instead of `vector search ready` | Embedding not configured or API key invalid | Check `config.embedding` credentials |
-| `No LLM available` error | LLM config missing after plugin reinstall | Re-add `config.llm` to `plugins.entries.graph-memory` |
-| No `extracted` log after `afterTurn` | Gateway skipped `ingest` or an older build reused turn indexes | Update to the latest plugin release |
-| `content.filter is not a function` | OpenClaw expects array content | Update to the latest plugin release (includes content normalization) |
-| Nodes are empty after many messages | `compactTurnCount` not reached | Default is 7 messages. Keep chatting or set a lower value |
+![Vector mode ready](docs/images/dsh/vector-status.png)
 
-## Agent tools
+## Verified DSH flow
 
-| Tool | Description |
-|------|-------------|
-| `gm_search` | Search the knowledge graph for relevant skills, events, and solutions |
-| `gm_record` | Manually record knowledge to the graph |
-| `gm_update` | Update an existing node's description and/or content by exact name (throws if not found) |
-| `gm_stats` | View graph statistics: nodes, edges, communities, PageRank top nodes |
-| `gm_maintain` | Manually trigger graph maintenance: dedup → PageRank → community detection + summaries |
+The local DSH Web acceptance run verified:
 
-## Configuration
+1. Native plugin status is active.
+2. All 15 existing nodes were backfilled to 15 vectors of 1024 dimensions.
+3. Session A recorded a failover procedure with `gm_record`.
+4. A fresh session asked a semantically equivalent question with different wording.
+5. No explicit `gm_search` call was needed; the relevant SKILL, TASK, and evidence edge were injected automatically.
 
-All parameters have defaults. Only set what you want to override.
+![Cross-session semantic recall](docs/images/dsh/vector-cross-session-recall.png)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `dbPath` | `~/.openclaw/graph-memory.db` | SQLite database path |
-| `compactTurnCount` | `7` | Turns between maintenance cycles (PageRank + community + summaries) |
-| `recallMaxNodes` | `6` | Max nodes injected per recall |
-| `recallMaxDepth` | `2` | Graph traversal hops from seed nodes |
-| `dedupThreshold` | `0.90` | Cosine similarity threshold for node dedup |
-| `pagerankDamping` | `0.85` | PPR damping factor |
-| `pagerankIterations` | `20` | PPR iteration count |
+Automatic extraction still depends on auxiliary-model output stability. During beta, use `gm_record` for critical knowledge; failed extraction remains pending for a later retry.
 
-## Database
+## Host capability matrix
 
-SQLite via `@photostructure/sqlite` (prebuilt binaries, zero native compilation). Default: `~/.openclaw/graph-memory.db`.
+| Capability | DeepSeek Harness | OpenClaw |
+|---|---:|---:|
+| Native lifecycle | Cordis fiber | Plugin hooks |
+| Persistent recall | ✅ | ✅ |
+| SQLite / FTS5 | ✅ | ✅ |
+| OpenAI-compatible embeddings | ✅ | ✅ |
+| Runtime credential references | ✅ | Host-managed |
+| `gm_status/search/record/stats` | ✅ | ✅ |
+| `gm_update/maintain` | Planned | ✅ |
+| DSH split-view 3D graph | Phase two | N/A |
 
-| Table | Purpose |
-|-------|---------|
-| `gm_nodes` | Knowledge nodes with pagerank + community_id |
-| `gm_edges` | Typed relationships |
-| `gm_nodes_fts` | FTS5 full-text index |
-| `gm_messages` | Raw conversation messages |
-| `gm_signals` | Detected signals |
-| `gm_vectors` | Embedding vectors (optional) |
-| `gm_communities` | Community summaries + embeddings |
+## OpenClaw compatibility
 
-## vs lossless-claw
+The OpenClaw adapter remains supported:
 
-| | lossless-claw | graph-memory |
-|--|---|---|
-| **Approach** | DAG of summaries | Knowledge graph (triples) |
-| **Recall** | FTS grep + sub-agent expansion | Dual-path: entity PPR + community vector matching |
-| **Cross-session** | Per-conversation only | Automatic cross-session recall |
-| **Compression** | Summaries (lossy text) | Structured triples (lossless semantics) |
-| **Graph algorithms** | None | PageRank, community detection, vector dedup |
-| **Context traces** | None | Episodic snippets from source conversations |
+```bash
+openclaw plugins install graph-memory
+openclaw plugins enable graph-memory
+openclaw gateway restart
+```
+
+The store, extractor, recaller, and graph algorithms are host-neutral. `dsh.ts` and `index.ts` are adapters, so DSH development does not strand existing OpenClaw users.
+
+## From a Tsinghua talk to the DSH ecosystem
+
+Graph Memory was publicly demonstrated as an OpenClaw plugin and as a Pro knowledge-graph system. The next chapter is a native DSH plugin and, later, a Cordis client workspace.
+
+- [Community cross-session memory demo](https://b23.tv/ebzZ9gb)
+- [Pro Neo4j graph and Tsinghua sharing video](https://b23.tv/MIZCh0a)
+
+“Tsinghua sharing” describes the author's technical sharing experience; it does not imply endorsement by Tsinghua University or DeepSeek.
+
+## Pro phase two: 3D graph and drag-to-context
+
+![Graph Memory Pro reference](docs/images/pro-reference/graph-memory-pro-video-frame.jpg)
+
+The image above is a frame from the existing Pro/OpenClaw demo and is not a completed DSH UI. The planned DSH client plugin will provide:
+
+- Conversation and searchable 2D/3D memory graph in a split view.
+- Memory, Session, Skill, MCP Server, and Tool nodes without storing secrets.
+- Controlled drag-to-context: the client drops node IDs, the host validates and loads content, and a durable session event records the action.
+- SQLite as the default graph backend; no mandatory Neo4j install.
+- Optional Neo4j/GDS for very large graphs, multi-user deployments, and advanced graph analytics.
+
+See [DSH_NATIVE_PLAN.md](docs/DSH_NATIVE_PLAN.md) for interfaces, milestones, and acceptance criteria.
 
 ## Development
 
 ```bash
-git clone https://github.com/adoresever/graph-memory.git
-cd graph-memory
-npm install
-npm test        # 80 tests
-npx vitest      # watch mode
+npm ci
+npm test       # 107 tests
+npm run build
 ```
 
-### Project structure
+Before release: run tests and build, inspect the tarball for `dsh.ts`, `cordis.patch.yml`, and docs, and scan for API keys or local databases.
 
-```
-graph-memory/
-├── index.ts                     # Plugin entry point
-├── openclaw.plugin.json         # Plugin manifest
-├── src/
-│   ├── types.ts                 # Type definitions
-│   ├── store/                   # SQLite CRUD / FTS5 / CTE traversal / community CRUD
-│   ├── engine/                  # LLM (fetch-based) + Embedding (fetch-based, SDK-free)
-│   ├── extractor/               # Knowledge extraction prompts
-│   ├── recaller/                # Dual-path recall (precise + generalized + PPR)
-│   ├── format/                  # Context assembly + transcript repair + content normalization
-│   └── graph/                   # PageRank, community detection + summaries, dedup, maintenance
-└── test/                        # 80 vitest tests
-```
+## Privacy and security
+
+- Memory is local SQLite by default.
+- Recalled history is marked untrusted reference material; current user instructions win.
+- Secrets belong in host credentials or environment variables, never in README, Cordis patches, logs, or the database.
+- Rotate any credential that has appeared in chat, screenshots, or terminal output.
 
 ## License
 
-MIT
+[MIT](LICENSE) © 2026 adoresever
+
+See [docs/ATTRIBUTIONS.md](docs/ATTRIBUTIONS.md) for asset and trademark notes.

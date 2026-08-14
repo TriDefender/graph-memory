@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { closeDb, getDb } from "../src/store/db.ts";
+import { closeDb, getDb, openDb } from "../src/store/db.ts";
 
 let tempDir: string | undefined;
 
@@ -15,6 +15,27 @@ afterEach(() => {
 });
 
 describe("database migrations", () => {
+  it("opens independently owned connections for lifecycle-scoped hosts", () => {
+    const first = openDb(":memory:");
+    const second = openDb(":memory:");
+
+    try {
+      first.prepare(`INSERT INTO gm_nodes
+        (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
+        VALUES ('n1', 'TASK', 'first', '', 'first', 'active', 1, '[]', 1, 1)`).run();
+
+      const firstCount = (first.prepare("SELECT COUNT(*) AS count FROM gm_nodes").get() as any).count;
+      const secondCount = (second.prepare("SELECT COUNT(*) AS count FROM gm_nodes").get() as any).count;
+
+      expect(first).not.toBe(second);
+      expect(firstCount).toBe(1);
+      expect(secondCount).toBe(0);
+    } finally {
+      first.close();
+      second.close();
+    }
+  });
+
   it("upgrades a v6 community table and backfills member signatures", () => {
     tempDir = mkdtempSync(join(tmpdir(), "graph-memory-migration-"));
     const dbPath = join(tempDir, "legacy.db");

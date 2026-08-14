@@ -104,4 +104,26 @@ describe("MiniMax embedding adapter", () => {
       { model: "nomic-embed-text", input: "hello" },
     ]);
   });
+
+  it("resolves credentials for every operation so rotation takes effect without restart", async () => {
+    let key = "first-key";
+    const authorization: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      authorization.push(new Headers(init?.headers).get("Authorization") ?? "");
+      return new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+
+    const embed = await createEmbedFn({
+      apiKeyResolver: async () => key,
+      baseURL: "https://example.test/v1",
+      model: "embedding-test",
+    });
+    key = "rotated-key";
+    await embed!("hello", "query");
+
+    expect(authorization).toEqual(["Bearer first-key", "Bearer rotated-key"]);
+  });
 });

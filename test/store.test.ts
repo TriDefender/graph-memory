@@ -12,15 +12,48 @@ import {
   findByName, findById, upsertNode, upsertEdge, updateNode, deprecate,
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
   searchNodes, topNodes, graphWalk, getBySession,
-  saveMessage, getMessages, getUnextracted, markExtracted,
+  saveMessage, saveMessageOnce, getMessages, getUnextracted, markExtracted, getEpisodicMessages,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, getAllVectors, upsertCommunitySummary,
+  vectorSearchWithScore,
 } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
 
 beforeEach(() => {
   db = createTestDb();
+});
+
+describe("vector dimensions", () => {
+  it("never compares vectors with different dimensions", () => {
+    const { node } = upsertNode(db, {
+      type: "SKILL", name: "mixed-dimension", description: "", content: "test",
+    }, "s1");
+    saveVector(db, node.id, "test", [1, 0, 0]);
+    expect(vectorSearchWithScore(db, [1, 0], 5, -1)).toEqual([]);
+  });
+});
+
+describe("host event messages", () => {
+  it("stores one DSH event idempotently and renders nested content blocks", () => {
+    const payload = {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "internal analysis" },
+        { type: "text", text: "Graph Memory is active" },
+      ],
+    };
+
+    expect(saveMessageOnce(db, "dsh:s1:7", "dsh:s1", 7, "assistant", payload)).toBe(true);
+    expect(saveMessageOnce(db, "dsh:s1:7", "dsh:s1", 7, "assistant", payload)).toBe(false);
+    expect(getMessages(db, "dsh:s1")).toHaveLength(1);
+
+    const episodic = getEpisodicMessages(db, ["dsh:s1"], Date.now());
+    expect(episodic).toHaveLength(1);
+    expect(episodic[0].text).toContain("internal analysis");
+    expect(episodic[0].text).toContain("Graph Memory is active");
+    expect(episodic[0].text).not.toContain("[object Object]");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════

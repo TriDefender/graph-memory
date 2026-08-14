@@ -78,7 +78,7 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   // Local OpenAI-compatible servers commonly do not require a key. A key by
   // itself still selects the default OpenAI endpoint; a URL by itself selects
   // an unauthenticated local/custom endpoint.
-  if (!cfg || (!cfg.apiKey && !cfg.baseURL && !cfg.baseUrl)) return null;
+  if (!cfg || (!cfg.apiKey && !cfg.apiKeyResolver && !cfg.baseURL && !cfg.baseUrl)) return null;
   const config = cfg;
 
   const baseURL    = (config.baseURL ?? config.baseUrl ?? "https://api.openai.com/v1").replace(/\/+$/, "");
@@ -105,11 +105,12 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   }
 
   async function callEmbedding(input: string, mode: EmbedMode): Promise<number[]> {
+    const apiKey = config.apiKeyResolver ? await config.apiKeyResolver() : config.apiKey;
     const res = await fetchRetry(`${baseURL}/embeddings`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        ...(config.apiKey ? { "Authorization": `Bearer ${config.apiKey}` } : {}),
+        ...(apiKey ? { "Authorization": `Bearer ${apiKey}` } : {}),
       },
       body: JSON.stringify(buildBody(input, mode)),
     });

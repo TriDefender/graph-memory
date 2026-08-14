@@ -114,6 +114,8 @@ export interface RecallResult {
 
 export interface EmbeddingConfig {
   apiKey?: string;
+  /** Runtime-only credential resolver. Host adapters use this to avoid putting secrets in config. */
+  apiKeyResolver?: () => Promise<string | undefined>;
   baseURL?: string;
   /** Alias used by OpenClaw and several OpenAI-compatible providers. */
   baseUrl?: string;

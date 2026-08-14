@@ -46,9 +46,9 @@ export interface DedupResult {
  * 余弦相似度
  */
 function cosineSim(a: Float32Array, b: Float32Array): number {
-  const len = Math.min(a.length, b.length);
+  if (a.length !== b.length) return Number.NEGATIVE_INFINITY;
   let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     normA += a[i] * a[i];
     normB += b[i] * b[i];

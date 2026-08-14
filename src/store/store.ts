@@ -205,17 +205,22 @@ export function edgesTo(db: DatabaseSyncInstance, id: string): GmEdge[] {
 
 // ─── FTS5 搜索 ───────────────────────────────────────────────
 
-let _fts5Available: boolean | null = null;
+// FTS support belongs to a concrete connection. A process-global boolean is
+// incorrect when multiple host profiles use different SQLite builds or when
+// tests/DSH fibers own independent databases.
+const fts5Availability = new WeakMap<object, boolean>();
 
 function fts5Available(db: DatabaseSyncInstance): boolean {
-  if (_fts5Available !== null) return _fts5Available;
+  const cached = fts5Availability.get(db as object);
+  if (cached !== undefined) return cached;
   try {
     db.prepare("SELECT * FROM gm_nodes_fts LIMIT 0").all();
-    _fts5Available = true;
+    fts5Availability.set(db as object, true);
+    return true;
   } catch {
-    _fts5Available = false;
+    fts5Availability.set(db as object, false);
+    return false;
   }
-  return _fts5Available;
 }
 
 export function searchNodes(db: DatabaseSyncInstance, query: string, limit = 6): GmNode[] {
@@ -310,6 +315,28 @@ export function saveMessage(
     .run(uid("m"), sid, turn, role, JSON.stringify(content), Date.now());
 }
 
+/**
+ * Persist one host event exactly once.
+ *
+ * DSH session events already carry a stable, monotonically increasing seq.
+ * Host adapters use that identity instead of the legacy random id so replay,
+ * resume and HMR backfill cannot duplicate a message.
+ */
+export function saveMessageOnce(
+  db: DatabaseSyncInstance,
+  eventId: string,
+  sid: string,
+  turn: number,
+  role: string,
+  content: unknown,
+): boolean {
+  const result = db.prepare(`INSERT OR IGNORE INTO gm_messages
+    (id, session_id, turn_index, role, content, created_at)
+    VALUES (?,?,?,?,?,?)`)
+    .run(eventId, sid, turn, role, JSON.stringify(content), Date.now());
+  return result.changes > 0;
+}
+
 export function getMessages(db: DatabaseSyncInstance, sid: string, limit?: number): any[] {
   if (limit) {
     return db.prepare("SELECT * FROM gm_messages WHERE session_id=? ORDER BY turn_index DESC LIMIT ?")
@@ -364,18 +391,7 @@ export function getEpisodicMessages(
       let text = "";
       try {
         const parsed = JSON.parse(r.content);
-        if (typeof parsed === "string") {
-          text = parsed;
-        } else if (typeof parsed?.content === "string") {
-          text = parsed.content;
-        } else if (Array.isArray(parsed)) {
-          text = parsed
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text ?? "")
-            .join("\n");
-        } else {
-          text = String(parsed).slice(0, 300);
-        }
+        text = extractStoredText(parsed);
       } catch {
         text = String(r.content).slice(0, 300);
       }
@@ -394,6 +410,20 @@ export function getEpisodicMessages(
   }
 
   return results;
+}
+
+/** Read text from legacy OpenClaw payloads and DSH block-based messages. */
+function extractStoredText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(extractStoredText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  if ((record.type === "text" || record.type === "reasoning") && typeof record.text === "string") {
+    return record.text;
+  }
+  if (record.content !== undefined) return extractStoredText(record.content);
+  if (record.message !== undefined) return extractStoredText(record.message);
+  return "";
 }
 
 // ─── 信号 CRUD ───────────────────────────────────────────────
@@ -454,6 +484,13 @@ export function getVectorHash(db: DatabaseSyncInstance, nodeId: string): string 
   return (db.prepare("SELECT content_hash FROM gm_vectors WHERE node_id=?").get(nodeId) as any)?.content_hash ?? null;
 }
 
+export function getVectorStats(db: DatabaseSyncInstance): { count: number; dimensions: number[] } {
+  const count = Number((db.prepare("SELECT COUNT(*) AS c FROM gm_vectors").get() as any)?.c ?? 0);
+  const rows = db.prepare("SELECT embedding FROM gm_vectors").all() as Array<{ embedding: Uint8Array }>;
+  const dimensions = [...new Set(rows.map((row) => row.embedding.byteLength / 4))].sort((a, b) => a - b);
+  return { count, dimensions };
+}
+
 /** 获取所有向量（供去重/聚类用） */
 export function getAllVectors(db: DatabaseSyncInstance): Array<{ nodeId: string; embedding: Float32Array }> {
   const rows = db.prepare(`
@@ -489,8 +526,8 @@ export function vectorSearchWithScore(db: DatabaseSyncInstance, queryVec: number
       const raw = row.embedding as Uint8Array;
       const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
       let dot = 0, vNorm = 0;
-      const len = Math.min(v.length, q.length);
-      for (let i = 0; i < len; i++) {
+      if (v.length !== q.length) return { score: Number.NEGATIVE_INFINITY, node: toNode(row) };
+      for (let i = 0; i < q.length; i++) {
         dot += v[i] * q[i];
         vNorm += v[i] * v[i];
       }
@@ -645,9 +682,11 @@ export function communityVectorSearch(db: DatabaseSyncInstance, queryVec: number
     .map(r => {
       const raw = r.embedding as Uint8Array;
       const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
+      if (v.length !== q.length) {
+        return { id: r.id as string, summary: r.summary as string, score: Number.NEGATIVE_INFINITY, nodeCount: r.node_count as number };
+      }
       let dot = 0, vNorm = 0;
-      const len = Math.min(v.length, q.length);
-      for (let i = 0; i < len; i++) {
+      for (let i = 0; i < q.length; i++) {
         dot += v[i] * q[i];
         vNorm += v[i] * v[i];
       }
