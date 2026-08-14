@@ -72,7 +72,7 @@ Graph Memory 的方向没有因为新宿主而推倒重来。项目正在从“O
 | OpenClaw 起点 | Context Engine、跨会话图记忆、双路径召回 | 保持兼容 |
 | Community 图引擎 | SQLite、FTS5、向量、图排序、溯源 | 可使用 |
 | DeepSeek Harness | Cordis 适配器、原生工具、自动召回、Credentials | 已完成并实测 |
-| Graph Memory Pro | 可视化图工作台、受控拖拽、Neo4j 可选适配器 | Pro Lite Host / GraphSnapshot 骨架已实现；Client 待实现 |
+| Graph Memory Pro | 可视化图工作台、受控拖拽、Neo4j 可选适配器 | Pro Lite 只读 Host + Client 已实现；2D/3D 与拖拽待实现 |
 
 2026 年 3 月 15 日，项目负责人在清华科技园举办的 CLAW 蜕壳计划活动中分享了 Graph Memory 的架构思路。以下为项目负责人提供的现场材料与[新浪财经活动报道](https://cj.sina.com.cn/articles/view/7984421895/1dbe89c0700101nnpq)。
 
@@ -166,9 +166,9 @@ graph-memory/
 | 显式记录与搜索 | **已完成** | `gm_record`、`gm_search` |
 | 向量回填与模型迁移 | **已完成** | 追踪模型、维度与 fingerprint |
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
-| Pro 可视化工作台 | **未交付** | 需要 DSH Client Plugin |
+| Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.1`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.5`；DSH 仍处于 Developer Preview，后续版本可能出现破坏性变化。验收已覆盖 tarball 安装、插件 active、1024 维向量回填、跨 Session 语义召回、重启持久化、FTS5 降级和 Pro Lite Host 边界；110 项自动化测试通过。
+当前 beta：`1.6.0-beta.1`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.5`；DSH 仍处于 Developer Preview，后续版本可能出现破坏性变化。验收已覆盖 tarball 安装、插件 active、1024 维向量回填、跨 Session 语义召回、重启持久化、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；111 项自动化测试通过。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -249,7 +249,7 @@ dsh web
 
 ### 结论
 
-**可以改造成插件，但现有 Pro 代码今天不能直接安装到 DSH。** 已核查的 `desktop-2.0` 分支是 OpenClaw + Neo4j 实现，绑定 `openclaw/plugin-sdk`、OpenClaw Gateway Route 和旧 ClawX 交互方向。Neo4j、GDS、APOC、向量索引、PageRank、社区分析和 CRUD 后端可以复用；宿主入口与浏览器通信层必须替换。目前没有可直接安装的 DSH Client renderer。
+**旧 `desktop-2.0` Pro 不能直接安装到 DSH，但新的 Pro Lite 已经作为独立 DSH 插件实现最小可用闭环。** 旧分支是 OpenClaw + Neo4j 实现，绑定 `openclaw/plugin-sdk`、OpenClaw Gateway Route 和旧 ClawX 交互方向。新实现位于 `dsh-pro/`：Host 读取 Community SQLite，Typed Remote 只提供受限快照，Client 在 DSH Web 侧边栏注册只读入口。Neo4j、GDS、APOC 和旧 CRUD 后端仍可在后续作为可选适配器迁移。
 
 目标不是再做一个独立产品，而是把 Pro 作为 Graph Memory 的可选增强插件：
 
@@ -269,44 +269,37 @@ flowchart LR
 
 ```text
 graph-memory                         # Community：当前原生 Host Plugin
-@adoresever/graph-memory-pro-dsh    # Pro：Host + Client Plugin（待实现）
+graph-memory-pro-dsh                # Pro Lite：Host + Client Plugin（本地 beta）
 @adoresever/graph-memory-store-neo4j # 可选大图存储适配器（待实现）
 ```
 
 第一版优先做 **Pro Lite**：继续读取现有 SQLite 图数据，只增加 DSH 图谱工作台。这样用户不需要安装 Neo4j。Neo4j 作为可选适配器，面向更大图谱、GDS 与复杂分析。**这是规划中的目标架构；现有 `desktop-2.0` Pro 仍是 Neo4j-only，尚未实现 SQLite / Neo4j 可切换的 `GraphStore`。**
 
-### 目标安装体验
+### 当前本地安装方式
 
-下面仅说明完成后的目标体验。当前 npm 上的 `graph-memory@1.5.8` 仍是 OpenClaw 包，`@adoresever/graph-memory-pro-dsh` 尚未发布；以下命令现在不可执行：
-
-```bash
-# PLANNED — NOT AVAILABLE YET
-dsh plugin --profile web add graph-memory
-dsh plugin --profile web add @adoresever/graph-memory-pro-dsh
-dsh web
-```
-
-当前实验性 Pro Lite Host 可以随本仓库从本地安装，并通过 overlay 启动：
+当前 npm 上的 `graph-memory@1.5.8` 仍是 OpenClaw 包，新的 Community beta 与 `graph-memory-pro-dsh` 尚未发布到 npm，需从当前源码本地安装：
 
 ```bash
 dsh plugin --profile web add \
   --allow-build=@photostructure/sqlite \
   /absolute/path/to/graph-memory
 
-dsh --profile web \
-  --patch ~/.dsh/profiles/web/node_modules/graph-memory/cordis.pro-lite.patch.yml
+dsh plugin --profile web add \
+  /absolute/path/to/graph-memory/dsh-pro
+
+dsh web
 ```
 
-这个入口已经提供受限的 SQLite `GraphSnapshot`、`gm_graph_snapshot` 和 `gm_graph_node`，但仍然只有 Host 层；没有分屏画布、2D/3D renderer、Typed Remote 或拖拽交互。
+两个插件默认共用 `~/.dsh/graph-memory/graph-memory.db`。当前入口提供受限 SQLite `GraphSnapshot`、`gm_graph_snapshot`、`gm_graph_node`、Typed Remote，以及侧边栏只读快照/搜索界面；尚无 2D/3D renderer、完整分屏、拖拽写入和节点编辑。
 
 ### 必须改造的四层
 
 1. **Core contract**：SQLite `GraphSnapshot` 与受限节点详情已经落地；Neo4j provider 和统一可写契约待实现。
-2. **Host Plugin**：Pro Lite Host 服务和两个受限工具已经落地；Typed Remote 与更细权限策略待实现。
-3. **Client Plugin**：在 DSH 注册侧栏 / Workbench / Tool Card，实现 2D 或 3D 图谱、搜索、筛选和对话分屏。
+2. **Host Plugin**：Pro Lite Host、两个受限工具和只读 Typed Remote 已落地；可写动作与更细权限策略待实现。
+3. **Client Plugin**：DSH 侧栏入口、卡片式快照、搜索与刷新已落地；2D/3D 图谱和对话分屏待实现。
 4. **受控上下文操作**：拖拽只提交节点 ID 与动作意图；Host 校验后把内容写入可见、可撤销的 Session Context。
 
-旧 Pro 的 `/graph-memory-pro/neo4j-config` 会把连接信息返回浏览器，这是必须消除的安全问题。新的 DSH Pro 将由 Host 解析 Credentials，浏览器只能获取经过裁剪的 `GraphSnapshot`，不能接收 Bolt 密码，也不能执行任意 Cypher。这是未来实现必须满足的设计约束。
+旧 Pro 的 `/graph-memory-pro/neo4j-config` 会把连接信息返回浏览器，这是已经在新实现中消除的安全问题。当前 Pro Lite 的浏览器只获取经过严格校验和裁剪的 `GraphSnapshot`，不会接收数据库路径、Session ID、Bolt 密码、SQL 或任意 Cypher。后续可写动作也必须保持这条 Host 权限边界。
 
 ## OpenClaw 兼容
 
@@ -352,7 +345,7 @@ npm pack
 
 - 自动抽取依赖辅助模型输出稳定性；关键知识在 beta 阶段建议使用 `gm_record`。
 - DSH 版暂未提供 `gm_update` 和 `gm_maintain`，这两个工具目前属于 OpenClaw 入口。
-- Pro 的 DSH Client Plugin 尚未实现。
+- Pro Lite 目前只有只读卡片式 Client；2D/3D、分屏和受控拖拽尚未实现。
 - npm registry 发布尚未完成，当前使用 GitHub 源码 tarball 安装。
 
 ## 隐私与安全

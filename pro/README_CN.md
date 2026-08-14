@@ -8,6 +8,8 @@
 - `GraphMemoryProHostApi` 只暴露 `getSnapshot()` 和 `getNodeDetail()`，不暴露数据库连接、SQL、Cypher 或凭据。
 - 图快照限制节点数、边数和文本长度；概览不返回记忆正文和会话标识。
 - `graph-memory/pro/dsh` 提供 DSH Host 插件，并注册 `gm_graph_snapshot`、`gm_graph_node` 两个可测试入口。
+- `GraphMemoryProRemoteService` 通过 Typert 暴露只读 `snapshot/detail`，Client 不能绕过 Host 直接查询数据库。
+- `dsh-pro/` 是独立的 `graph-memory-pro-dsh` bundle，在 DSH Web 侧边栏注册只读快照视图。
 - Cordis disposer 会同时撤销 Host 服务并关闭它拥有的 SQLite 连接。
 
 ## 本地试运行
@@ -51,13 +53,12 @@ Neo4j 后续可实现为 `GraphSnapshotStore` 的可选 provider。无论选择 
 
 ## 下一阶段
 
-1. 增加 Typert Remote，将 `GraphMemoryProHostApi` 映射到 DSH Host/Client 通道。
-2. 增加 DSH Client Plugin，在会话侧栏或分屏区域渲染 2D/3D 图谱。
-3. 拖拽只传递节点 id 和动作意图，由 Host 校验后写入可见、可撤销的 session context。
-4. 将 Pro Host、Remote 和 Client 打包成独立 bundle，使目标安装命令成为：
+1. 将当前卡片式快照升级成可缩放的 2D/3D 图谱，但继续消费同一个 `GraphSnapshot`。
+2. 拖拽只传递节点 id 和动作意图，由 Host 校验后写入可见、可撤销的 session context。
+3. 发布独立 bundle，使远程安装命令成为：
 
 ```bash
 dsh plugin --profile web add graph-memory-pro-dsh
 ```
 
-上述独立 bundle 尚未发布；当前可用入口是本目录提供的 overlay。
+独立 bundle 已在 `dsh-pro/` 中实现并通过本地安装验证，但尚未发布到 npm。

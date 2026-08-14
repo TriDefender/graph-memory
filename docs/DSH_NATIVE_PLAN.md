@@ -1,8 +1,8 @@
 # Graph Memory × DeepSeek Harness 原生架构与 Pro 路线图
 
-> 更新：2026-08-13  
+> 更新：2026-08-14  
 > Community 状态：`1.6.0-beta.1` 已完成本机 DSH 原生闭环验证  
-> Pro 状态：SQLite GraphSnapshot 与 DSH Host 骨架已实现，Typed Remote 和 DSH Client 尚未实现
+> Pro 状态：SQLite GraphSnapshot、DSH Host、Typed Remote 与只读 Client 已实现；2D/3D、分屏和拖拽尚未实现
 
 ## 1. 结论
 
@@ -107,7 +107,7 @@ embedding:
 | 跨会话语义召回 | 不同措辞、无显式 `gm_search` 仍命中 |
 | 重启持久化 | 通过 |
 | 无 embedding 降级 | FTS5，通过 |
-| 单元/迁移测试 | 110/110（含 Pro Lite Host / GraphSnapshot） |
+| 单元/迁移测试 | 111/111（含 Pro Lite Host / GraphSnapshot / Client bundle） |
 | TypeScript build | 通过 |
 | 普通对话自动抽取 | 有模型稳定性缺口，beta 已明确披露 |
 
@@ -186,7 +186,7 @@ interface GraphStore {
 | 阶段 | 目标 | 当前进度 | 完成标准 |
 |---|---|---:|---|
 | 第一步：Community 原生插件 | 可安装、可显示、跨会话记录/召回、向量检索、OpenClaw 保留 | 约 85%，beta 闭环完成 | 自动抽取 P0 修复、发布包/安装/卸载 E2E、文档与版本发布 |
-| 第二步：Pro Lite 客户端 | SQLite 图快照、2D 图谱、分屏、受控拖拽、Skill/MCP 索引 | Host/GraphSnapshot 骨架完成；Client 未开始 | 不改 DSH core；1 万节点交互性能达标；完整权限与审计 |
+| 第二步：Pro Lite 客户端 | SQLite 图快照、2D 图谱、分屏、受控拖拽、Skill/MCP 索引 | Host、Typed Remote、只读卡片 Client 已完成；2D/分屏/拖拽未开始 | 不改 DSH core；1 万节点交互性能达标；完整权限与审计 |
 | 第三步：Pro 完整版 | 3D renderer、可选 Neo4j/GDS、迁移与大图能力 | 待开始 | SQLite/Neo4j 同契约；凭据零下发；多平台安装与回滚通过 |
 
 ## 10. 下一批具体任务
@@ -208,8 +208,8 @@ interface GraphStore {
 
 ### P2：Pro Lite
 
-- 定义 `GraphSnapshot` 与 typed remote contracts。
-- 开发 Host graph service 和 DSH Client launcher。
+- 扩展已落地的 `GraphSnapshot` 与 typed remote contracts，增加邻居与健康状态。
+- 将已落地的侧栏只读 Client 升级为 Workbench / Conversation Node。
 - 2D explorer、tool card、settings/health。
 - Session / Skill / MCP / Tool 元数据索引。
 - drag-to-context 事件与权限确认。

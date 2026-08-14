@@ -1,4 +1,5 @@
 import { SqliteGraphSnapshotStore } from "./sqlite.ts";
+import { GraphMemoryProRemoteService } from "./remote-host.ts";
 import type { GraphMemoryProHostApi, GraphNodeId, GraphSnapshotRequest } from "./types.ts";
 
 export const name = "graph-memory-pro-dsh";
@@ -13,6 +14,7 @@ export interface Config {
   overviewTextLimit?: number;
   detailContentLimit?: number;
   modelToolsEnabled?: boolean;
+  remoteEnabled?: boolean;
 }
 
 interface DshContext {
@@ -50,13 +52,12 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     getNodeDetail: (id) => store.getNodeDetail(id),
   };
 
-  ctx.effect(() => {
-    const disposeService = ctx.provide(GRAPH_MEMORY_PRO_SERVICE, service);
-    return () => {
-      disposeService();
-      store.close();
-    };
-  }, "graph-memory-pro.close");
+  if (input.remoteEnabled ?? true) {
+    new GraphMemoryProRemoteService(ctx, service);
+  } else {
+    ctx.effect(() => ctx.provide(GRAPH_MEMORY_PRO_SERVICE, service), "graph-memory-pro.service");
+  }
+  ctx.effect(() => () => { store.close(); }, "graph-memory-pro.close");
 
   if (input.modelToolsEnabled ?? true) {
     ctx.tools.register({

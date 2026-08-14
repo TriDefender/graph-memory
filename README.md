@@ -88,7 +88,7 @@ The DSH integration does not discard the original project. Graph Memory is evolv
 | OpenClaw origin | Context Engine, cross-session graph memory, dual-path recall | Maintained |
 | Community graph engine | SQLite, FTS5, vectors, graph ranking, provenance | Available |
 | DeepSeek Harness | Cordis adapter, native tools, auto-recall, Credentials | Implemented and tested |
-| Graph Memory Pro | Visual graph workbench, controlled drag-and-drop, optional Neo4j | Pro Lite Host / GraphSnapshot skeleton implemented; Client pending |
+| Graph Memory Pro | Visual graph workbench, controlled drag-and-drop, optional Neo4j | Pro Lite read-only Host + Client implemented; 2D/3D and drag pending |
 
 On March 15, 2026, the project owner presented Graph Memory's architecture at the CLAW program event held in Tsinghua Science Park. The following owner-supplied materials and the [Sina Finance event report](https://cj.sina.com.cn/articles/view/7984421895/1dbe89c0700101nnpq) document that development.
 
@@ -181,9 +181,9 @@ graph-memory/
 | Explicit record and search | **Done** | `gm_record`, `gm_search` |
 | Vector backfill and migration | **Done** | Model, dimension, and fingerprint tracked |
 | Visible plugin state | **Done** | Active in Plugin Inventory |
-| Pro visual workbench | **Not shipped** | Requires a DSH Client Plugin |
+| Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.1`. Local acceptance used DeepSeek Harness `0.1.0-rc.5`. DSH remains in Developer Preview and may introduce compatibility-breaking changes. Testing covered tarball installation, active plugin state, 1024-dimensional vector backfill, semantic recall across Sessions, persistence across restarts, FTS5 fallback, and the Pro Lite Host boundary. All 110 automated tests passed.
+Current beta: `1.6.0-beta.1`. Local acceptance used DeepSeek Harness `0.1.0-rc.5`. DSH remains in Developer Preview and may introduce compatibility-breaking changes. Testing covered tarball installation, active plugin state, 1024-dimensional vector backfill, semantic recall across Sessions, persistence across restarts, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 111 automated tests passed.
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -261,7 +261,7 @@ Automatic recall does not require an explicit `gm_search` tool call. The plugin 
 
 ## Graph Memory Pro as a DSH plugin
 
-The accurate conclusion is not “Pro can already be installed into DSH.” It is: **Pro's graph database, retrieval, PageRank, community, and CRUD backend can be migrated; its OpenClaw host code and old ClawX integration must be replaced by a DSH Host + Client Plugin.** The current `desktop-2.0` implementation is OpenClaw + Neo4j and contains no installable DSH Client renderer.
+**The old `desktop-2.0` Pro cannot be installed into DSH directly, but the new Pro Lite now has a minimal, separately installable DSH plugin loop.** The old branch remains an OpenClaw + Neo4j implementation. The new `dsh-pro/` package reads Community SQLite on the Host, exposes only bounded snapshots over Typed Remote, and registers a read-only entry in the DSH Web sidebar.
 
 The reviewed `desktop-2.0` code includes Neo4j Driver, GDS, APOC, vector indexes, graph maintenance tools, and CRUD routes. Today it also:
 
@@ -296,44 +296,37 @@ Pro should therefore be an optional Graph Memory DSH plugin module, not a separa
 
 ```text
 graph-memory                          # Community: current native Host Plugin
-@adoresever/graph-memory-pro-dsh     # Pro: Host + Client Plugin, to be built
+graph-memory-pro-dsh                 # Pro Lite: local beta Host + Client Plugin
 @adoresever/graph-memory-store-neo4j # Optional large-graph adapter, to be built
 ```
 
 The first milestone should be **Pro Lite**: reuse the existing SQLite graph and add the DSH graph workbench, so users do not need Neo4j. Neo4j stays optional for larger graphs, GDS, and advanced analysis. **This is a planned architecture; the existing `desktop-2.0` Pro is still Neo4j-only and does not yet implement a switchable SQLite / Neo4j `GraphStore`.**
 
-### Target installation experience
+### Current local installation
 
-This illustrates the target experience only. The npm package `graph-memory@1.5.8` is still the OpenClaw release, and `@adoresever/graph-memory-pro-dsh` has not been published. These commands do not work today:
-
-```bash
-# PLANNED — NOT AVAILABLE YET
-dsh plugin --profile web add graph-memory
-dsh plugin --profile web add @adoresever/graph-memory-pro-dsh
-dsh web
-```
-
-The experimental Pro Lite Host can now be loaded from this repository with an overlay:
+The npm package `graph-memory@1.5.8` is still the OpenClaw release. The new Community beta and `graph-memory-pro-dsh` have not been published to npm, so install them from this checkout:
 
 ```bash
 dsh plugin --profile web add \
   --allow-build=@photostructure/sqlite \
   /absolute/path/to/graph-memory
 
-dsh --profile web \
-  --patch ~/.dsh/profiles/web/node_modules/graph-memory/cordis.pro-lite.patch.yml
+dsh plugin --profile web add \
+  /absolute/path/to/graph-memory/dsh-pro
+
+dsh web
 ```
 
-This currently provides a bounded SQLite `GraphSnapshot`, `gm_graph_snapshot`, and `gm_graph_node`. It is Host-only: there is no split-view canvas, 2D/3D renderer, Typed Remote, or drag interaction yet.
+Both plugins share `~/.dsh/graph-memory/graph-memory.db` by default. The current entry provides bounded SQLite `GraphSnapshot`, `gm_graph_snapshot`, `gm_graph_node`, a strict Typed Remote, and a read-only sidebar snapshot/search view. It does not yet provide a 2D/3D renderer, full split view, drag-to-context, or node editing.
 
 ### Four required integration layers
 
 1. **Core contracts:** bounded SQLite `GraphSnapshot` and node detail are implemented; a Neo4j provider and unified writable contract remain.
-2. **Host Plugin:** the Pro Lite Host service and two bounded tools are implemented; Typed Remote and finer permission policy remain.
-3. **Client Plugin:** register a DSH sidebar, workbench, and tool card for 2D/3D graphs, search, filters, and split-view conversations.
+2. **Host Plugin:** the Pro Lite Host service, two bounded tools, and read-only Typed Remote are implemented; write actions and finer permissions remain.
+3. **Client Plugin:** the DSH sidebar entry, card snapshot, search, and refresh are implemented; 2D/3D graphs and split-view conversations remain.
 4. **Controlled context actions:** drag-and-drop sends only a node ID and an intent; the Host validates it and writes visible, reversible Session Context.
 
-The old Pro `/graph-memory-pro/neo4j-config` route returns connection details to the browser; this is a security flaw that must be removed. In the future DSH Pro design, the Host resolves Credentials and the browser receives only a bounded `GraphSnapshot`, never a Bolt password or unrestricted Cypher access.
+The old Pro `/graph-memory-pro/neo4j-config` route returns connection details to the browser; the new implementation removes that security flaw. Pro Lite sends only a strictly validated, bounded `GraphSnapshot`, never a database path, Session ID, Bolt password, SQL, or unrestricted Cypher. Future write actions must preserve this Host boundary.
 
 ## OpenClaw compatibility
 
@@ -384,7 +377,7 @@ Release checks:
 
 - Automatic extraction depends on auxiliary-model output stability. Use `gm_record` for critical beta knowledge.
 - DSH does not yet expose `gm_update` and `gm_maintain`; those remain OpenClaw-entry tools.
-- The Pro DSH visualization client plugin is not implemented.
+- Pro Lite currently has a read-only card client; 2D/3D, split view, and controlled drag-to-context are not implemented.
 - npm registry publication is pending; install the current beta from a GitHub-built tarball.
 
 ## Privacy and security
