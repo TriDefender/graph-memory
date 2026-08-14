@@ -26,6 +26,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./dsh": "./dist/dsh.js",
+    "./pro": "./dist/pro/index.js",
+    "./pro/dsh": "./dist/pro/dsh.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -34,9 +36,11 @@
     "dsh.ts",
     "tsconfig.json",
     "tsconfig.dsh.json",
+    "pro",
     "src",
     "docs",
     "cordis.patch.yml",
+    "cordis.pro-lite.patch.yml",
     "openclaw.plugin.json",
     "README.md",
     "README_CN.md",

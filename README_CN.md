@@ -72,7 +72,7 @@ Graph Memory 的方向没有因为新宿主而推倒重来。项目正在从“O
 | OpenClaw 起点 | Context Engine、跨会话图记忆、双路径召回 | 保持兼容 |
 | Community 图引擎 | SQLite、FTS5、向量、图排序、溯源 | 可使用 |
 | DeepSeek Harness | Cordis 适配器、原生工具、自动召回、Credentials | 已完成并实测 |
-| Graph Memory Pro | 可视化图工作台、受控拖拽、Neo4j 可选适配器 | 架构已审计，DSH Host / Client Plugin 待实现 |
+| Graph Memory Pro | 可视化图工作台、受控拖拽、Neo4j 可选适配器 | Pro Lite Host / GraphSnapshot 骨架已实现；Client 待实现 |
 
 2026 年 3 月 15 日，项目负责人在清华科技园举办的 CLAW 蜕壳计划活动中分享了 Graph Memory 的架构思路。以下为项目负责人提供的现场材料与[新浪财经活动报道](https://cj.sina.com.cn/articles/view/7984421895/1dbe89c0700101nnpq)。
 
@@ -168,7 +168,7 @@ graph-memory/
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **未交付** | 需要 DSH Client Plugin |
 
-当前 beta：`1.6.0-beta.1`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.5`；DSH 仍处于 Developer Preview，后续版本可能出现破坏性变化。验收已覆盖 tarball 安装、插件 active、1024 维向量回填、跨 Session 语义召回、重启持久化和 FTS5 降级；107 项自动化测试通过。
+当前 beta：`1.6.0-beta.1`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.5`；DSH 仍处于 Developer Preview，后续版本可能出现破坏性变化。验收已覆盖 tarball 安装、插件 active、1024 维向量回填、跨 Session 语义召回、重启持久化、FTS5 降级和 Pro Lite Host 边界；110 项自动化测试通过。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -286,18 +286,23 @@ dsh plugin --profile web add @adoresever/graph-memory-pro-dsh
 dsh web
 ```
 
-开发期则从本地 tarball 安装：
+当前实验性 Pro Lite Host 可以随本仓库从本地安装，并通过 overlay 启动：
 
 ```bash
-npm run build
-npm pack
-dsh plugin --profile web add /absolute/path/to/graph-memory-pro-dsh-*.tgz
+dsh plugin --profile web add \
+  --allow-build=@photostructure/sqlite \
+  /absolute/path/to/graph-memory
+
+dsh --profile web \
+  --patch ~/.dsh/profiles/web/node_modules/graph-memory/cordis.pro-lite.patch.yml
 ```
+
+这个入口已经提供受限的 SQLite `GraphSnapshot`、`gm_graph_snapshot` 和 `gm_graph_node`，但仍然只有 Host 层；没有分屏画布、2D/3D renderer、Typed Remote 或拖拽交互。
 
 ### 必须改造的四层
 
-1. **Core contract**：抽出 `GraphStore`、`GraphSnapshot`、`RecallResult`，让 SQLite 与 Neo4j 使用同一接口。
-2. **Host Plugin**：接入 DSH Session、Tools、LLM、System Prompt 与 Credentials；所有数据库凭据只在 Host 端解析。
+1. **Core contract**：SQLite `GraphSnapshot` 与受限节点详情已经落地；Neo4j provider 和统一可写契约待实现。
+2. **Host Plugin**：Pro Lite Host 服务和两个受限工具已经落地；Typed Remote 与更细权限策略待实现。
 3. **Client Plugin**：在 DSH 注册侧栏 / Workbench / Tool Card，实现 2D 或 3D 图谱、搜索、筛选和对话分屏。
 4. **受控上下文操作**：拖拽只提交节点 ID 与动作意图；Host 校验后把内容写入可见、可撤销的 Session Context。
 
