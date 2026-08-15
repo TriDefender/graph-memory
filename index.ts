@@ -24,7 +24,7 @@ import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
-import { DEFAULT_CONFIG, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
+import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
 
@@ -279,6 +279,8 @@ const graphMemoryProPlugin = {
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
     if (raw.decay) cfg.decay = { ...DEFAULT_CONFIG.decay, ...raw.decay };
+    if (raw.cron) cfg.cron = { ...DEFAULT_CONFIG.cron, ...raw.cron };
+    const cronCfg = cfg.cron ?? DEFAULT_CRON_CONFIG;
 
     const providerModel = readDefaultModel(api.config);
 
@@ -467,6 +469,9 @@ const graphMemoryProPlugin = {
 
     api.on("before_agent_start", async (event: any, ctx: any) => {
       try {
+        // cron session 关闭图谱功能时不召回（cron 标记在 sessionKey 上，sessionId 是随机 UUID）
+        if (isCronSessionKey(typeof ctx?.sessionKey === "string" ? ctx.sessionKey : null) && !cronCfg.enabled) return;
+
         const rawPrompt = typeof event?.prompt === "string" ? event.prompt : "";
         const prompt = cleanPrompt(rawPrompt);
         if (!prompt) return;
@@ -506,6 +511,10 @@ const graphMemoryProPlugin = {
       async ingest({ sessionId, sessionKey, message, isHeartbeat }: { sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean }) {
         if (isHeartbeat) return { ingested: false };
         bindSessionIdentity(sessionId, sessionKey);
+        // cron session 关闭图谱功能：消息不入库
+        if (isCronSessionKey(sessionKey) && !cronCfg.enabled) {
+          return { ingested: false };
+        }
         await ingestMessage(sessionId, message);
         ingestedSinceTurn.set(sessionId, (ingestedSinceTurn.get(sessionId) ?? 0) + 1);
         return { ingested: true };
@@ -516,6 +525,21 @@ const graphMemoryProPlugin = {
       }) {
         bindSessionIdentity(sessionId, sessionKey);
         const budget = tokenBudget ?? 128_000;
+
+        // cron session 关闭图谱功能：仅做消息裁剪与配对修复，不注入图谱上下文
+        if (isCronSessionKey(sessionKey) && !cronCfg.enabled) {
+          const prepared = prepareAssemblyMessages(messages);
+          if (prepared.dropped > 0) {
+            api.logger.info(
+              `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
+              `dropped ${prepared.dropped} older msgs, graph skipped (cron session)`,
+            );
+          }
+          return {
+            messages: prepared.messages,
+            estimatedTokens: prepared.tokens,
+          };
+        }
 
         const activeNodes = await getBySession(driver, sessionId);
         const activeEdges: any[] = [];
@@ -585,6 +609,13 @@ const graphMemoryProPlugin = {
 
       async compact({ sessionId, sessionKey, currentTokenCount }: { sessionId: string; sessionKey?: string; sessionFile: string; tokenBudget?: number; force?: boolean; currentTokenCount?: number }) {
         bindSessionIdentity(sessionId, sessionKey);
+        // cron session 关闭图谱功能或知识提取：不触发 LLM 提取
+        if (isCronSessionKey(sessionKey) && !(cronCfg.enabled && cronCfg.extract)) {
+          return {
+            ok: true, compacted: false,
+            reason: cronCfg.enabled ? "cron session extraction disabled" : "cron session graph disabled",
+          };
+        }
         return withExtractLock(sessionId, async () => {
           const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
 
@@ -648,6 +679,12 @@ const graphMemoryProPlugin = {
           return;
         }
 
+        // cron session 关闭图谱功能：跳过入库回填与知识提取
+        if (isCronSessionKey(sessionKey) && !cronCfg.enabled) {
+          ingestedSinceTurn.delete(sessionId);
+          return;
+        }
+
         // Official OpenClaw delivers ingest() and afterTurn() as separate
         // lifecycle phases. Older downstream builds incorrectly call only
         // afterTurn(). Persist just the missing suffix so neither host loses
@@ -667,6 +704,12 @@ const graphMemoryProPlugin = {
         const turnNum = msgSeq.get(sessionId) ?? 0;
 
         api.logger.info(`[graph-memory-pro] afterTurn sid=${sessionId.slice(0, 8)} turn=${turnNum} rawMsgs=${newMessages.length}`);
+
+        // cron session 关闭知识提取：消息仅入库缓冲，可稍后用 `graph-memory extract` 手动回填
+        if (isCronSessionKey(sessionKey) && !cronCfg.extract) {
+          api.logger.info("[graph-memory-pro] cron session: extraction skipped (cron.extract=false)");
+          return;
+        }
 
         // 直接用原始消息提取知识图谱（异步，不阻塞）
         extractTurnKnowledge(sessionId, turnNum, newMessages).catch(err => {
@@ -722,6 +765,12 @@ const graphMemoryProPlugin = {
         : typeof ctx?.sessionKey === "string" ? ctx.sessionKey : undefined;
 
       try {
+        // cron session：图谱功能关闭或明确禁用时，跳过 finalize 与图维护（finally 清理仍执行）
+        if (isCronSessionKey(sessionKey) && !(cronCfg.enabled && cronCfg.finalizeAndMaintain)) {
+          api.logger.info(`[graph-memory-pro] cron session ${sid.slice(0, 12)}…: finalize + maintenance skipped (cron config)`);
+          return;
+        }
+
         const nodes = await getBySession(driver, sid);
         if (nodes.length) {
           // 获取图谱摘要

@@ -131,6 +131,30 @@ Common overrides — for fuller control see `docs/decay.md` §4:
 }
 ```
 
+### Cron sessions
+
+Sessions created by OpenClaw scheduled tasks can be configured independently of normal sessions. The host places the cron marker on the **sessionKey** (`sessionId` is a random UUID); real shapes are `cron:<jobId>`, `agent:<agentId>:cron:<jobId>`, or `agent:<agentId>:cron:<jobId>:run:<runId>`:
+
+```json
+"cron": {
+  "enabled": true,
+  "extract": true,
+  "finalizeAndMaintain": true
+}
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Enable graph functionality inside cron sessions (recall injection + message buffering). When `false`, cron sessions skip automatic recall and message persistence; the `gm_*` tools remain available for explicit calls (manual escape hatch). |
+| `extract` | `false` | Trigger knowledge extraction (LLM triples) in cron sessions via `afterTurn` / `compact`. When `false`, messages are still buffered and can be backfilled later with `openclaw graph-memory extract`. |
+| `finalizeAndMaintain` | `false` | Run finalize (EVENT→SKILL promotion) and graph maintenance (decay / PageRank / communities) when a cron session ends. Disable when frequent cron runs make end-of-session global maintenance too costly. |
+
+All three options default to **`false`**: cron sessions skip the graph entirely (no recall, no buffering, no extraction, no maintenance) unless explicitly enabled. `enabled: false` is the master switch — even with `extract` / `finalizeAndMaintain` set to `true`, nothing runs. Non-cron sessions are never affected by these options.
+
+All three sub-options are optional; omitted fields keep the default `false` (e.g. with `"cron": { "enabled": true }` only recall and message buffering are enabled — extraction and end-of-session maintenance stay off).
+
+Caveat: when a cron job sets an explicit custom `sessionKey`, the host does not append the `cron` segment — such sessions cannot be detected and are treated as normal sessions.
+
 ### OAuth login (experimental)
 
 ```bash

@@ -51,6 +51,15 @@
           "workingCompositeThreshold": { "type": "number", "default": 0.4, "description": "peripheral→working 所需的最低 composite 分数。" }
         }
       },
+      "cron": {
+        "type": "object",
+        "description": "cron 定时会话的图谱行为开关（host 将 cron 标记放在 sessionKey 上，形如 agent:<agentId>:cron:<jobId>）。默认全部启用，与普通会话一致。注意：cron 任务若显式设置自定义 sessionKey，则无法被识别为 cron 会话。",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true, "description": "是否在 cron session 内启用图谱功能（召回注入 + 消息入库）。关闭后 cron 会话不自动召回、不自动入库；gm_* 工具仍可手动调用。" },
+          "extract": { "type": "boolean", "default": true, "description": "是否在 cron session 内触发知识提取（afterTurn / compact 的 LLM 三元组提取）。关闭后消息仍入库缓冲，可用 openclaw graph-memory extract 手动回填。" },
+          "finalizeAndMaintain": { "type": "boolean", "default": true, "description": "cron session 结束时是否执行 finalize（EVENT→SKILL 晋升）和图维护（decay/PageRank/社区检测）。频繁的 cron 任务可关闭以避免每次结束都跑全局维护。" }
+        }
+      },
       "llm": {
         "type": "object",
         "properties": {

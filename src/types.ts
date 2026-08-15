@@ -182,6 +182,31 @@ export interface DecayConfig {
   workingCompositeThreshold: number;
 }
 
+// ─── cron 会话（定时任务）的图谱行为配置 ─────────────────────
+
+/**
+ * 判断是否为 cron 定时会话。host 把 cron 标记放在 sessionKey 上（sessionId 是随机 UUID），
+ * 实际形状：cron:<jobId> / agent:<agentId>:cron:<jobId> / agent:<agentId>:cron:<jobId>:run:<runId>。
+ * 按段匹配（split(":") 后包含 "cron"），避免误匹配 "cron-daily" 这类自定义段。
+ * 注意：cron 任务若显式设置了自定义 sessionKey，host 不再附加 cron 段，此类会话无法识别（见 README）。
+ * cron session 的图谱行为（召回/消息入库、知识提取、结束维护）可由 `cron` 配置独立开关；非 cron session 不受影响。
+ */
+export function isCronSessionKey(sessionKey: string | undefined | null): boolean {
+  return typeof sessionKey === "string" && sessionKey.split(":").includes("cron");
+}
+
+export interface CronConfig {
+  enabled: boolean;
+  extract: boolean;
+  finalizeAndMaintain: boolean;
+}
+
+export const DEFAULT_CRON_CONFIG: CronConfig = {
+  enabled: true,
+  extract: true,
+  finalizeAndMaintain: true,
+};
+
 // ─── 插件配置 ─────────────────────────────────────────────────
 
 export interface GmConfig {
@@ -210,6 +235,7 @@ export interface GmConfig {
   pagerankIterations: number;
   /** 遗忘曲线衰减配置；未提供时使用 DEFAULT_CONFIG.decay。 */
   decay?: DecayConfig;
+  cron?: CronConfig;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {
@@ -243,4 +269,5 @@ export const DEFAULT_CONFIG: GmConfig = {
     workingAccessThreshold: 3,
     workingCompositeThreshold: 0.4,
   },
+  cron: DEFAULT_CRON_CONFIG,
 };

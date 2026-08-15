@@ -81,6 +81,28 @@ bash setup-graph-memory-pro.sh --uninstall
 
 `embedding` 可选。设置时，`dimensions` 必须与 Neo4j 向量索引维度一致。新数据库会在插件启动时按配置创建索引；更换维度后需要重建向量索引或 Neo4j 数据库。
 
+### cron 会话行为控制
+
+OpenClaw 定时任务创建的会话可以独立配置图谱行为。host 把 cron 标记放在 **sessionKey** 上（`sessionId` 是随机 UUID），实际形状为 `cron:<jobId>`、`agent:<agentId>:cron:<jobId>` 或 `agent:<agentId>:cron:<jobId>:run:<runId>`：
+
+```json
+"cron": {
+  "enabled": true,
+  "extract": true,
+  "finalizeAndMaintain": true
+}
+```
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 是否在 cron 会话内启用图谱功能（召回注入 + 消息入库）。关闭后 cron 会话不自动召回、不自动入库；`gm_*` 工具仍可手动调用（作为显式逃生通道）。 |
+| `extract` | `true` | 是否在 cron 会话内触发知识提取（afterTurn / compact 的 LLM 三元组提取）。关闭后消息仍入库缓冲，之后可用 `openclaw graph-memory extract` 手动回填。 |
+| `finalizeAndMaintain` | `true` | cron 会话结束时是否执行 finalize（EVENT→SKILL 晋升）和图维护（decay / PageRank / 社区检测）。定时任务频繁时可关闭，避免每次会话结束都跑全局维护。 |
+
+三个选项**默认全部开启**：cron 会话默认使用图谱，需按需显式关闭。`enabled=true` 是总开关：即使 `extract`/`finalizeAndMaintain` 设为 `false` 也不生效。非 cron 会话不受这些选项影响。
+
+注意：若 cron 任务显式设置了自定义 `sessionKey`，host 不再附加 `cron` 段，此类会话无法被识别，将按普通会话处理。
+
 ### OAuth 登录（实验性）
 
 ```bash
