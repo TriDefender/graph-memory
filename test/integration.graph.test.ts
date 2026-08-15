@@ -191,15 +191,27 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
 
   it("summarizeCommunities：社区成员未变时复用摘要，不重调 LLM", async () => {
     const memberIds = [nodeIds["gmpsrc-deploy"], nodeIds["gmpsrc-compose"]];
-    const communities = new Map([["c-reuse-test", memberIds]]);
+
+    // 生产不变量：detectCommunities 会先给成员节点写入 communityId，
+    // pruneCommunitySummaries 只保留仍被 active 成员引用的社区 — 不先 SET 会被 prune 删掉
+    const prepare = getSession(driver);
+    try {
+      await prepare.run(
+        "MATCH (n:MemoryNode) WHERE n.id IN $ids SET n.communityId = $cid",
+        { ids: memberIds, cid: "c-reuse-test" },
+      );
+    } finally {
+      await prepare.close();
+    }
+
     let llmCalls = 0;
     const llm = async () => {
       llmCalls += 1;
       return "容器部署与编排技能";
     };
 
-    const first = await summarizeCommunities(driver, communities, llm);
-    const second = await summarizeCommunities(driver, communities, llm);
+    const first = await summarizeCommunities(driver, new Map([["c-reuse-test", memberIds]]), llm);
+    const second = await summarizeCommunities(driver, new Map([["c-reuse-test", memberIds]]), llm);
 
     expect(first).toBe(1);
     expect(second).toBe(0);
@@ -209,9 +221,25 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
     expect(summary?.summary).toBe("容器部署与编排技能");
     expect(summary?.memberSignature).toBe(buildCommunityMemberSignature(memberIds));
 
+    // detectCommunities 每轮按成员数重编号（c-1..c-N），ID 变但成员相同 → 按签名跨社区复用
+    const third = await summarizeCommunities(
+      driver, new Map([["c-reuse-renumbered", memberIds]]), llm,
+    );
+    expect(third).toBe(0);
+    expect(llmCalls).toBe(1);
+    const renumbered = await getCommunitySummary(driver, "c-reuse-renumbered");
+    expect(renumbered?.summary).toBe("容器部署与编排技能");
+    expect(renumbered?.memberSignature).toBe(buildCommunityMemberSignature(memberIds));
+
     const cleanup = getSession(driver);
     try {
-      await cleanup.run("MATCH (c:Community {id: 'c-reuse-test'}) DELETE c");
+      await cleanup.run(
+        "MATCH (c:Community) WHERE c.id IN ['c-reuse-test', 'c-reuse-renumbered'] DELETE c",
+      );
+      await cleanup.run(
+        "MATCH (n:MemoryNode) WHERE n.id IN $ids SET n.communityId = null",
+        { ids: memberIds },
+      );
     } finally {
       await cleanup.close();
     }
