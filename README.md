@@ -145,13 +145,13 @@ Sessions created by OpenClaw scheduled tasks can be configured independently of 
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `enabled` | `false` | Enable graph functionality inside cron sessions (recall injection + message buffering). When `false`, cron sessions skip automatic recall and message persistence; the `gm_*` tools remain available for explicit calls (manual escape hatch). |
-| `extract` | `false` | Trigger knowledge extraction (LLM triples) in cron sessions via `afterTurn` / `compact`. When `false`, messages are still buffered and can be backfilled later with `openclaw graph-memory extract`. |
-| `finalizeAndMaintain` | `false` | Run finalize (EVENT→SKILL promotion) and graph maintenance (decay / PageRank / communities) when a cron session ends. Disable when frequent cron runs make end-of-session global maintenance too costly. |
+| `enabled` | `true` | Enable graph functionality inside cron sessions (recall injection + message buffering). When `false`, cron sessions skip automatic recall and message persistence; the `gm_*` tools remain available for explicit calls (manual escape hatch). |
+| `extract` | `true` | Trigger knowledge extraction (LLM triples) in cron sessions via `afterTurn` / `compact`. When `false`, messages are still buffered and can be backfilled later with `openclaw graph-memory extract`. |
+| `finalizeAndMaintain` | `true` | Run finalize (EVENT→SKILL promotion) and graph maintenance (decay / PageRank / communities) when a cron session ends. Disable when frequent cron runs make end-of-session global maintenance too costly. |
 
-All three options default to **`false`**: cron sessions skip the graph entirely (no recall, no buffering, no extraction, no maintenance) unless explicitly enabled. `enabled: false` is the master switch — even with `extract` / `finalizeAndMaintain` set to `true`, nothing runs. Non-cron sessions are never affected by these options.
+All three options default to **`true`**: cron sessions behave like normal sessions (recall, buffering, extraction, and end-of-session maintenance all enabled) unless explicitly disabled. `enabled: false` is the master switch — even with `extract` / `finalizeAndMaintain` set to `true`, nothing runs. Non-cron sessions are never affected by these options.
 
-All three sub-options are optional; omitted fields keep the default `false` (e.g. with `"cron": { "enabled": true }` only recall and message buffering are enabled — extraction and end-of-session maintenance stay off).
+All three sub-options are optional; omitted fields keep the default `true` (e.g. with `"cron": { "extract": false }` only extraction is disabled — recall, buffering, and end-of-session maintenance stay on).
 
 Caveat: when a cron job sets an explicit custom `sessionKey`, the host does not append the `cron` segment — such sessions cannot be detected and are treated as normal sessions.
 

@@ -99,7 +99,7 @@ OpenClaw 定时任务创建的会话可以独立配置图谱行为。host 把 cr
 | `extract` | `true` | 是否在 cron 会话内触发知识提取（afterTurn / compact 的 LLM 三元组提取）。关闭后消息仍入库缓冲，之后可用 `openclaw graph-memory extract` 手动回填。 |
 | `finalizeAndMaintain` | `true` | cron 会话结束时是否执行 finalize（EVENT→SKILL 晋升）和图维护（decay / PageRank / 社区检测）。定时任务频繁时可关闭，避免每次会话结束都跑全局维护。 |
 
-三个选项**默认全部开启**：cron 会话默认使用图谱，需按需显式关闭。`enabled=true` 是总开关：即使 `extract`/`finalizeAndMaintain` 设为 `false` 也不生效。非 cron 会话不受这些选项影响。
+三个选项**默认全部开启**：cron 会话默认使用图谱，需按需显式关闭。`enabled=false` 是总开关：即使 `extract`/`finalizeAndMaintain` 设为 `true` 也不生效。非 cron 会话不受这些选项影响。三个子项均可省略，未写的字段取默认值 `true`。
 
 注意：若 cron 任务显式设置了自定义 `sessionKey`，host 不再附加 `cron` 段，此类会话无法被识别，将按普通会话处理。
 

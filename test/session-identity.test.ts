@@ -217,22 +217,22 @@ describe("cron session gating (cron 配置)", () => {
     expect(isCronSessionKey(null)).toBe(false);
   });
 
-  it("默认配置（全 false）下 cron session_end 跳过 finalize 与图维护", async () => {
+  it("默认配置（全 true）下 cron session_end 仍执行 finalize 与图维护（向后兼容）", async () => {
     const handler = registerPlugin().hooks.get("session_end");
     if (!handler) throw new Error("session_end hook was not registered");
 
     await handler({ sessionId: CRON_SID, sessionKey: CRON_KEY }, {});
 
-    expect(mocks.getBySession).not.toHaveBeenCalled();
-    expect(mocks.runMaintenance).not.toHaveBeenCalled();
+    expect(mocks.getBySession).toHaveBeenCalledWith({}, CRON_SID);
+    expect(mocks.runMaintenance).toHaveBeenCalledTimes(1);
   });
 
-  it("默认配置下 cron session 不入库（默认关闭）", async () => {
+  it("默认配置下 cron session 正常入库", async () => {
     const { engine } = registerPlugin();
 
     await expect(engine.ingest({ sessionId: CRON_SID, sessionKey: CRON_KEY, message: { role: "user", content: "hi" } }))
-      .resolves.toEqual({ ingested: false });
-    expect(mocks.saveMessage).not.toHaveBeenCalled();
+      .resolves.toEqual({ ingested: true });
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(1);
   });
 
   it("finalizeAndMaintain=false 时 cron session 跳过 finalize 与图维护", async () => {
