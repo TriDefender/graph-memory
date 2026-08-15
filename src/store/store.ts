@@ -1029,12 +1029,15 @@ export interface CommunitySummary {
   id: string;
   summary: string;
   nodeCount: number;
+  /** 成员 ID 排序后的 sha1 — 用于识别"成员构成未变"的社区（复用摘要） */
+  memberSignature: string | null;
   createdAt: number;
   updatedAt: number;
 }
 
 export async function upsertCommunitySummary(
-  driver: Driver, id: string, summary: string, nodeCount: number, embedding?: number[],
+  driver: Driver, id: string, summary: string, nodeCount: number,
+  embedding?: number[], memberSignature?: string,
 ): Promise<void> {
   const session = getSession(driver);
   try {
@@ -1044,18 +1047,21 @@ export async function upsertCommunitySummary(
         c.summary = $summary,
         c.nodeCount = $nodeCount,
         c.embedding = $embedding,
+        c.memberSignature = $memberSignature,
         c.createdAt = $now,
         c.updatedAt = $now
       ON MATCH SET
         c.summary = $summary,
         c.nodeCount = $nodeCount,
         c.embedding = CASE WHEN $embedding IS NOT NULL THEN $embedding ELSE c.embedding END,
+        c.memberSignature = CASE WHEN $memberSignature IS NOT NULL THEN $memberSignature ELSE c.memberSignature END,
         c.updatedAt = $now
     `, {
       id,
       summary,
       nodeCount,
       embedding: embedding ?? null,
+      memberSignature: memberSignature ?? null,
       now: Date.now(),
     });
   } finally {
@@ -1076,6 +1082,32 @@ export async function getCommunitySummary(driver: Driver, id: string): Promise<C
       id: c.id,
       summary: c.summary,
       nodeCount: toInt(c.nodeCount),
+      memberSignature: c.memberSignature ?? null,
+      createdAt: toInt(c.createdAt),
+      updatedAt: toInt(c.updatedAt),
+    };
+  } finally {
+    await session.close();
+  }
+}
+
+export async function getCommunitySummaryBySignature(
+  driver: Driver, memberSignature: string,
+): Promise<(CommunitySummary & { embedding?: number[] }) | null> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      "MATCH (c:Community {memberSignature: $memberSignature}) RETURN c ORDER BY c.updatedAt DESC LIMIT 1",
+      { memberSignature },
+    );
+    if (result.records.length === 0) return null;
+    const c = result.records[0].get("c").properties;
+    return {
+      id: c.id,
+      summary: c.summary,
+      nodeCount: toInt(c.nodeCount),
+      memberSignature: c.memberSignature ?? null,
+      embedding: Array.isArray(c.embedding) ? (c.embedding as number[]) : undefined,
       createdAt: toInt(c.createdAt),
       updatedAt: toInt(c.updatedAt),
     };
@@ -1096,6 +1128,7 @@ export async function getAllCommunitySummaries(driver: Driver): Promise<Communit
         id: c.id,
         summary: c.summary,
         nodeCount: toInt(c.nodeCount),
+        memberSignature: c.memberSignature ?? null,
         createdAt: toInt(c.createdAt),
         updatedAt: toInt(c.updatedAt),
       };

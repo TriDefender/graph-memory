@@ -12,12 +12,14 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
 import {
-  upsertNode, upsertEdge, saveVector, findById, deprecate,
+  upsertNode, upsertEdge, saveVector, findById, deprecate, getCommunitySummary,
 } from "../src/store/store.ts";
 import {
   personalizedPageRank, computeGlobalPageRank,
 } from "../src/graph/pagerank.ts";
-import { detectCommunities, getCommunityPeers } from "../src/graph/community.ts";
+import {
+  detectCommunities, getCommunityPeers, summarizeCommunities, buildCommunityMemberSignature,
+} from "../src/graph/community.ts";
 import { detectDuplicates, dedup } from "../src/graph/dedup.ts";
 import { runMaintenance } from "../src/graph/maintenance.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
@@ -184,6 +186,34 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
       if (compose!.communityId === deploy!.communityId) {
         expect(peers).toContain(compose!.id);
       }
+    }
+  });
+
+  it("summarizeCommunities：社区成员未变时复用摘要，不重调 LLM", async () => {
+    const memberIds = [nodeIds["gmpsrc-deploy"], nodeIds["gmpsrc-compose"]];
+    const communities = new Map([["c-reuse-test", memberIds]]);
+    let llmCalls = 0;
+    const llm = async () => {
+      llmCalls += 1;
+      return "容器部署与编排技能";
+    };
+
+    const first = await summarizeCommunities(driver, communities, llm);
+    const second = await summarizeCommunities(driver, communities, llm);
+
+    expect(first).toBe(1);
+    expect(second).toBe(0);
+    expect(llmCalls).toBe(1);
+
+    const summary = await getCommunitySummary(driver, "c-reuse-test");
+    expect(summary?.summary).toBe("容器部署与编排技能");
+    expect(summary?.memberSignature).toBe(buildCommunityMemberSignature(memberIds));
+
+    const cleanup = getSession(driver);
+    try {
+      await cleanup.run("MATCH (c:Community {id: 'c-reuse-test'}) DELETE c");
+    } finally {
+      await cleanup.close();
     }
   });
 

@@ -75,6 +75,7 @@ export async function initSchema(driver: Driver, embedding?: EmbeddingConfig): P
 
     // Community
     await session.run("CREATE CONSTRAINT community_id IF NOT EXISTS FOR (c:Community) REQUIRE c.id IS UNIQUE");
+    await session.run("CREATE INDEX community_member_signature IF NOT EXISTS FOR (c:Community) ON (c.memberSignature)");
 
     // Message (temporary extraction buffer)
     await session.run("CREATE CONSTRAINT gm_msg_id IF NOT EXISTS FOR (m:GmMessage) REQUIRE m.id IS UNIQUE");

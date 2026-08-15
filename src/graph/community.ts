@@ -6,12 +6,15 @@
  * 保留 summarizeCommunities()（需要 LLM）
  */
 
+import { createHash } from "node:crypto";
 import type { Driver } from "neo4j-driver";
 import { getSession } from "../store/db.ts";
 import {
   clearCommunities,
   updateCommunities,
   upsertCommunitySummary,
+  getCommunitySummary,
+  getCommunitySummaryBySignature,
   pruneCommunitySummaries,
 } from "../store/store.ts";
 import { getExistingActiveRelTypes, projectActiveGraph } from "./projection.ts";
@@ -142,6 +145,10 @@ const COMMUNITY_SUMMARY_SYS = `你是知识图谱社区摘要引擎。根据社�
 - 不要使用"社区"这个词
 - 不要加引号或标点以外的格式`;
 
+export function buildCommunityMemberSignature(memberIds: string[]): string {
+  return createHash("sha1").update([...memberIds].sort().join(",")).digest("hex");
+}
+
 export async function summarizeCommunities(
   driver: Driver,
   communities: Map<string, string[]>,
@@ -153,6 +160,26 @@ export async function summarizeCommunities(
 
   for (const [communityId, memberIds] of communities) {
     if (memberIds.length === 0) continue;
+
+    const memberSignature = buildCommunityMemberSignature(memberIds);
+
+    const current = await getCommunitySummary(driver, communityId);
+    if (current?.memberSignature === memberSignature && current.summary.trim()) {
+      continue;
+    }
+
+    const reusable = await getCommunitySummaryBySignature(driver, memberSignature);
+    if (reusable?.summary.trim()) {
+      await upsertCommunitySummary(
+        driver,
+        communityId,
+        reusable.summary,
+        memberIds.length,
+        reusable.embedding,
+        memberSignature,
+      );
+      continue;
+    }
 
     const session = getSession(driver);
     let members: any[];
@@ -204,7 +231,7 @@ export async function summarizeCommunities(
         } catch {}
       }
 
-      await upsertCommunitySummary(driver, communityId, cleaned, memberIds.length, embedding);
+      await upsertCommunitySummary(driver, communityId, cleaned, memberIds.length, embedding, memberSignature);
       generated++;
     } catch (err) {
       console.log(`  [WARN] community summary failed for ${communityId}: ${err}`);
