@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { isCronSessionKey } from "../src/types.ts";
 
 const mocks = vi.hoisted(() => ({
-  getBySession: vi.fn(async () => []),
-  saveMessage: vi.fn(async () => {}),
+  getBySession: vi.fn(async () => [] as unknown[]),
+  saveMessage: vi.fn(async (
+    _driver: unknown, _sid: string, _turn: number, _role: string, _content: unknown,
+  ): Promise<void> => {}),
   getMaxTurnIndex: vi.fn(async () => 0),
   getUnextracted: vi.fn(async () => []),
   isTurnExtracted: vi.fn(async () => false),
@@ -352,5 +354,81 @@ describe("cron session gating (cron 配置)", () => {
       .resolves.toEqual({ ingested: true });
 
     expect(mocks.saveMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("outage buffering (Neo4j 掉线缓冲)", () => {
+  beforeEach(() => {
+    // mockReset：清掉上一个测试可能设置的 mockRejectedValue 等持久实现，
+    // 否则持续拒绝会泄漏到后续测试，把所有消息都打进缓冲
+    mocks.saveMessage.mockReset().mockImplementation(async () => {});
+    mocks.saveMessage.mockClear();
+    mocks.getUnextracted.mockClear();
+    mocks.getMaxTurnIndex.mockClear();
+  });
+
+  it("写失败时消息被缓冲且不向 host 抛错", async () => {
+    const { engine } = registerPlugin();
+    mocks.saveMessage.mockRejectedValue(new Error("neo4j down"));
+
+    await expect(
+      engine.ingest({ sessionId: "outage-1", message: { role: "user", content: "hello" } }),
+    ).resolves.toEqual({ ingested: true });
+
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("恢复后缓冲消息经 ingestMessage 补写（seq 由 DB 状态分配，不撞号）", async () => {
+    const { engine } = registerPlugin();
+    mocks.saveMessage.mockRejectedValueOnce(new Error("neo4j down"));
+
+    // 第一条：写失败 → 缓冲（seq 1 被失败尝试消耗）
+    await engine.ingest({ sessionId: "outage-2", message: { role: "user", content: "first message" } });
+    // 第二条：写成功 → 触发 flush → 第一条补写（分配新 seq，绕开撞号）
+    await engine.ingest({ sessionId: "outage-2", message: { role: "user", content: "second message" } });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(3);
+    const flushed = mocks.saveMessage.mock.calls[2];
+    expect(flushed[1]).toBe("outage-2");
+    expect(flushed[2]).toBe(3); // seq 3 = max(已写 2) + 1，而非缓冲期的 1
+    expect((flushed[4] as { content: string }).content).toContain("first message");
+  });
+
+  it("不可序列化的消息被丢弃，不堵塞后续消息（队头防堵）", async () => {
+    const { engine } = registerPlugin();
+    // 先让写失败一次，把毒消息逼进缓冲路径（真实 saveMessage 会在 stringify 时抛错）
+    mocks.saveMessage.mockRejectedValueOnce(new Error("neo4j down"));
+
+    const poison: any = { role: "user", content: "ok" };
+    poison.self = poison; // 循环引用 → JSON.stringify 抛错
+
+    await expect(
+      engine.ingest({ sessionId: "outage-3", message: poison }),
+    ).resolves.toEqual({ ingested: true });
+    await expect(
+      engine.ingest({ sessionId: "outage-3", message: { role: "user", content: "after poison" } }),
+    ).resolves.toEqual({ ingested: true });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    // 第一次 saveMessage 因序列化失败抛错 → 消息进缓冲即被丢弃；
+    // 第二条正常直写后 flush 无积压 → 总共 2 次调用，毒消息不重试
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("compact 在读取未提取消息前先刷缓冲（恢复补提取顺序）", async () => {
+    const { engine } = registerPlugin();
+    mocks.saveMessage.mockRejectedValueOnce(new Error("neo4j down"));
+
+    await engine.ingest({ sessionId: "outage-4", message: { role: "user", content: "buffered turn" } });
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(1);
+
+    const res = await engine.compact({ sessionId: "outage-4" });
+    expect(res).toEqual({ ok: true, compacted: false, reason: "no messages" });
+
+    // flush 先于 getUnextracted：第二条 saveMessage 是缓冲补写，然后才查未提取集
+    expect(mocks.saveMessage).toHaveBeenCalledTimes(2);
+    expect((mocks.saveMessage.mock.calls[1][4] as { content: string }).content).toContain("buffered turn");
+    expect(mocks.getUnextracted).toHaveBeenCalledTimes(1);
   });
 });

@@ -345,16 +345,24 @@ const graphMemoryProPlugin = {
     const extractor = new Extractor(llm);
 
     // ── 初始化 embedding ────────────────────────────────────
+    // re-probe 状态提前声明：启动 probe 失败时记录时间戳，bootstrap 的
+    // 会话级 re-probe 据此退避（端点宕机时不逐会话重试刷日志/打 API）
+    const embeddingConfigured = !!(cfg.embedding && (cfg.embedding.apiKey || cfg.embedding.baseURL));
+    let embedProbeInFlight = false;
+    let lastEmbedProbeAt = 0;
+
     createEmbedFn(cfg.embedding)
       .then((fn) => {
         if (fn) {
           recaller.setEmbedFn(fn);
           api.logger.info("[graph-memory-pro] vector search ready");
         } else {
+          lastEmbedProbeAt = Date.now();
           api.logger.info("[graph-memory-pro] text search mode (配置 embedding 可启用语义搜索)");
         }
       })
       .catch(() => {
+        lastEmbedProbeAt = Date.now();
         api.logger.info("[graph-memory-pro] text search mode");
       });
 
@@ -386,6 +394,9 @@ const graphMemoryProPlugin = {
       }
       return withExtractLock(sessionId, async () => {
         try {
+          // 先等掉线期间缓冲的消息落库，再判断/标记 extracted——否则行落库晚于
+          // markExtracted 时会以 extracted=false 重现，被下一轮 compact 重复提取
+          if (messageBuffer.length) await flushMessageBuffer();
           if (await isTurnExtracted(driver, sessionId, turnNum)) {
             api.logger.info(`[graph-memory-pro] turn ${turnNum}: already extracted (compact), skipping`);
             return;
@@ -479,49 +490,61 @@ const graphMemoryProPlugin = {
 
     // ── 消息持久化：门控 + 内存缓冲（Neo4j 掉线时兜底） ────
 
-    interface BufferedMessage { sessionId: string; seq: number; role: string; message: any }
+    interface BufferedMessage { sessionId: string; message: any }
     const messageBuffer: BufferedMessage[] = [];
     const MESSAGE_BUFFER_CAP = 2000;
-    let bufferFlushInFlight = false;
+    let flushRun: Promise<void> | null = null;
 
     /**
-     * 缓冲一条消息：seq 在缓冲时预分配（不走 getMaxTurnIndex —— 那也是 DB 查询），
-     * 保证恢复后落库顺序与到达顺序一致。
+     * 缓冲一条消息。不在缓冲时分配 seq：内存 msgSeq 在 session_end 清理 /
+     * DB 故障时与 DB 脱节，预分配的 seq 会与已有行撞号，saveMessage 的
+     * ON MATCH SET 会静默覆盖旧行内容。seq 统一在 flush 时由 ingestMessage
+     * 分配（那时 DB 可达，getMaxTurnIndex 恢复能正确兜底）。
      */
     function bufferMessage(sessionId: string, message: any): void {
-      const seq = (msgSeq.get(sessionId) ?? 0) + 1;
-      msgSeq.set(sessionId, seq);
+      // 不可序列化的消息（循环引用 / BigInt）永远写不进 DB——当场丢弃，
+      // 否则它会永久堵在 flush 队列头并反复重跳熔断
+      try { JSON.stringify(message); } catch (err) {
+        api.logger.warn(`[graph-memory-pro] message not serializable, dropped from outage buffer: ${err}`);
+        return;
+      }
       if (messageBuffer.length >= MESSAGE_BUFFER_CAP) {
         messageBuffer.shift();
         api.logger.warn("[graph-memory-pro] message buffer full, dropping oldest buffered message");
       }
-      messageBuffer.push({ sessionId, seq, role: message?.role ?? "unknown", message });
+      messageBuffer.push({ sessionId, message });
     }
 
-    /** 恢复后把缓冲消息刷回 Neo4j（single-flight；失败保留余量稍后重试）。 */
-    async function flushMessageBuffer(): Promise<void> {
-      if (bufferFlushInFlight || !messageBuffer.length || !neo4jGate.isAvailable()) return;
-      bufferFlushInFlight = true;
-      let flushed = 0;
-      try {
-        while (messageBuffer.length) {
-          const next = messageBuffer[0];
-          try {
-            await saveMessage(driver, next.sessionId, next.seq, next.role, next.message);
-            messageBuffer.shift();
-            flushed += 1;
-          } catch (err) {
-            neo4jGate.recordFailure();
-            api.logger.warn(`[graph-memory-pro] buffered message flush failed, will retry later: ${err}`);
-            break;
+    /**
+     * 恢复后把缓冲消息刷回 Neo4j。single-flight：返回同一个 in-flight
+     * promise，让 extract / compact 路径能真正等它完成再继续。
+     */
+    function flushMessageBuffer(): Promise<void> {
+      if (flushRun) return flushRun;
+      if (!messageBuffer.length || !neo4jGate.isAvailable()) return Promise.resolve();
+      flushRun = (async () => {
+        let flushed = 0;
+        try {
+          while (messageBuffer.length) {
+            const next = messageBuffer[0];
+            try {
+              await ingestMessage(next.sessionId, next.message);
+              messageBuffer.shift();
+              flushed += 1;
+            } catch (err) {
+              neo4jGate.recordFailure();
+              api.logger.warn(`[graph-memory-pro] buffered message flush failed, will retry later: ${err}`);
+              break;
+            }
           }
+          if (flushed > 0) {
+            api.logger.info(`[graph-memory-pro] flushed ${flushed} buffered message(s) to neo4j`);
+          }
+        } finally {
+          flushRun = null;
         }
-        if (flushed > 0) {
-          api.logger.info(`[graph-memory-pro] flushed ${flushed} buffered message(s) to neo4j`);
-        }
-      } finally {
-        bufferFlushInFlight = false;
-      }
+      })();
+      return flushRun;
     }
 
     /**
@@ -607,14 +630,15 @@ const graphMemoryProPlugin = {
 
     // ── embedding 会话级 re-probe ──────────────────────────
     // 启动 probe 失败会让插件停在文本搜索模式直到重启；这里在每个会话开始时
-    // 重试一次（single-flight），临时性故障恢复后自动回到向量召回。
+    // 重试（single-flight + 5 分钟退避），临时性故障恢复后自动回到向量召回。
 
-    const embeddingConfigured = !!(cfg.embedding && (cfg.embedding.apiKey || cfg.embedding.baseURL));
-    let embedProbeInFlight = false;
+    const EMBED_REPROBE_INTERVAL_MS = 300_000;
 
     function ensureEmbeddingReady(): void {
       if (!embeddingConfigured || recaller.hasEmbedFn() || embedProbeInFlight) return;
+      if (Date.now() - lastEmbedProbeAt < EMBED_REPROBE_INTERVAL_MS) return;
       embedProbeInFlight = true;
+      lastEmbedProbeAt = Date.now();
       createEmbedFn(cfg.embedding)
         .then(fn => {
           if (fn) {
@@ -786,6 +810,8 @@ const graphMemoryProPlugin = {
           return { ok: true, compacted: false, reason: "neo4j unavailable (circuit open)" };
         }
         return withExtractLock(sessionId, async () => {
+          // compact 是掉线恢复后的补提取路径：先把缓冲消息刷进 DB 再读未提取集
+          if (messageBuffer.length) await flushMessageBuffer();
           const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
 
           if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
