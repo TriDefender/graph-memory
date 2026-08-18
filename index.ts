@@ -8,6 +8,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { getDriver, initSchema, getSession } from "./src/store/db.ts";
+import { Neo4jGate } from "./src/store/gate.ts";
 import {
   saveMessage, getUnextracted, getMaxTurnIndex,
   markExtracted, isTurnExtracted,
@@ -328,10 +329,16 @@ const graphMemoryProPlugin = {
     // ── 初始化 Neo4j ────────────────────────────────────────
     const driver = getDriver(cfg.neo4j);
 
+    // Neo4j 熔断门控：掉线时快速降级（跳图谱注入 / 缓冲消息），避免每轮吃满 driver 超时
+    const neo4jGate = new Neo4jGate();
+
     // Schema 初始化（异步，不阻塞启动）
     initSchema(driver, cfg.embedding)
       .then(() => api.logger.info("[graph-memory-pro] Neo4j schema initialized"))
-      .catch(err => api.logger.error(`[graph-memory-pro] schema init failed: ${err}`));
+      .catch(err => {
+        neo4jGate.recordFailure();
+        api.logger.error(`[graph-memory-pro] schema init failed: ${err}`);
+      });
 
     const llm = createCompleteFn(effectiveModel, cfg.llm);
     const recaller = new Recaller(driver, cfg);
@@ -372,6 +379,11 @@ const graphMemoryProPlugin = {
     }
 
     async function extractTurnKnowledge(sessionId: string, turnNum: number, rawMessages: any[]): Promise<void> {
+      // 熔断开启时跳过本轮提取：消息保持未标记，恢复后由 compact / extract 补提取
+      if (!neo4jGate.isAvailable()) {
+        api.logger.info(`[graph-memory-pro] turn ${turnNum}: extraction skipped (neo4j circuit open)`);
+        return;
+      }
       return withExtractLock(sessionId, async () => {
         try {
           if (await isTurnExtracted(driver, sessionId, turnNum)) {
@@ -465,6 +477,155 @@ const graphMemoryProPlugin = {
       await saveMessage(driver, sessionId, seq, message.role ?? "unknown", message);
     }
 
+    // ── 消息持久化：门控 + 内存缓冲（Neo4j 掉线时兜底） ────
+
+    interface BufferedMessage { sessionId: string; seq: number; role: string; message: any }
+    const messageBuffer: BufferedMessage[] = [];
+    const MESSAGE_BUFFER_CAP = 2000;
+    let bufferFlushInFlight = false;
+
+    /**
+     * 缓冲一条消息：seq 在缓冲时预分配（不走 getMaxTurnIndex —— 那也是 DB 查询），
+     * 保证恢复后落库顺序与到达顺序一致。
+     */
+    function bufferMessage(sessionId: string, message: any): void {
+      const seq = (msgSeq.get(sessionId) ?? 0) + 1;
+      msgSeq.set(sessionId, seq);
+      if (messageBuffer.length >= MESSAGE_BUFFER_CAP) {
+        messageBuffer.shift();
+        api.logger.warn("[graph-memory-pro] message buffer full, dropping oldest buffered message");
+      }
+      messageBuffer.push({ sessionId, seq, role: message?.role ?? "unknown", message });
+    }
+
+    /** 恢复后把缓冲消息刷回 Neo4j（single-flight；失败保留余量稍后重试）。 */
+    async function flushMessageBuffer(): Promise<void> {
+      if (bufferFlushInFlight || !messageBuffer.length || !neo4jGate.isAvailable()) return;
+      bufferFlushInFlight = true;
+      let flushed = 0;
+      try {
+        while (messageBuffer.length) {
+          const next = messageBuffer[0];
+          try {
+            await saveMessage(driver, next.sessionId, next.seq, next.role, next.message);
+            messageBuffer.shift();
+            flushed += 1;
+          } catch (err) {
+            neo4jGate.recordFailure();
+            api.logger.warn(`[graph-memory-pro] buffered message flush failed, will retry later: ${err}`);
+            break;
+          }
+        }
+        if (flushed > 0) {
+          api.logger.info(`[graph-memory-pro] flushed ${flushed} buffered message(s) to neo4j`);
+        }
+      } finally {
+        bufferFlushInFlight = false;
+      }
+    }
+
+    /**
+     * ingest / afterTurn 共用的落库入口：
+     * 可用 → 直接写；不可用或写失败 → 缓冲并吞掉错误（不向 host 抛），
+     * 恢复后由 flushMessageBuffer 补写。返回的 ingested=true 语义为"引擎已接管该消息"。
+     */
+    async function persistMessage(sessionId: string, message: any): Promise<void> {
+      if (!neo4jGate.isAvailable()) {
+        bufferMessage(sessionId, message);
+        return;
+      }
+      try {
+        await ingestMessage(sessionId, message);
+        neo4jGate.recordSuccess();
+        void flushMessageBuffer();
+      } catch (err) {
+        neo4jGate.recordFailure();
+        bufferMessage(sessionId, message);
+        api.logger.warn(`[graph-memory-pro] neo4j write failed, message buffered (${messageBuffer.length} pending): ${err}`);
+      }
+    }
+
+    // ── recall 超时预算：慢查询不拖回合，回退缓存/降级 ──────
+
+    const RECALL_BUDGET_MS = 5_000;
+
+    /**
+     * 给 Promise 加等待上限。不取消底层操作（Neo4j 查询会在后台自然完成、
+     * 连接归还连接池），只是放弃等待 —— 慢 != 死。
+     */
+    function withBudget<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        p.then(
+          v => { clearTimeout(timer); resolve(v); },
+          e => { clearTimeout(timer); reject(e); },
+        );
+      });
+    }
+
+    // ── 图维护：后台单飞 + trailing rerun（A1） ─────────────
+    // session_end 不再 await 维护链（衰减→去重→PR→社区→LLM 摘要可能耗时数分钟）；
+    // 全局单飞修掉多会话并发跑维护的竞态；运行期间的再次请求只标记 rerun，
+    // 当前一轮结束后最多补跑一次（覆盖"最后一个结束的会话"）。
+
+    let maintenanceRun: Promise<void> | null = null;
+    let maintenanceRerunRequested = false;
+
+    function scheduleMaintenance(): void {
+      if (!neo4jGate.isAvailable()) {
+        api.logger.info("[graph-memory-pro] maintenance skipped: neo4j unavailable (circuit open)");
+        return;
+      }
+      if (maintenanceRun) {
+        maintenanceRerunRequested = true;
+        api.logger.info("[graph-memory-pro] maintenance already running, rerun queued");
+        return;
+      }
+      maintenanceRun = (async () => {
+        try {
+          do {
+            maintenanceRerunRequested = false;
+            const embedFn = recaller.embedFn ?? undefined;
+            const result = await runMaintenance(driver, cfg, llm, embedFn);
+            neo4jGate.recordSuccess();
+            api.logger.info(
+              `[graph-memory-pro] maintenance: ${result.durationMs}ms, ` +
+              `dedup=${result.dedup.merged}, communities=${result.community.count}, ` +
+              `summaries=${result.communitySummaries}, ` +
+              `top_pr=${result.pagerank.topK.slice(0, 3).map(n => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
+            );
+          } while (maintenanceRerunRequested && neo4jGate.isAvailable());
+        } catch (err) {
+          neo4jGate.recordFailure();
+          api.logger.error(`[graph-memory-pro] maintenance failed: ${err}`);
+        } finally {
+          maintenanceRun = null;
+          maintenanceRerunRequested = false;
+        }
+      })();
+    }
+
+    // ── embedding 会话级 re-probe ──────────────────────────
+    // 启动 probe 失败会让插件停在文本搜索模式直到重启；这里在每个会话开始时
+    // 重试一次（single-flight），临时性故障恢复后自动回到向量召回。
+
+    const embeddingConfigured = !!(cfg.embedding && (cfg.embedding.apiKey || cfg.embedding.baseURL));
+    let embedProbeInFlight = false;
+
+    function ensureEmbeddingReady(): void {
+      if (!embeddingConfigured || recaller.hasEmbedFn() || embedProbeInFlight) return;
+      embedProbeInFlight = true;
+      createEmbedFn(cfg.embedding)
+        .then(fn => {
+          if (fn) {
+            recaller.setEmbedFn(fn);
+            api.logger.info("[graph-memory-pro] embedding re-probe succeeded — vector search re-enabled");
+          }
+        })
+        .catch(() => {})
+        .finally(() => { embedProbeInFlight = false; });
+    }
+
     // ── before_agent_start：召回 ────────────────────────────
 
     api.on("before_agent_start", async (event: any, ctx: any) => {
@@ -476,10 +637,12 @@ const graphMemoryProPlugin = {
         const prompt = cleanPrompt(rawPrompt);
         if (!prompt) return;
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
+        // 熔断开启时跳过召回 —— assemble 也会走降级路径（仅转录文本）
+        if (!neo4jGate.isAvailable()) return;
 
         api.logger.info(`[graph-memory-pro] recall query: "${prompt.slice(0, 80)}"`);
 
-        const res = await recaller.recall(prompt);
+        const res = await withBudget(recaller.recall(prompt), RECALL_BUDGET_MS, "[graph-memory-pro] recall");
         if (res.nodes.length) {
           const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : undefined;
           const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey : undefined;
@@ -505,6 +668,8 @@ const graphMemoryProPlugin = {
 
       async bootstrap({ sessionId, sessionKey }: { sessionId: string; sessionKey?: string }) {
         bindSessionIdentity(sessionId, sessionKey);
+        // 每个会话开始时尝试恢复 embedding（启动 probe 失败后的会话级 re-probe）
+        ensureEmbeddingReady();
         return { bootstrapped: true };
       },
 
@@ -515,7 +680,7 @@ const graphMemoryProPlugin = {
         if (isCronSessionKey(sessionKey) && !cronCfg.enabled) {
           return { ingested: false };
         }
-        await ingestMessage(sessionId, message);
+        await persistMessage(sessionId, message);
         ingestedSinceTurn.set(sessionId, (ingestedSinceTurn.get(sessionId) ?? 0) + 1);
         return { ingested: true };
       },
@@ -541,20 +706,13 @@ const graphMemoryProPlugin = {
           };
         }
 
-        const activeNodes = await getBySession(driver, sessionId);
-        const activeEdges: any[] = [];
-        for (const n of activeNodes) {
-          activeEdges.push(...await edgesFrom(driver, n.id));
-          activeEdges.push(...await edgesTo(driver, n.id));
-        }
-
         // prompt-aware recall：优先用当前 prompt 做新鲜召回，回退到 before_agent_start 缓存
         let rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
-        if (prompt) {
+        if (prompt && neo4jGate.isAvailable()) {
           const cleaned = cleanPrompt(prompt);
           if (cleaned) {
             try {
-              const freshRec = await recaller.recall(cleaned);
+              const freshRec = await withBudget(recaller.recall(cleaned), RECALL_BUDGET_MS, "[graph-memory-pro] assemble recall");
               if (freshRec.nodes.length) {
                 rec = freshRec;
                 recalled.set(sessionId, freshRec);
@@ -564,45 +722,52 @@ const graphMemoryProPlugin = {
             }
           }
         }
-        const totalGmNodes = activeNodes.length + rec.nodes.length;
         const prepared = prepareAssemblyMessages(messages);
 
-        if (totalGmNodes === 0) {
-          if (prepared.dropped > 0) {
-            api.logger.info(
-              `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
-              `dropped ${prepared.dropped} older msgs, graph ~0 tok`,
-            );
-          }
-          return {
-            messages: prepared.messages,
-            estimatedTokens: prepared.tokens,
-          };
-        }
+        // 图谱段：门控 + 降级 —— Neo4j 掉线/超时时只返回裁剪后的转录，
+        // 不让错误抛回 host（原实现无 catch，getBySession 失败会炸掉 assemble）
+        let graphTokens = 0;
+        let systemPromptAddition: string | undefined;
+        if (neo4jGate.isAvailable()) {
+          try {
+            const activeNodes = await getBySession(driver, sessionId);
+            const activeEdges: any[] = [];
+            for (const n of activeNodes) {
+              activeEdges.push(...await edgesFrom(driver, n.id));
+              activeEdges.push(...await edgesTo(driver, n.id));
+            }
 
-        const { xml, systemPrompt, tokens: gmTokens } = await assembleContext(driver, {
-          tokenBudget: budget,
-          activeNodes,
-          activeEdges,
-          recalledNodes: rec.nodes,
-          recalledEdges: rec.edges,
-        });
+            if (activeNodes.length + rec.nodes.length > 0) {
+              const { xml, systemPrompt, tokens } = await assembleContext(driver, {
+                tokenBudget: budget,
+                activeNodes,
+                activeEdges,
+                recalledNodes: rec.nodes,
+                recalledEdges: rec.edges,
+              });
+              graphTokens = tokens;
+              if (xml) {
+                systemPromptAddition = systemPrompt ? `${systemPrompt}\n\n${xml}` : xml;
+              }
+            }
+            neo4jGate.recordSuccess();
+            void flushMessageBuffer();
+          } catch (err) {
+            neo4jGate.recordFailure();
+            api.logger.warn(`[graph-memory-pro] assemble: graph context unavailable, transcript-only: ${err}`);
+          }
+        }
 
         if (prepared.dropped > 0) {
           api.logger.info(
             `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
-            `dropped ${prepared.dropped} older msgs, graph ~${gmTokens} tok`,
+            `dropped ${prepared.dropped} older msgs, graph ~${graphTokens} tok`,
           );
-        }
-
-        let systemPromptAddition: string | undefined;
-        if (xml) {
-          systemPromptAddition = systemPrompt ? `${systemPrompt}\n\n${xml}` : xml;
         }
 
         return {
           messages: prepared.messages,
-          estimatedTokens: gmTokens + prepared.tokens,
+          estimatedTokens: graphTokens + prepared.tokens,
           ...(systemPromptAddition ? { systemPromptAddition } : {}),
         };
       },
@@ -615,6 +780,10 @@ const graphMemoryProPlugin = {
             ok: true, compacted: false,
             reason: cronCfg.enabled ? "cron session extraction disabled" : "cron session graph disabled",
           };
+        }
+        // 熔断开启时跳过提取：未提取消息保留，恢复后下一次 compact / extract 补上
+        if (!neo4jGate.isAvailable()) {
+          return { ok: true, compacted: false, reason: "neo4j unavailable (circuit open)" };
         }
         return withExtractLock(sessionId, async () => {
           const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
@@ -692,7 +861,7 @@ const graphMemoryProPlugin = {
         const ingestedCount = ingestedSinceTurn.get(sessionId) ?? 0;
         const missingMessages = missingIngestMessages(newMessages, ingestedCount);
         for (const message of missingMessages) {
-          await ingestMessage(sessionId, message);
+          await persistMessage(sessionId, message);
         }
         if (missingMessages.length > 0) {
           api.logger.warn(
@@ -771,7 +940,22 @@ const graphMemoryProPlugin = {
           return;
         }
 
-        const nodes = await getBySession(driver, sid);
+        // 熔断开启时跳过 finalize（全是 Neo4j 写）—— 消息已缓冲，恢复后补齐
+        if (!neo4jGate.isAvailable()) {
+          api.logger.warn(`[graph-memory-pro] session_end ${sid.slice(0, 12)}…: neo4j unavailable (circuit open), finalize + maintenance skipped`);
+          return;
+        }
+
+        let nodes: Awaited<ReturnType<typeof getBySession>>;
+        try {
+          nodes = await getBySession(driver, sid);
+          neo4jGate.recordSuccess();
+          void flushMessageBuffer();
+        } catch (err) {
+          neo4jGate.recordFailure();
+          api.logger.error(`[graph-memory-pro] session_end error: ${err}`);
+          return;
+        }
         if (nodes.length) {
           // 获取图谱摘要
           const session = getSession(driver);
@@ -812,15 +996,9 @@ const graphMemoryProPlugin = {
           for (const id of fin.invalidations) await deprecate(driver, id);
         }
 
-        // 图维护
-        const embedFn = (recaller as any).embed ?? undefined;
-        const result = await runMaintenance(driver, cfg, llm, embedFn);
-        api.logger.info(
-          `[graph-memory-pro] maintenance: ${result.durationMs}ms, ` +
-          `dedup=${result.dedup.merged}, communities=${result.community.count}, ` +
-          `summaries=${result.communitySummaries}, ` +
-          `top_pr=${result.pagerank.topK.slice(0, 3).map(n => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
-        );
+        // 图维护：后台单飞（A1）—— 衰减→去重→PR→社区→LLM 摘要可能耗时数分钟，
+        // 不再阻塞 session_end；结果只进日志，host 对其零依赖
+        scheduleMaintenance();
       } catch (err) {
         api.logger.error(`[graph-memory-pro] session_end error: ${err}`);
       } finally {
@@ -1244,7 +1422,7 @@ const graphMemoryProPlugin = {
         description: "手动触发图维护：衰减评分 + tier 转换、去重、PageRank、社区检测。",
         parameters: Type.Object({}),
         async execute() {
-          const embedFn = (recaller as any).embed ?? undefined;
+          const embedFn = recaller.embedFn ?? undefined;
           const result = await runMaintenance(driver, cfg, llm, embedFn);
           const t = result.decay.tierTransitions;
           const totalTransitions = t.coreToWorking + t.workingToPeripheral + t.peripheralToWorking + t.workingToCore;

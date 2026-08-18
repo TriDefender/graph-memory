@@ -88,6 +88,12 @@ export class Recaller {
 
   setEmbedFn(fn: EmbedFn): void { this.embed = fn; }
 
+  /** 是否已接入 embedding（启动 probe 成功或会话级 re-probe 成功）。 */
+  hasEmbedFn(): boolean { return this.embed !== null; }
+
+  /** 只读暴露 embedFn（maintenance / gm_maintain 需要），替代 (recaller as any).embed。 */
+  get embedFn(): EmbedFn | null { return this.embed; }
+
   async recall(query: string, options?: RecallOptions): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
     const timeRange = options ? parseTimeRange(options) : null;

@@ -58,6 +58,8 @@ vi.mock("../src/engine/embed.ts", () => ({
 vi.mock("../src/recaller/recall.ts", () => ({
   Recaller: class {
     setEmbedFn(): void {}
+    hasEmbedFn(): boolean { return false; }
+    get embedFn() { return null; }
     async recall() { return mocks.recall(); }
     async syncEmbed(): Promise<void> {}
   },

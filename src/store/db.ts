@@ -21,8 +21,9 @@ export function getDriver(cfg: Neo4jConfig): Driver {
   if (_driver) return _driver;
   _driver = neo4j.driver(cfg.uri, neo4j.auth.basic(cfg.user, cfg.password), {
     maxConnectionPoolSize: 50,
-    connectionAcquisitionTimeout: 60000,
-    maxTransactionRetryTime: 30000,
+    // 快速失败配合 gate.ts 熔断：掉线时 ~10s 内报错跳闸，而不是每次卡 30-60s
+    connectionAcquisitionTimeout: 15_000,
+    maxTransactionRetryTime: 10_000,
   });
   return _driver;
 }
@@ -40,8 +41,9 @@ export function getSession(driver: Driver): Session {
       console.log("[graph-memory-pro] reconnecting Neo4j driver...");
       _driver = neo4j.driver(_cfg.uri, neo4j.auth.basic(_cfg.user, _cfg.password), {
         maxConnectionPoolSize: 50,
-        connectionAcquisitionTimeout: 60000,
-        maxTransactionRetryTime: 30000,
+        // 与 getDriver 保持一致：快速失败，让熔断门控尽早接手
+        connectionAcquisitionTimeout: 15_000,
+        maxTransactionRetryTime: 10_000,
       });
       return _driver.session({ database: "neo4j" });
     }
