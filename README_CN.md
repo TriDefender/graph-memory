@@ -187,7 +187,7 @@ graph-memory/
 ```bash
 git clone https://github.com/adoresever/graph-memory.git
 cd graph-memory
-npm ci
+npm install
 npm test
 npm run build
 npm pack
@@ -335,7 +335,7 @@ openclaw gateway restart
 ## 开发与验证
 
 ```bash
-npm ci
+npm install
 npm test
 npm run build
 npm pack

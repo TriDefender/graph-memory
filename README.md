@@ -202,7 +202,7 @@ Prerequisites: Node.js `22.19+` or `24+`. The current beta is not yet published 
 ```bash
 git clone https://github.com/adoresever/graph-memory.git
 cd graph-memory
-npm ci
+npm install
 npm test
 npm run build
 npm pack
@@ -362,7 +362,7 @@ The Community memory core is host-neutral. DSH development does not require Open
 ## Development
 
 ```bash
-npm ci
+npm install
 npm test
 npm run build
 npm pack

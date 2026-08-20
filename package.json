@@ -32,6 +32,8 @@
     "dist",
     "index.ts",
     "dsh.ts",
+    "tsconfig.json",
+    "tsconfig.dsh.json",
     "src",
     "docs",
     "cordis.patch.yml",
@@ -42,6 +44,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "build:dsh": "tsc -p tsconfig.dsh.json",
     "prepare": "npm run build",
     "prepack": "npm run build",
     "test": "vitest run",
