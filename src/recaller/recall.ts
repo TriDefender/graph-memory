@@ -42,10 +42,19 @@ export class Recaller {
 
   async recall(query: string): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
+    let queryVector: number[] | undefined;
+    if (this.embed) {
+      try {
+        queryVector = await this.embed(query, "query");
+      } catch {
+        // The lexical path remains available when the embedding provider is
+        // temporarily unavailable.
+      }
+    }
 
     // ── 两条路径各自独立跑满，不分配额 ──────────────────
-    const precise = await this.recallPrecise(query, limit);
-    const generalized = await this.recallGeneralized(query, limit);
+    const precise = await this.recallPrecise(query, limit, queryVector);
+    const generalized = await this.recallGeneralized(limit, queryVector);
 
     // ── 合并去重（全部保留，只去重复节点） ────────────────
     const merged = this.mergeResults(precise, generalized);
@@ -56,27 +65,27 @@ export class Recaller {
   /**
    * 精确召回：向量/FTS5 找种子 → 社区扩展 → 图遍历 → PPR 排序
    */
-  private async recallPrecise(query: string, limit: number): Promise<RecallResult> {
-    let seeds: GmNode[] = [];
-
-    if (this.embed) {
-      try {
-        const vec = await this.embed(query, "query");
-        const scored = vectorSearchWithScore(this.db, vec, Math.ceil(limit / 2));
-        seeds = scored.map(s => s.node);
-
-        // 向量结果不足时补 FTS5
-        if (seeds.length < 2) {
-          const fts = searchNodes(this.db, query, limit);
-          const seen = new Set(seeds.map(n => n.id));
-          seeds.push(...fts.filter(n => !seen.has(n.id)));
-        }
-      } catch {
-        seeds = searchNodes(this.db, query, limit);
-      }
-    } else {
-      seeds = searchNodes(this.db, query, limit);
-    }
+  private async recallPrecise(query: string, limit: number, queryVector?: number[]): Promise<RecallResult> {
+    // Always combine semantic and lexical retrieval. A vector-only branch
+    // misses exact identifiers; an FTS-only fallback misses paraphrases.
+    const lexical = searchNodes(this.db, query, limit);
+    const semantic = queryVector
+      ? vectorSearchWithScore(this.db, queryVector, limit)
+      : [];
+    const relevance = new Map<string, number>();
+    const byId = new Map<string, GmNode>();
+    semantic.forEach(({ node, score }) => {
+      byId.set(node.id, node);
+      relevance.set(node.id, Math.max(relevance.get(node.id) ?? 0, score));
+    });
+    lexical.forEach((node, index) => {
+      byId.set(node.id, node);
+      // Reciprocal rank is bounded but gives exact terms a meaningful boost.
+      relevance.set(node.id, (relevance.get(node.id) ?? 0) + 0.35 / (index + 1));
+    });
+    const seeds = Array.from(byId.values())
+      .sort((a, b) => (relevance.get(b.id) ?? 0) - (relevance.get(a.id) ?? 0))
+      .slice(0, limit);
 
     if (!seeds.length) return { nodes: [], edges: [], tokenEstimate: 0 };
 
@@ -101,7 +110,7 @@ export class Recaller {
     // 个性化 PageRank 排序
     const candidateIds = nodes.map(n => n.id);
     const { scores: pprScores } = personalizedPageRank(
-      this.db, seedIds, candidateIds, this.cfg,
+      this.db, seedIds, candidateIds, this.cfg, relevance,
     );
 
     const filtered = nodes
@@ -126,14 +135,13 @@ export class Recaller {
    * 有社区向量时：query vs 社区 embedding 匹配，按相似度排序社区
    * 无社区向量时：fallback 到 communityRepresentatives（按时间取代表节点）
    */
-  private async recallGeneralized(query: string, limit: number): Promise<RecallResult> {
+  private async recallGeneralized(limit: number, queryVector?: number[]): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
     // 优先用社区向量搜索
-    if (this.embed) {
+    if (queryVector) {
       try {
-        const vec = await this.embed(query, "query");
-        const scoredCommunities = communityVectorSearch(this.db, vec);
+        const scoredCommunities = communityVectorSearch(this.db, queryVector);
 
         if (scoredCommunities.length > 0) {
           const communityIds = scoredCommunities.map(c => c.id);
@@ -219,7 +227,7 @@ export class Recaller {
   /** 异步同步 embedding，不阻塞主流程 */
   async syncEmbed(node: GmNode): Promise<void> {
     if (!this.embed) return;
-    const text = `${node.name}: ${node.description}\n${node.content.slice(0, 500)}`;
+    const text = `${node.name}: ${node.description}\n${node.content}`;
     const hashInput = this.embeddingFingerprint ? `${this.embeddingFingerprint}\0${text}` : text;
     const hash = createHash("md5").update(hashInput).digest("hex");
     if (getVectorHash(this.db, node.id) === hash) return;

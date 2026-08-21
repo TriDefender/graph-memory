@@ -7,7 +7,12 @@
         recallEnabled: true
         recallMaxNodes: 6
         recallMaxDepth: 2
+        recallTokenBudget: 4096
         maintenanceInterval: 6
+        # Graph Memory retains the newest real user turns and asks the agent's
+        # public DSH compaction provider to summarize/replace the older prefix.
+        contextCompactionEnabled: true
+        freshTurnCount: 5
         # Secrets stay outside the bundle and repository. Set these variables
         # in the environment that starts DSH to enable semantic vector recall.
         embedding:

@@ -76,6 +76,8 @@ export interface ExtractionResult {
     name: string;
     description: string;
     content: string;
+    /** Source message turn/event indices cited by the extractor. */
+    sourceTurns?: number[];
   }>;
   edges: Array<{
     from: string;

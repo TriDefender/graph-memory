@@ -7,7 +7,7 @@
 
 import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite";
 import type { GmNode, GmEdge } from "../types.ts";
-import { getCommunitySummary, getEpisodicMessages } from "../store/store.ts";
+import { getCommunitySummary, getEpisodicMessages, getNodeSourceMessages } from "../store/store.ts";
 
 const CHARS_PER_TOKEN = 3;
 
@@ -17,8 +17,9 @@ const CHARS_PER_TOKEN = 3;
 export function buildSystemPromptAddition(params: {
   selectedNodes: Array<{ type: string; src: "active" | "recalled" }>;
   edgeCount: number;
+  freshTurnCount?: number;
 }): string {
-  const { selectedNodes, edgeCount } = params;
+  const { selectedNodes, edgeCount, freshTurnCount } = params;
   if (selectedNodes.length === 0) return "";
 
   const recalledCount = selectedNodes.filter(n => n.src === "recalled").length;
@@ -55,7 +56,9 @@ export function buildSystemPromptAddition(params: {
     "",
     "- **`<episodic_context>`** — Trimmed conversation traces from sessions that produced the knowledge nodes, ordered by time.",
     "- **`<knowledge_graph>`** — Relevant triples (TASK/SKILL/EVENT) and edges, grouped by community.",
-    "- **Recent 5 turns** — Last turn in full, previous 4 turns as user+assistant text only.",
+    ...(freshTurnCount === undefined
+      ? []
+      : [`- **Recent ${freshTurnCount} turns** — retained verbatim by the active host context policy.`]),
     "",
     "Read this context first. Use `gm_search` only if insufficient. Use `gm_record` to save new knowledge.",
   );
@@ -85,9 +88,11 @@ export function assembleContext(
     activeEdges: GmEdge[];
     recalledNodes: GmNode[];
     recalledEdges: GmEdge[];
+    freshTurnCount?: number;
   },
 ): { xml: string | null; systemPrompt: string; tokens: number; episodicXml: string; episodicTokens: number } {
-  // recall 返回多少节点就放多少，不截断
+  // Candidate collection is independent from injection. The token budget below
+  // decides which relevant nodes enter this request.
   const map = new Map<string, GmNode & { src: "active" | "recalled" }>();
   for (const n of params.recalledNodes) map.set(n.id, { ...n, src: "recalled" });
   for (const n of params.activeNodes) map.set(n.id, { ...n, src: "active" });
@@ -103,90 +108,57 @@ export function assembleContext(
       b.pagerank - a.pagerank
     );
 
-  // recall 返回的已经是 PPR 排序过的，全量放入
-  const selected = sorted;
-
-  if (!selected.length) return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
-
-  const idToName = new Map<string, string>();
-  for (const n of selected) idToName.set(n.id, n.name);
-
-  const selectedIds = new Set(selected.map(n => n.id));
   const allEdges = [...params.activeEdges, ...params.recalledEdges];
-  const seen = new Set<string>();
-  const edges = allEdges.filter(e =>
-    selectedIds.has(e.fromId) && selectedIds.has(e.toId) && !seen.has(e.id) && seen.add(e.id)
-  );
-
-  // 按社区分组节点
-  const byCommunity = new Map<string, typeof selected>();
-  const noCommunity: typeof selected = [];
-  for (const n of selected) {
-    if (n.communityId) {
-      if (!byCommunity.has(n.communityId)) byCommunity.set(n.communityId, []);
-      byCommunity.get(n.communityId)!.push(n);
-    } else {
-      noCommunity.push(n);
-    }
+  const budget = params.tokenBudget > 0 ? params.tokenBudget : Number.POSITIVE_INFINITY;
+  let selected = sorted;
+  let rendered: ReturnType<typeof renderKnowledgeGraph> | undefined;
+  let systemPrompt = "";
+  let baseTokens = 0;
+  while (selected.length) {
+    rendered = renderKnowledgeGraph(db, selected, allEdges);
+    systemPrompt = buildSystemPromptAddition({
+      selectedNodes: selected.map(n => ({ type: n.type, src: n.src })),
+      edgeCount: rendered.edges.length,
+      freshTurnCount: params.freshTurnCount,
+    });
+    baseTokens = Math.ceil((systemPrompt.length + rendered.xml.length) / CHARS_PER_TOKEN);
+    if (baseTokens <= budget) break;
+    selected = selected.slice(0, -1);
   }
 
-  // 生成节点 XML（按社区分组）
-  const xmlParts: string[] = [];
-
-  for (const [cid, members] of byCommunity) {
-    const summary = getCommunitySummary(db, cid);
-    const label = summary ? escapeXml(summary.summary) : cid;
-    xmlParts.push(`  <community id="${cid}" desc="${label}">`);
-    for (const n of members) {
-      const tag = n.type.toLowerCase();
-      const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
-      const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-      xmlParts.push(`    <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n    </${tag}>`);
-    }
-    xmlParts.push(`  </community>`);
+  if (!selected.length || !rendered) {
+    return { xml: null, systemPrompt: "", tokens: 0, episodicXml: "", episodicTokens: 0 };
   }
-
-  // 无社区的节点直接放顶层
-  for (const n of noCommunity) {
-    const tag = n.type.toLowerCase();
-    const srcAttr = n.src === "recalled" ? ` source="recalled"` : "";
-    const timeAttr = ` updated="${new Date(n.updatedAt).toISOString().slice(0, 10)}"`;
-    xmlParts.push(`  <${tag} name="${n.name}" desc="${escapeXml(n.description)}"${srcAttr}${timeAttr}>\n${n.content.trim()}\n  </${tag}>`);
-  }
-
-  const nodesXml = xmlParts.join("\n");
-
-  const edgesXml = edges.length
-    ? `\n  <edges>\n${edges.map(e => {
-        const fromName = idToName.get(e.fromId) ?? e.fromId;
-        const toName = idToName.get(e.toId) ?? e.toId;
-        const cond = e.condition ? ` when="${escapeXml(e.condition)}"` : "";
-        return `    <e type="${e.type}" from="${fromName}" to="${toName}"${cond}>${escapeXml(e.instruction)}</e>`;
-      }).join("\n")}\n  </edges>`
-    : "";
-
-  const xml = `<knowledge_graph>\n${nodesXml}${edgesXml}\n</knowledge_graph>`;
-
-  const systemPrompt = buildSystemPromptAddition({
-    selectedNodes: selected.map(n => ({ type: n.type, src: n.src })),
-    edgeCount: edges.length,
-  });
+  const { xml } = rendered;
 
   // ── 溯源选拉：PPR top 3 节点 → 拉原始 user/assistant 对话 ──
   const topNodes = selected.slice(0, 3);
   const episodicParts: string[] = [];
+  let episodicCharsRemaining = Number.isFinite(budget)
+    ? Math.max(0, Math.floor((budget - baseTokens) * CHARS_PER_TOKEN))
+    : Number.POSITIVE_INFINITY;
 
   for (const node of topNodes) {
+    if (episodicCharsRemaining <= 0) break;
     if (!node.sourceSessions?.length) continue;
     // 取最近的 2 个 session
     const recentSessions = node.sourceSessions.slice(-2);
-    const msgs = getEpisodicMessages(db, recentSessions, node.updatedAt, 500);
+    const traceBudget = Number.isFinite(episodicCharsRemaining)
+      ? episodicCharsRemaining
+      : 1500;
+    const exact = getNodeSourceMessages(db, node.id, traceBudget);
+    const msgs = exact.length
+      ? exact
+      : getEpisodicMessages(db, recentSessions, node.updatedAt, traceBudget);
     if (!msgs.length) continue;
 
     const lines = msgs.map(m =>
-      `    [${m.role.toUpperCase()}] ${escapeXml(m.text.slice(0, 200))}`
+      `    [${m.role.toUpperCase()}] ${escapeXml(m.text)}`
     ).join("\n");
-    episodicParts.push(`  <trace node="${node.name}">\n${lines}\n  </trace>`);
+    const trace = `  <trace node="${node.name}">\n${lines}\n  </trace>`;
+    if (trace.length > episodicCharsRemaining) break;
+    episodicParts.push(trace);
+    episodicCharsRemaining -= trace.length;
   }
 
   const episodicXml = episodicParts.length
@@ -201,6 +173,62 @@ export function assembleContext(
     episodicXml,
     episodicTokens: Math.ceil(episodicXml.length / CHARS_PER_TOKEN),
   };
+}
+
+function renderKnowledgeGraph(
+  db: DatabaseSyncInstance,
+  selected: Array<GmNode & { src: "active" | "recalled" }>,
+  candidateEdges: GmEdge[],
+): { xml: string; edges: GmEdge[] } {
+  const idToName = new Map<string, string>();
+  for (const node of selected) idToName.set(node.id, node.name);
+  const selectedIds = new Set(selected.map(node => node.id));
+  const seen = new Set<string>();
+  const edges = candidateEdges.filter(edge =>
+    selectedIds.has(edge.fromId) && selectedIds.has(edge.toId) &&
+    !seen.has(edge.id) && seen.add(edge.id)
+  );
+
+  const byCommunity = new Map<string, typeof selected>();
+  const noCommunity: typeof selected = [];
+  for (const node of selected) {
+    if (node.communityId) {
+      if (!byCommunity.has(node.communityId)) byCommunity.set(node.communityId, []);
+      byCommunity.get(node.communityId)!.push(node);
+    } else {
+      noCommunity.push(node);
+    }
+  }
+
+  const xmlParts: string[] = [];
+  for (const [communityId, members] of byCommunity) {
+    const summary = getCommunitySummary(db, communityId);
+    const label = summary ? escapeXml(summary.summary) : communityId;
+    xmlParts.push(`  <community id="${communityId}" desc="${label}">`);
+    for (const node of members) xmlParts.push(renderNode(node, "    "));
+    xmlParts.push("  </community>");
+  }
+  for (const node of noCommunity) xmlParts.push(renderNode(node, "  "));
+
+  const edgesXml = edges.length
+    ? `\n  <edges>\n${edges.map(edge => {
+        const fromName = idToName.get(edge.fromId) ?? edge.fromId;
+        const toName = idToName.get(edge.toId) ?? edge.toId;
+        const condition = edge.condition ? ` when="${escapeXml(edge.condition)}"` : "";
+        return `    <e type="${edge.type}" from="${fromName}" to="${toName}"${condition}>${escapeXml(edge.instruction)}</e>`;
+      }).join("\n")}\n  </edges>`
+    : "";
+  return {
+    xml: `<knowledge_graph>\n${xmlParts.join("\n")}${edgesXml}\n</knowledge_graph>`,
+    edges,
+  };
+}
+
+function renderNode(node: GmNode & { src: "active" | "recalled" }, indent: string): string {
+  const tag = node.type.toLowerCase();
+  const source = node.src === "recalled" ? ` source="recalled"` : "";
+  const updated = ` updated="${new Date(node.updatedAt).toISOString().slice(0, 10)}"`;
+  return `${indent}<${tag} name="${node.name}" desc="${escapeXml(node.description)}"${source}${updated}>\n${node.content.trim()}\n${indent}</${tag}>`;
 }
 
 function escapeXml(s: string): string {

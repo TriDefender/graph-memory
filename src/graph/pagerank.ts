@@ -101,6 +101,7 @@ export function personalizedPageRank(
   seedIds: string[],
   candidateIds: string[],
   cfg: GmConfig,
+  seedWeights?: ReadonlyMap<string, number>,
 ): PPRResult {
   const graph = loadGraph(db);
   const { nodeIds, adj, N } = graph;
@@ -115,14 +116,22 @@ export function personalizedPageRank(
   const validSeeds = seedIds.filter(id => nodeIds.has(id));
   if (validSeeds.length === 0) return { scores: new Map() };
 
-  // teleport 向量：只指向种子节点，均匀分配
-  const teleportWeight = 1 / validSeeds.length;
-  const seedSet = new Set(validSeeds);
+  // teleport 向量：优先保留查询相关性；旧调用方未提供权重时
+  // 仍保持均匀分配。Without this, vector similarity is discarded as soon
+  // as graph propagation starts and weak seeds can outrank the best match.
+  const rawWeights = validSeeds.map(id => Math.max(0, seedWeights?.get(id) ?? 1));
+  const totalWeight = rawWeights.reduce((sum, value) => sum + value, 0) || validSeeds.length;
+  const teleport = new Map(validSeeds.map((id, index) => [
+    id,
+    totalWeight === validSeeds.length && rawWeights.every(value => value === 0)
+      ? 1 / validSeeds.length
+      : rawWeights[index]! / totalWeight,
+  ]));
 
   // 初始分数：集中在种子节点上
   let rank = new Map<string, number>();
   for (const id of nodeIds) {
-    rank.set(id, seedSet.has(id) ? teleportWeight : 0);
+    rank.set(id, teleport.get(id) ?? 0);
   }
 
   // 迭代
@@ -131,7 +140,7 @@ export function personalizedPageRank(
 
     // teleport 分量：回到种子节点
     for (const id of nodeIds) {
-      newRank.set(id, seedSet.has(id) ? (1 - damping) * teleportWeight : 0);
+      newRank.set(id, (1 - damping) * (teleport.get(id) ?? 0));
     }
 
     // 传播分量：从邻居获得权重
@@ -153,8 +162,8 @@ export function personalizedPageRank(
       }
     }
     if (danglingSum > 0) {
-      const danglingContrib = damping * danglingSum * teleportWeight;
       for (const sid of validSeeds) {
+        const danglingContrib = damping * danglingSum * (teleport.get(sid) ?? 0);
         newRank.set(sid, (newRank.get(sid) || 0) + danglingContrib);
       }
     }

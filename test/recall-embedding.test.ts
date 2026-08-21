@@ -4,7 +4,7 @@ import type { DatabaseSyncInstance } from "@photostructure/sqlite";
 import { Recaller } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 import { createTestDb } from "./helpers.ts";
-import { getVectorHash, updateNode, upsertNode } from "../src/store/store.ts";
+import { getVectorHash, saveVector, updateNode, upsertNode } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
 
@@ -37,5 +37,34 @@ describe("Recaller.syncEmbed", () => {
     expect(calls[0]).toContain("old description");
     expect(calls[1]).toContain("new description");
     expect(getVectorHash(db, node.id)).not.toBe(firstHash);
+  });
+
+  it("keeps semantic relevance through graph ranking and embeds a query once", async () => {
+    const strong = upsertNode(db, {
+      type: "EVENT",
+      name: "semantic-match",
+      description: "relevant paraphrase",
+      content: "the correct memory",
+    }, "old-session").node;
+    const weak = upsertNode(db, {
+      type: "EVENT",
+      name: "popular-distractor",
+      description: "unrelated",
+      content: "different topic",
+    }, "old-session").node;
+    db.prepare("UPDATE gm_nodes SET validated_count=100 WHERE id=?").run(weak.id);
+    saveVector(db, strong.id, "strong", [1, 0]);
+    saveVector(db, weak.id, "weak", [0.5, Math.sqrt(0.75)]);
+
+    let queryCalls = 0;
+    const recaller = new Recaller(db, { ...DEFAULT_CONFIG, recallMaxNodes: 2 });
+    recaller.setEmbedFn(async (_text, purpose) => {
+      if (purpose === "query") queryCalls += 1;
+      return [1, 0];
+    });
+    const result = await recaller.recall("words absent from both stored nodes");
+
+    expect(queryCalls).toBe(1);
+    expect(result.nodes[0]?.id).toBe(strong.id);
   });
 });

@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { Extractor } from "../src/extractor/extract.ts";
+import { Extractor, normalizeExtractionContent } from "../src/extractor/extract.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 import type { ExtractionResult, FinalizeResult } from "../src/types.ts";
 
@@ -24,6 +24,41 @@ function mockLlm(response: string) {
 function createExtractor(response: string): Extractor {
   return new Extractor(DEFAULT_CONFIG, mockLlm(response));
 }
+
+describe("extraction input preservation", () => {
+  it("normalizes DSH blocks and keeps meaningful content beyond 800 characters", async () => {
+    const marker = "TAIL-MUST-SURVIVE";
+    let captured = "";
+    const ext = new Extractor(DEFAULT_CONFIG, async (_system, user) => {
+      captured = user;
+      return '{"nodes":[],"edges":[]}';
+    });
+
+    await ext.extract({
+      messages: [{
+        role: "tool",
+        turn_index: 42,
+        content: JSON.stringify({
+          content: [{
+            type: "tool-result",
+            content: [{ type: "text", text: `${"x".repeat(1200)}${marker}` }],
+          }],
+        }),
+      }],
+      existingNames: [],
+    });
+
+    expect(captured).toContain(marker);
+    expect(captured).toContain("[TOOL RESULT]");
+    expect(captured).not.toContain('"type":"tool-result"');
+  });
+
+  it("retains tool names and arguments while removing envelope noise", () => {
+    expect(normalizeExtractionContent({
+      content: [{ type: "tool-call", name: "read_file", arguments: { path: "/tmp/a" } }],
+    })).toBe('[TOOL CALL read_file]\n{"path":"/tmp/a"}');
+  });
+});
 
 // ═══════════════════════════════════════════════════════════════
 // 核心问题：TASK→SKILL 的边类型修正

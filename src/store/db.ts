@@ -78,11 +78,28 @@ function migrate(db: DatabaseSyncInstance): void {
     m6_communities,
     m7_community_signature,
     m8_backfill_community_signatures,
+    m9_node_sources,
   ];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
   }
+}
+
+// ─── 精确溯源：图节点 → 原始消息 ──────────────────────────────
+
+function m9_node_sources(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_node_sources (
+      node_id     TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      session_id  TEXT NOT NULL,
+      message_id  TEXT NOT NULL REFERENCES gm_messages(id) ON DELETE CASCADE,
+      turn_index  INTEGER NOT NULL,
+      PRIMARY KEY (node_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_node_sources_node ON gm_node_sources(node_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_node_sources_session ON gm_node_sources(session_id, turn_index);
+  `);
 }
 
 // ─── 核心表：节点 + 边 ──────────────────────────────────────

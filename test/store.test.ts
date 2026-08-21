@@ -13,6 +13,7 @@ import {
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
   searchNodes, topNodes, graphWalk, getBySession,
   saveMessage, saveMessageOnce, getMessages, getUnextracted, markExtracted, getEpisodicMessages,
+  getNodeSourceMessages,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, getAllVectors, upsertCommunitySummary,
   vectorSearchWithScore,
@@ -53,6 +54,22 @@ describe("host event messages", () => {
     expect(episodic[0].text).toContain("internal analysis");
     expect(episodic[0].text).toContain("Graph Memory is active");
     expect(episodic[0].text).not.toContain("[object Object]");
+  });
+
+  it("reads exact node evidence instead of guessing by session time", () => {
+    saveMessageOnce(db, "dsh:s1:7", "dsh:s1", 7, "user", {
+      role: "user", content: [{ type: "text", text: "unrelated earlier text" }],
+    });
+    saveMessageOnce(db, "dsh:s1:19", "dsh:s1", 19, "assistant", {
+      role: "assistant", content: [{ type: "text", text: "the exact retained evidence" }],
+    });
+    const { node } = upsertNode(db, {
+      type: "EVENT", name: "exact-source", description: "", content: "summary",
+    }, "dsh:s1", [{ messageId: "dsh:s1:19", turnIndex: 19 }]);
+
+    expect(getNodeSourceMessages(db, node.id, 1000).map(message => message.text)).toEqual([
+      "the exact retained evidence",
+    ]);
   });
 });
 

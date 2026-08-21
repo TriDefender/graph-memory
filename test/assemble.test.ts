@@ -108,7 +108,7 @@ describe("assembleContext", () => {
     expect(xml).toContain('source="recalled"');
   });
 
-  it("token 预算不截断节点（全量放入）", () => {
+  it("token 预算限制注入节点且不截断已选节点内容", () => {
     // 插入很多大节点
     const nodes: GmNode[] = [];
     for (let i = 0; i < 20; i++) {
@@ -120,19 +120,20 @@ describe("assembleContext", () => {
     }
 
     // 很小的 token 预算
-    const { xml } = assembleContext(db, {
-      tokenBudget: 1000, // 1000 * 0.15 * 3 = 450 字符
+    const { xml, tokens } = assembleContext(db, {
+      tokenBudget: 2200,
       activeNodes: nodes,
       activeEdges: [],
       recalledNodes: [],
       recalledEdges: [],
     });
 
-    // 不应该包含所有 20 个节点
-    if (xml) {
-      const matches = xml.match(/name="skill-/g);
-      expect(matches!.length).toBe(20);
-    }
+    expect(xml).not.toBeNull();
+    const matches = xml!.match(/name="skill-/g) ?? [];
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches.length).toBeLessThan(20);
+    expect(tokens).toBeLessThanOrEqual(2200);
+    expect(xml).toContain("x".repeat(5000));
   });
 });
 

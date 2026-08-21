@@ -68,6 +68,7 @@ export function upsertNode(
   db: DatabaseSyncInstance,
   c: { type: NodeType; name: string; description: string; content: string },
   sessionId: string,
+  sources: Array<{ messageId: string; turnIndex: number }> = [],
 ): { node: GmNode; isNew: boolean } {
   const name = normalizeName(c.name);
   const ex = findByName(db, name);
@@ -80,6 +81,7 @@ export function upsertNode(
     db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
       source_sessions=?, updated_at=? WHERE id=?`)
       .run(content, desc, count, sessions, Date.now(), ex.id);
+    saveNodeSources(db, ex.id, sessionId, sources);
     return { node: { ...ex, content, description: desc, validatedCount: count }, isNew: false };
   }
 
@@ -88,7 +90,25 @@ export function upsertNode(
     (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
     VALUES (?,?,?,?,?,'active',1,?,?,?)`)
     .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), Date.now(), Date.now());
-  return { node: findByName(db, name)!, isNew: true };
+  const node = findByName(db, name)!;
+  saveNodeSources(db, node.id, sessionId, sources);
+  return { node, isNew: true };
+}
+
+/** Link one graph node to durable message rows that actually exist. */
+export function saveNodeSources(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  sessionId: string,
+  sources: Array<{ messageId: string; turnIndex: number }>,
+): void {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO gm_node_sources (node_id, session_id, message_id, turn_index)
+    SELECT ?, ?, id, turn_index FROM gm_messages WHERE id=?
+  `);
+  for (const source of sources) {
+    insert.run(nodeId, sessionId, source.messageId);
+  }
 }
 
 /** 按 name 精确更新 description / content；找不到返回 null（调用方决定报错语义） */
@@ -412,8 +432,47 @@ export function getEpisodicMessages(
   return results;
 }
 
+/** Read exact durable message evidence for one node, in source order. */
+export function getNodeSourceMessages(
+  db: DatabaseSyncInstance,
+  nodeId: string,
+  maxChars: number,
+): Array<{ sessionId: string; turnIndex: number; role: string; text: string; createdAt: number }> {
+  if (maxChars <= 0) return [];
+  const rows = db.prepare(`
+    SELECT s.session_id, s.turn_index, m.role, m.content, m.created_at
+    FROM gm_node_sources s
+    JOIN gm_messages m ON m.id=s.message_id
+    WHERE s.node_id=?
+    ORDER BY s.turn_index, m.created_at
+  `).all(nodeId) as any[];
+  const results: Array<{ sessionId: string; turnIndex: number; role: string; text: string; createdAt: number }> = [];
+  let usedChars = 0;
+  for (const row of rows) {
+    if (usedChars >= maxChars) break;
+    let text = "";
+    try {
+      text = extractStoredText(JSON.parse(row.content));
+    } catch {
+      text = String(row.content);
+    }
+    if (!text.trim()) continue;
+    const remaining = maxChars - usedChars;
+    const selected = text.length <= remaining ? text : text.slice(0, remaining);
+    results.push({
+      sessionId: row.session_id,
+      turnIndex: row.turn_index,
+      role: row.role,
+      text: selected,
+      createdAt: row.created_at,
+    });
+    usedChars += selected.length;
+  }
+  return results;
+}
+
 /** Read text from legacy OpenClaw payloads and DSH block-based messages. */
-function extractStoredText(value: unknown): string {
+export function extractStoredText(value: unknown): string {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(extractStoredText).filter(Boolean).join("\n");
   if (!value || typeof value !== "object") return "";

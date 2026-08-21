@@ -126,6 +126,17 @@ export function createTestDb(): DatabaseSyncInstance {
     );
   `);
 
+  // m9: graph node provenance
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_node_sources (
+      node_id TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL REFERENCES gm_messages(id) ON DELETE CASCADE,
+      turn_index INTEGER NOT NULL,
+      PRIMARY KEY (node_id, message_id)
+    );
+  `);
+
   return db;
 }
 

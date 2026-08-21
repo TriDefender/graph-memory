@@ -13,6 +13,52 @@ import type { CompleteFn } from "../engine/llm.ts";
 const VALID_NODE_TYPES = new Set(["TASK", "SKILL", "EVENT"]);
 const VALID_EDGE_TYPES = new Set(["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"]);
 
+/**
+ * Convert stored OpenClaw/DSH message envelopes into semantic text without
+ * discarding a fixed prefix. The durable store keeps the original JSON; this
+ * projection is only the extraction input.
+ */
+export function normalizeExtractionContent(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]")) ||
+        (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+      try {
+        return normalizeExtractionContent(JSON.parse(trimmed));
+      } catch {
+        // It is ordinary text that happens to resemble JSON.
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeExtractionContent).filter(Boolean).join("\n");
+  }
+  if (typeof value !== "object") return String(value);
+
+  const record = value as Record<string, unknown>;
+  if ((record.type === "text" || record.type === "reasoning") && typeof record.text === "string") {
+    return record.text;
+  }
+  if (record.type === "tool-call") {
+    const name = typeof record.name === "string" ? record.name : "unknown";
+    const args = record.arguments === undefined
+      ? ""
+      : typeof record.arguments === "string"
+        ? record.arguments
+        : JSON.stringify(record.arguments);
+    return `[TOOL CALL ${name}]${args ? `\n${args}` : ""}`;
+  }
+  if (record.type === "tool-result") {
+    return `[TOOL RESULT]\n${normalizeExtractionContent(record.content)}`;
+  }
+  if (record.content !== undefined) return normalizeExtractionContent(record.content);
+  if (record.message !== undefined) return normalizeExtractionContent(record.message);
+  return JSON.stringify(record);
+}
+
 /** 边类型 → 合法的 from 节点类型 */
 const EDGE_FROM_CONSTRAINT: Record<string, Set<string>> = {
   USED_SKILL:     new Set(["TASK"]),
@@ -42,11 +88,12 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
        - TASK：用户要求 Agent 完成的具体任务，或对话中讨论、分析、对比的主题
        - SKILL：可复用的操作技能，有具体工具/命令/API，有明确触发条件，步骤可直接执行
        - EVENT：一次性的报错或异常，记录现象、原因和解决方法
-   1.2 每个节点必须包含 4 个字段，缺一不可：
+   1.2 每个节点必须包含以下字段：
        - type：节点类型，只允许 TASK / SKILL / EVENT
        - name：全小写连字符命名，确保整个提取过程命名一致
        - description：一句话说明什么场景触发
        - content：纯文本格式的知识内容（见 1.4 的模板）
+       - sourceTurns（推荐）：支持该节点的 t 编号数组，只引用输入中真实存在的 t
    1.3 name 命名规范：
        - TASK：动词-对象格式，如 deploy-bilibili-mcp、extract-pdf-tables、compare-ocr-engines
        - SKILL：工具-操作格式，如 conda-env-create、docker-port-expose
@@ -105,7 +152,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 
 4. 输出规范：
    4.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
-   4.2 禁止 markdown 代码块包裹，禁止解释文字，禁止额外字段
+   4.2 禁止 markdown 代码块包裹，禁止解释文字
    4.3 没有知识产出时返回 {"nodes":[],"edges":[]}
    4.4 每条 edge 的 instruction 必须写具体可执行的内容，不能为空或写"见上文"
 
@@ -221,7 +268,7 @@ export class Extractor {
   }): Promise<ExtractionResult> {
     const msgs = params.messages
       .map(m => `[${(m.role ?? "?").toUpperCase()} t=${m.turn_index ?? 0}]\n${
-        String(typeof m.content === "string" ? m.content : JSON.stringify(m.content)).slice(0, 800)
+        normalizeExtractionContent(m.content)
       }`).join("\n\n---\n\n");
 
     const raw = await this.llm(
@@ -248,6 +295,9 @@ export class Extractor {
           return false;
         }
         if (!n.description) n.description = "";
+        n.sourceTurns = Array.isArray(n.sourceTurns)
+          ? Array.from(new Set(n.sourceTurns.map(Number).filter(Number.isFinite)))
+          : [];
         n.name = normalizeName(n.name);
         return true;
       });

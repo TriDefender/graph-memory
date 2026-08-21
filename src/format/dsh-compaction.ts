@@ -1,0 +1,68 @@
+/**
+ * Pure DeepSeek Harness surface selection for Graph Memory rolling compaction.
+ *
+ * DSH keeps the durable event log intact and exposes a replaceable model-facing
+ * surface. Graph Memory selects only a complete prefix of that surface; the
+ * host compaction service owns the actual summary transaction and tool-pairing
+ * validation.
+ */
+
+interface DshSurfaceEvent {
+  type?: string;
+  data?: {
+    source?: { kind?: string };
+  };
+}
+
+interface DshSurfaceSession {
+  events?: Array<DshSurfaceEvent | undefined>;
+  surface?: { nodes?: number[] };
+}
+
+export interface DshCompactionRange {
+  start: number;
+  end: number;
+  shadowedSeqs: number[];
+  retainedUserTurns: number;
+}
+
+/** Whether one surface event is a real user prompt that starts a logical turn. */
+export function isDshUserTurn(event: DshSurfaceEvent | undefined): boolean {
+  return event?.type === "user/message" && event.data?.source?.kind === "user";
+}
+
+/**
+ * Select the oldest complete surface prefix while retaining the newest N user
+ * turns verbatim. Plugin-owned user messages (prompt snapshots, skill catalogs,
+ * compaction checkpoints) do not count as user turns.
+ */
+export function selectDshRollingCompactionRange(
+  session: DshSurfaceSession,
+  freshTurnCount: number,
+): DshCompactionRange | null {
+  if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
+    throw new TypeError(`freshTurnCount must be a positive integer, received ${freshTurnCount}`);
+  }
+
+  const surface = session.surface?.nodes;
+  const events = session.events;
+  if (!Array.isArray(surface) || !Array.isArray(events) || surface.length < 2) return null;
+
+  const userPositions: number[] = [];
+  for (let index = 0; index < surface.length; index += 1) {
+    if (isDshUserTurn(events[surface[index]])) userPositions.push(index);
+  }
+  if (userPositions.length <= freshTurnCount) return null;
+
+  const keepFromPosition = userPositions[userPositions.length - freshTurnCount];
+  if (keepFromPosition <= 0) return null;
+  const shadowedSeqs = surface.slice(0, keepFromPosition);
+  if (!shadowedSeqs.length) return null;
+
+  return {
+    start: shadowedSeqs[0],
+    end: shadowedSeqs[shadowedSeqs.length - 1],
+    shadowedSeqs,
+    retainedUserTurns: freshTurnCount,
+  };
+}
