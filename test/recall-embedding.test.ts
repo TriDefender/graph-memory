@@ -67,4 +67,23 @@ describe("Recaller.syncEmbed", () => {
     expect(queryCalls).toBe(1);
     expect(result.nodes[0]?.id).toBe(strong.id);
   });
+
+  it("supports a high-precision automatic mode without broad fallback", async () => {
+    const weak = upsertNode(db, {
+      type: "EVENT",
+      name: "weak-neighbor",
+      description: "only loosely related",
+      content: "generic memory",
+    }, "old-session").node;
+    saveVector(db, weak.id, "weak", [0.55, Math.sqrt(1 - 0.55 ** 2)]);
+
+    const recaller = new Recaller(db, DEFAULT_CONFIG);
+    recaller.setEmbedFn(async () => [1, 0]);
+    const result = await recaller.recall("unrelated current request", {
+      minSemanticScore: 0.6,
+      allowBroadFallback: false,
+    });
+
+    expect(result.nodes).toEqual([]);
+  });
 });

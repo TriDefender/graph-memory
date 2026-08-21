@@ -7,6 +7,7 @@
         recallEnabled: true
         recallMaxNodes: 6
         recallMaxDepth: 2
+        autoRecallMinScore: 0.6
         recallTokenBudget: 4096
         maintenanceInterval: 6
         # Graph Memory retains the newest real user turns and asks the agent's

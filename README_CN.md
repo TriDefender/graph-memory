@@ -35,9 +35,13 @@ Graph Memory 不是聊天记录归档器，也不是把所有历史重新塞回�
 
 ### 只把相关知识送进上下文
 
+- 默认原样保留最近 5 个真实用户轮次，可通过 `freshTurnCount` 配置。
+- 通过每个 Agent 的 DSH 公共 CompactionEngine，把更早的模型表面历史替换为滚动 checkpoint；持久化原始事件不删除。
+- checkpoint、知识节点与精确原消息来源建立关联，召回时可以回溯原文。
 - 精确路径：向量 / FTS5 → 社区扩展 → 图遍历 → 个性化 PageRank。
 - 泛化路径：查询向量 → 社区摘要 → 社区成员 → 图排序。
-- 只注入与本轮问题相关的局部图，不回放全部历史。
+- 只注入与本轮问题相关的跨会话局部图，并受 `recallTokenBudget`（默认 4096）约束。
+- 自动注入使用高精度语义门槛（`autoRecallMinScore`，默认 0.6），且不会在无关查询下退化为任意社区代表节点；显式 `gm_search` 仍保留宽召回。
 - 召回内容被标记为不可信参考材料，不能覆盖当前用户指令。
 
 ### 本地优先，向量能力可选
@@ -162,13 +166,14 @@ graph-memory/
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Cordis 原生加载 | **已完成** | 使用插件生命周期，无需 fork DSH |
+| 滚动上下文接管 | **已完成** | 最近 N 轮可配置，更早表面历史替换为 checkpoint |
 | 跨会话自动召回 | **已完成** | 在 Prompt Assembly 阶段注入相关记忆 |
 | 显式记录与搜索 | **已完成** | `gm_record`、`gm_search` |
 | 向量回填与模型迁移 | **已完成** | 追踪模型、维度与 fingerprint |
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.1`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.5`；DSH 仍处于 Developer Preview，后续版本可能出现破坏性变化。验收已覆盖 tarball 安装、插件 active、1024 维向量回填、跨 Session 语义召回、重启持久化、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；111 项自动化测试通过。
+当前 beta：`1.6.0-beta.8`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.8`。验收已覆盖 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；127 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -196,7 +201,7 @@ npm pack
 安装到 DSH Web profile：
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.8.tgz
 npx @deepseek-ai/dsh --profile web --dump-config
 npx @deepseek-ai/dsh web
 ```
@@ -204,7 +209,7 @@ npx @deepseek-ai/dsh web
 在 DeepSeek Harness 源码仓库内，也可以使用：
 
 ```bash
-pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.8.tgz
 pnpm dsh web
 ```
 

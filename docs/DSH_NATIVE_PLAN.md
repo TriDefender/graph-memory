@@ -1,7 +1,7 @@
 # Graph Memory × DeepSeek Harness 原生架构与 Pro 路线图
 
-> 更新：2026-08-14  
-> Community 状态：`1.6.0-beta.1` 已完成本机 DSH 原生闭环验证  
+> 更新：2026-08-21
+> Community 状态：`1.6.0-beta.8` 已完成 DSH rc.8 原生加载、滚动上下文接管与真实跨项目召回验证
 > Pro 状态：SQLite GraphSnapshot、DSH Host、Typed Remote 与只读 Client 已实现；2D/3D、分屏和拖拽尚未实现
 
 ## 1. 结论
@@ -62,10 +62,19 @@ graph-memory/
 ### 写入链路
 
 1. `session/event` 接收最终 user、assistant 和 tool result 事件。
-2. 幂等键采用 `dsh:<sessionId>:<event.seq>`，resume/HMR 回放不会重复记录。
+2. 只保存不可变的 append 原事件；派生的 surface replacement 不重复入库。幂等键采用 `dsh:<sessionId>:<event.seq>`，resume/HMR 回放不会重复记录。
 3. `turn/end` 串行调度该会话的结构化抽取。
 4. 节点与边写入 SQLite，随后生成 embedding。
 5. 抽取失败时消息仍为 pending，后续可以重试，不伪装成功。
+
+### 上下文接管链路
+
+1. `freshTurnCount` 只统计来源为真实用户的 `user/message`，默认保留最近 5 轮。
+2. `agent/pre-step` 选择更早的完整 surface 前缀，不拆开工具调用/结果边界。
+3. 插件从 agent 作用域取得 DSH 公共 `compaction` 服务并调用 `compactRegion`；不修改 DSH 源码。
+4. DSH 原子写入 summary 与 replacement，原始事件仍在 durable log 中。
+5. Graph Memory 把 summary 记录为稳定的 Session Capsule，并关联 `shadowedSeqs` 对应的精确原消息。
+6. 当前 Session 不再自动重复注入自身图节点；跨 Session 召回受独立 token 预算约束。
 
 ### 召回链路
 
@@ -75,7 +84,7 @@ graph-memory/
 4. 局部图遍历与 PPR 排序后限制节点数和深度。
 5. `system-prompt/assemble` 注入带来源的历史参考。
 
-DSH Compaction 负责单个 Session 内的短期上下文；Graph Memory 负责跨 Session 的长期记忆。两者互补，不互相接管。
+Graph Memory 负责“何时压、保留几轮、压缩结果如何进入长期图记忆”；DSH CompactionEngine 负责安全的摘要生成、工具配对校验和 surface replacement 事务。两者是策略层与宿主执行层的组合，不是互不相干的两套系统。
 
 ## 5. Embedding 与凭据设计
 
@@ -107,9 +116,11 @@ embedding:
 | 跨会话语义召回 | 不同措辞、无显式 `gm_search` 仍命中 |
 | 重启持久化 | 通过 |
 | 无 embedding 降级 | FTS5，通过 |
-| 单元/迁移测试 | 111/111（含 Pro Lite Host / GraphSnapshot / Client bundle） |
+| 单元/迁移/组合测试 | 127/127（含滚动压缩、溯源、预算、高精度召回和 Pro Lite） |
 | TypeScript build | 通过 |
-| 普通对话自动抽取 | 有模型稳定性缺口，beta 已明确披露 |
+| 真实模型滚动压缩 | DSH rc.8 上通过；第 6 个真实用户轮次触发最旧完整前缀替换 |
+| 真实跨项目召回 | 新项目不调用 `gm_search`，自动召回并准确回答 |
+| 真实向量写入 | `text-embedding-v4`，1024 dimensions |
 
 证据截图位于 `docs/images/dsh/`。
 
@@ -197,7 +208,7 @@ interface GraphStore {
 - 增加 DSH adapter mock 测试：credential missing/rotation、回填、dispose、并发 Session。
 - 验证 `plugin add`、update、remove、重装和 tarball 内容。
 - 增加 secret scan 与数据库/日志排除检查。
-- 发布 `1.6.0-beta.1`，收集不同 DSH profile 的兼容反馈。
+- 发布 `1.6.0-beta.8`，收集不同 DSH profile 的兼容反馈。
 
 ### P1：Community 稳定版
 
@@ -216,4 +227,4 @@ interface GraphStore {
 
 ## 11. 发布决策
 
-当前不建议继续沿用含义混乱的 `v2.0` 标签。Community DSH 适配以 `1.6.0-beta.1` 发布：它准确表达“已有可用闭环，但自动抽取和安装矩阵仍需扩展验证”。Pro UI 完成之前，README、截图和视频必须始终把“现有 Pro/OpenClaw 演示”和“DSH 已实现能力”分开标注。
+当前不建议继续沿用含义混乱的 `v2.0` 标签。`1.6.0-beta.8` 是一次 DSH 上下文接管修复：滚动上下文、长期图记忆、高精度跨项目召回与 Pro Lite 已组合，并已完成真实模型闭环；多 profile 安装矩阵仍需继续验证。README、截图和视频必须始终区分自动化组合测试、真实宿主加载和真实模型结果。

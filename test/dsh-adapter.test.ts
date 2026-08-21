@@ -31,14 +31,22 @@ describe("native DSH context takeover", () => {
   it("uses the agent-scoped public compaction service and retains configurable turns", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
+    let compactionService: any;
     const context: any = {
       logger: { info() {}, warn() {}, error() {} },
       llm: { async *stream() {} },
       tools: { register() { return () => {}; } },
       credentials: { async resolve() { return undefined; } },
-      on(name: string, listener: (...args: any[]) => any) {
+      agentPresets: {
+        serviceFor(_agent: any, key: string) {
+          expect(key).toBe("compaction");
+          return compactionService;
+        },
+      },
+      on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
         const current = listeners.get(name) ?? [];
-        current.push(listener);
+        if (options?.prepend) current.unshift(listener);
+        else current.push(listener);
         listeners.set(name, current);
         return () => {};
       },
@@ -56,6 +64,7 @@ describe("native DSH context takeover", () => {
 
     const events: any[] = [];
     const surface: number[] = [];
+    const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
     for (let turn = 1; turn <= 3; turn += 1) {
       const userSeq = events.length;
       events.push(user(userSeq));
@@ -68,19 +77,24 @@ describe("native DSH context takeover", () => {
     const agent = {
       session: { events, surface: { nodes: surface } },
       ctx: {
-        get(name: string) {
-          expect(name).toBe("compaction");
-          return {
-            async compactRegion(...args: any[]) {
-              calls.push(args);
-              return { shadowedSeqs: [0, 1] };
-            },
-          };
+        on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+          const current = agentListeners.get(name) ?? [];
+          if (options?.prepend) current.unshift(listener);
+          else current.push(listener);
+          agentListeners.set(name, current);
+          return () => {};
         },
       },
     };
+    compactionService = {
+      async compactRegion(...args: any[]) {
+        calls.push(args);
+        return { shadowedSeqs: [0, 1] };
+      },
+    };
+    listeners.get("agent/created")![0]({ agent });
     const next = async () => "continued";
-    const result = await listeners.get("agent/pre-step")![0]({
+    const result = await agentListeners.get("agent/pre-step")![0]({
       agent,
       signal: new AbortController().signal,
     }, next);
@@ -96,14 +110,22 @@ describe("native DSH context takeover", () => {
   it("keeps a 30-turn model surface bounded instead of growing linearly", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
+    let compactionService: any;
     const context: any = {
       logger: { info() {}, warn() {}, error() {} },
       llm: { async *stream() {} },
       tools: { register() { return () => {}; } },
       credentials: { async resolve() { return undefined; } },
-      on(name: string, listener: (...args: any[]) => any) {
+      agentPresets: {
+        serviceFor(_agent: any, key: string) {
+          expect(key).toBe("compaction");
+          return compactionService;
+        },
+      },
+      on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
         const current = listeners.get(name) ?? [];
-        current.push(listener);
+        if (options?.prepend) current.unshift(listener);
+        else current.push(listener);
         listeners.set(name, current);
         return () => {};
       },
@@ -121,48 +143,63 @@ describe("native DSH context takeover", () => {
 
     const events: any[] = [];
     const surface = { nodes: [] as number[] };
+    const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
     let compactions = 0;
     const agent: any = {
       id: "long-dialog",
       session: { events, surface },
       ctx: {
-        get() {
-          return {
-            async compactRegion(start: number, end: number) {
-              const startPosition = surface.nodes.indexOf(start);
-              const endPosition = surface.nodes.indexOf(end);
-              const shadowedSeqs = surface.nodes.slice(startPosition, endPosition + 1);
-              const replacementSeq = events.length;
-              events.push({
-                type: "user/message",
-                seq: replacementSeq,
-                surfaceOp: { op: "replace", start, end },
-                sourceEventSeqs: shadowedSeqs,
-                data: {
-                  source: { kind: "plugin", plugin: "compaction-basic" },
-                  content: [{ type: "text", text: `checkpoint-${compactions}`.padEnd(600, ".") }],
-                },
-              });
-              surface.nodes.splice(startPosition, shadowedSeqs.length, replacementSeq);
-              compactions += 1;
-              return { shadowedSeqs };
-            },
-          };
+        on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
+          const current = agentListeners.get(name) ?? [];
+          if (options?.prepend) current.unshift(listener);
+          else current.push(listener);
+          agentListeners.set(name, current);
+          return () => {};
         },
       },
     };
+    compactionService = {
+      async compactRegion(start: number, end: number) {
+        const startPosition = surface.nodes.indexOf(start);
+        const endPosition = surface.nodes.indexOf(end);
+        const shadowedSeqs = surface.nodes.slice(startPosition, endPosition + 1);
+        const replacementSeq = events.length;
+        events.push({
+          type: "user/message",
+          seq: replacementSeq,
+          surfaceOp: { op: "replace", start, end },
+          sourceEventSeqs: shadowedSeqs,
+          data: {
+            source: { kind: "plugin", plugin: "compaction-basic" },
+            content: [{ type: "text", text: `checkpoint-${compactions}`.padEnd(600, ".") }],
+          },
+        });
+        surface.nodes.splice(startPosition, shadowedSeqs.length, replacementSeq);
+        compactions += 1;
+        return { shadowedSeqs };
+      },
+    };
+    listeners.get("agent/created")![0]({ agent });
 
     const payload = "x".repeat(1_000);
     for (let turn = 0; turn < 30; turn += 1) {
+      const claimed = {
+        source: { kind: "user" },
+        content: [{ type: "text", text: `user-${turn}-${payload}` }],
+      };
+      // Real DSH order: pre-step sees claimed inbox messages before those
+      // messages are appended to the durable/model surface.
+      await agentListeners.get("agent/pre-step")![0]({
+        agent,
+        messages: [claimed],
+        signal: new AbortController().signal,
+      }, async () => undefined);
       const userSeq = events.length;
       events.push({
         type: "user/message",
         seq: userSeq,
         surfaceOp: "append",
-        data: {
-          source: { kind: "user" },
-          content: [{ type: "text", text: `user-${turn}-${payload}` }],
-        },
+        data: claimed,
       });
       surface.nodes.push(userSeq);
       const assistantSeq = events.length;
@@ -175,10 +212,6 @@ describe("native DSH context takeover", () => {
         },
       });
       surface.nodes.push(assistantSeq);
-      await listeners.get("agent/pre-step")![0]({
-        agent,
-        signal: new AbortController().signal,
-      }, async () => undefined);
     }
 
     const realUsers = surface.nodes.filter(seq => (

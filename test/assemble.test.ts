@@ -10,7 +10,7 @@ import { DatabaseSync, type DatabaseSyncInstance } from "@photostructure/sqlite"
 import { createTestDb, insertNode, insertEdge } from "./helpers.ts";
 import { assembleContext, buildSystemPromptAddition } from "../src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "../src/format/transcript-repair.ts";
-import { findById } from "../src/store/store.ts";
+import { findById, saveMessageOnce, upsertNode } from "../src/store/store.ts";
 import type { GmNode, GmEdge } from "../src/types.ts";
 
 let db: DatabaseSyncInstance;
@@ -134,6 +134,31 @@ describe("assembleContext", () => {
     expect(matches.length).toBeLessThan(20);
     expect(tokens).toBeLessThanOrEqual(2200);
     expect(xml).toContain("x".repeat(5000));
+  });
+
+  it("多个节点引用同一批原文时只注入一次证据", () => {
+    saveMessageOnce(db, "m-user", "session-a", 1, "user", { content: "唯一用户事实" });
+    saveMessageOnce(db, "m-assistant", "session-a", 2, "assistant", { content: "唯一助手确认" });
+    const sources = [
+      { messageId: "m-user", turnIndex: 1 },
+      { messageId: "m-assistant", turnIndex: 2 },
+    ];
+    const first = upsertNode(db, {
+      type: "EVENT", name: "shared-event", description: "shared", content: "fact",
+    }, "session-a", sources).node;
+    const second = upsertNode(db, {
+      type: "TASK", name: "shared-task", description: "shared", content: "task",
+    }, "session-a", sources).node;
+
+    const { episodicXml } = assembleContext(db, {
+      tokenBudget: 10_000,
+      activeNodes: [], activeEdges: [],
+      recalledNodes: [first, second], recalledEdges: [],
+    });
+
+    expect(episodicXml.match(/唯一用户事实/g)).toHaveLength(1);
+    expect(episodicXml.match(/唯一助手确认/g)).toHaveLength(1);
+    expect(episodicXml.match(/<trace /g)).toHaveLength(1);
   });
 });
 

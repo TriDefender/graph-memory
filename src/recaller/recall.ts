@@ -40,8 +40,15 @@ export class Recaller {
     this.embeddingFingerprint = fingerprint;
   }
 
-  async recall(query: string): Promise<RecallResult> {
+  async recall(query: string, options: {
+    /** Minimum cosine score for semantic seeds. Explicit searches keep 0.35. */
+    minSemanticScore?: number;
+    /** Allow query-independent community representatives as a broad fallback. */
+    allowBroadFallback?: boolean;
+  } = {}): Promise<RecallResult> {
     const limit = this.cfg.recallMaxNodes;
+    const minSemanticScore = options.minSemanticScore ?? 0.35;
+    const allowBroadFallback = options.allowBroadFallback ?? true;
     let queryVector: number[] | undefined;
     if (this.embed) {
       try {
@@ -53,8 +60,10 @@ export class Recaller {
     }
 
     // ── 两条路径各自独立跑满，不分配额 ──────────────────
-    const precise = await this.recallPrecise(query, limit, queryVector);
-    const generalized = await this.recallGeneralized(limit, queryVector);
+    const precise = await this.recallPrecise(query, limit, queryVector, minSemanticScore);
+    const generalized = await this.recallGeneralized(
+      limit, queryVector, minSemanticScore, allowBroadFallback,
+    );
 
     // ── 合并去重（全部保留，只去重复节点） ────────────────
     const merged = this.mergeResults(precise, generalized);
@@ -65,12 +74,17 @@ export class Recaller {
   /**
    * 精确召回：向量/FTS5 找种子 → 社区扩展 → 图遍历 → PPR 排序
    */
-  private async recallPrecise(query: string, limit: number, queryVector?: number[]): Promise<RecallResult> {
+  private async recallPrecise(
+    query: string,
+    limit: number,
+    queryVector?: number[],
+    minSemanticScore = 0.35,
+  ): Promise<RecallResult> {
     // Always combine semantic and lexical retrieval. A vector-only branch
     // misses exact identifiers; an FTS-only fallback misses paraphrases.
     const lexical = searchNodes(this.db, query, limit);
     const semantic = queryVector
-      ? vectorSearchWithScore(this.db, queryVector, limit)
+      ? vectorSearchWithScore(this.db, queryVector, limit, minSemanticScore)
       : [];
     const relevance = new Map<string, number>();
     const byId = new Map<string, GmNode>();
@@ -135,13 +149,18 @@ export class Recaller {
    * 有社区向量时：query vs 社区 embedding 匹配，按相似度排序社区
    * 无社区向量时：fallback 到 communityRepresentatives（按时间取代表节点）
    */
-  private async recallGeneralized(limit: number, queryVector?: number[]): Promise<RecallResult> {
+  private async recallGeneralized(
+    limit: number,
+    queryVector?: number[],
+    minSemanticScore = 0.35,
+    allowBroadFallback = true,
+  ): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
     // 优先用社区向量搜索
     if (queryVector) {
       try {
-        const scoredCommunities = communityVectorSearch(this.db, queryVector);
+        const scoredCommunities = communityVectorSearch(this.db, queryVector, minSemanticScore);
 
         if (scoredCommunities.length > 0) {
           const communityIds = scoredCommunities.map(c => c.id);
@@ -154,7 +173,7 @@ export class Recaller {
     }
 
     // fallback：按时间取社区代表节点
-    if (!seeds.length) {
+    if (!seeds.length && allowBroadFallback) {
       seeds = communityRepresentatives(this.db, 2);
     }
 

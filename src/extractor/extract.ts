@@ -87,7 +87,7 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    1.1 从对话中识别三类知识节点：
        - TASK：用户要求 Agent 完成的具体任务，或对话中讨论、分析、对比的主题
        - SKILL：可复用的操作技能，有具体工具/命令/API，有明确触发条件，步骤可直接执行
-       - EVENT：一次性的报错或异常，记录现象、原因和解决方法
+       - EVENT：需要跨轮次或跨会话保留的事实，包括人物与项目事实、用户偏好、约定、决策、状态变化、时间安排、标识符，以及报错和修复
    1.2 每个节点必须包含以下字段：
        - type：节点类型，只允许 TASK / SKILL / EVENT
        - name：全小写连字符命名，确保整个提取过程命名一致
@@ -97,12 +97,13 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    1.3 name 命名规范：
        - TASK：动词-对象格式，如 deploy-bilibili-mcp、extract-pdf-tables、compare-ocr-engines
        - SKILL：工具-操作格式，如 conda-env-create、docker-port-expose
-       - EVENT：现象-工具格式，如 importerror-libgl1、timeout-paddleocr
+       - EVENT：主题-事实格式，如 project-release-plan、user-display-preferences；报错仍可用 importerror-libgl1、timeout-paddleocr
        - 已有节点列表会提供，相同事物必须复用已有 name，不得创建重复节点
    1.4 content 模板（纯文本，按 type 选用）：
        TASK → "[name]\n目标: ...\n执行步骤:\n1. ...\n2. ...\n结果: ..."
        SKILL → "[name]\n触发条件: ...\n执行步骤:\n1. ...\n2. ...\n常见错误:\n- ... -> ..."
-       EVENT → "[name]\n现象: ...\n原因: ...\n解决方法: ..."
+       EVENT（事实/偏好/约定）→ "[name]\n事实: ...\n来源: ...\n状态: ..."
+       EVENT（报错）→ "[name]\n现象: ...\n原因: ...\n解决方法: ..."
 
 2. 关系提取：
    2.1 识别节点之间直接、明确的关系，只允许以下 5 种边类型。
@@ -148,7 +149,9 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
    3.1 所有对话内容都应尝试提取，包括讨论、分析、对比、方案选型等
    3.2 用户纠正 AI 的错误时，旧做法和新做法都要提取，用 PATCHES 边关联
    3.3 讨论和对比类对话提取为 TASK，记录讨论的结论和要点
-   3.4 只有纯粹的寒暄问候（如"你好""谢谢"）才不提取
+   3.4 明确提取未来回答可能需要的稳定信息：人物身份与关系、偏好、项目约束、负责人、时间、代码/编号、承诺与决策
+   3.5 不要因为信息不是“任务步骤”或“报错”就丢弃；可复用事实统一记录为 EVENT
+   3.6 只有纯粹的寒暄问候（如"你好""谢谢"）才不提取
 
 4. 输出规范：
    4.1 只返回 JSON，格式为 {"nodes":[...],"edges":[...]}
@@ -168,7 +171,14 @@ const EXTRACT_SYS = `你是 graph-memory 知识图谱提取引擎，从 AI Agent
 对话摘要：执行 PaddleOCR 时报 libGL 缺失，通过 apt 安装解决。
 
 输出：
-{"nodes":[{"type":"EVENT","name":"importerror-libgl1","description":"导入 cv2/paddleocr 时报 libGL.so.1 缺失","content":"importerror-libgl1\n现象: ImportError: libGL.so.1: cannot open shared object file\n原因: OpenCV 依赖系统级 libGL 库，conda/pip 不自动安装\n解决方法: apt install -y libgl1-mesa-glx"},{"type":"SKILL","name":"apt-install-libgl1","description":"安装 libgl1 解决 OpenCV 系统依赖缺失","content":"apt-install-libgl1\n触发条件: ImportError: libGL.so.1\n执行步骤:\n1. sudo apt update\n2. sudo apt install -y libgl1-mesa-glx\n常见错误:\n- Permission denied -> 加 sudo"}],"edges":[{"from":"importerror-libgl1","to":"apt-install-libgl1","type":"SOLVED_BY","instruction":"执行 sudo apt install -y libgl1-mesa-glx","condition":"报 ImportError: libGL.so.1 时"}]}`;
+{"nodes":[{"type":"EVENT","name":"importerror-libgl1","description":"导入 cv2/paddleocr 时报 libGL.so.1 缺失","content":"importerror-libgl1\n现象: ImportError: libGL.so.1: cannot open shared object file\n原因: OpenCV 依赖系统级 libGL 库，conda/pip 不自动安装\n解决方法: apt install -y libgl1-mesa-glx"},{"type":"SKILL","name":"apt-install-libgl1","description":"安装 libgl1 解决 OpenCV 系统依赖缺失","content":"apt-install-libgl1\n触发条件: ImportError: libGL.so.1\n执行步骤:\n1. sudo apt update\n2. sudo apt install -y libgl1-mesa-glx\n常见错误:\n- Permission denied -> 加 sudo"}],"edges":[{"from":"importerror-libgl1","to":"apt-install-libgl1","type":"SOLVED_BY","instruction":"执行 sudo apt install -y libgl1-mesa-glx","condition":"报 ImportError: libGL.so.1 时"}]}
+
+示例 3（跨会话事实 EVENT）：
+
+对话摘要：用户说明项目主题色是钴蓝，负责人代号 Ananas，发布时间是周五。
+
+输出：
+{"nodes":[{"type":"EVENT","name":"project-release-facts","description":"项目展示与发布时需要沿用的已确认事实","content":"project-release-facts\n事实: 主题色为钴蓝；负责人代号为 Ananas；发布时间为周五\n来源: 用户明确说明\n状态: 已确认","sourceTurns":[2,4,5]}],"edges":[]}`;
 
 // ─── 提取 User Prompt ───────────────────────────────────────────
 

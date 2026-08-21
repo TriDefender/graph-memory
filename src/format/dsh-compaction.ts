@@ -39,9 +39,13 @@ export function isDshUserTurn(event: DshSurfaceEvent | undefined): boolean {
 export function selectDshRollingCompactionRange(
   session: DshSurfaceSession,
   freshTurnCount: number,
+  incomingUserTurns = 0,
 ): DshCompactionRange | null {
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`freshTurnCount must be a positive integer, received ${freshTurnCount}`);
+  }
+  if (!Number.isInteger(incomingUserTurns) || incomingUserTurns < 0) {
+    throw new TypeError(`incomingUserTurns must be a non-negative integer, received ${incomingUserTurns}`);
   }
 
   const surface = session.surface?.nodes;
@@ -52,9 +56,12 @@ export function selectDshRollingCompactionRange(
   for (let index = 0; index < surface.length; index += 1) {
     if (isDshUserTurn(events[surface[index]])) userPositions.push(index);
   }
-  if (userPositions.length <= freshTurnCount) return null;
+  if (userPositions.length + incomingUserTurns <= freshTurnCount) return null;
 
-  const keepFromPosition = userPositions[userPositions.length - freshTurnCount];
+  const retainOnSurface = Math.max(0, freshTurnCount - incomingUserTurns);
+  const keepFromPosition = retainOnSurface === 0
+    ? surface.length
+    : userPositions[userPositions.length - retainOnSurface];
   if (keepFromPosition <= 0) return null;
   const shadowedSeqs = surface.slice(0, keepFromPosition);
   if (!shadowedSeqs.length) return null;

@@ -43,6 +43,21 @@ describe("DSH rolling compaction selection", () => {
     )).toBeNull();
   });
 
+  it("counts a claimed incoming user turn before DSH appends it to the surface", () => {
+    const events = [
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+    ];
+    expect(selectDshRollingCompactionRange(
+      { events, surface: { nodes: events.map((_, index) => index) } },
+      5,
+      1,
+    )).toMatchObject({ start: 0, end: 1, shadowedSeqs: [0, 1] });
+  });
+
   it("supports replacement seqs whose numeric order differs from surface order", () => {
     const events: any[] = [];
     events[20] = user("plugin");
@@ -60,6 +75,7 @@ describe("DSH rolling compaction selection", () => {
 
   it("rejects invalid retention instead of silently changing policy", () => {
     expect(() => selectDshRollingCompactionRange({}, 0)).toThrow(/positive integer/);
+    expect(() => selectDshRollingCompactionRange({}, 5, -1)).toThrow(/non-negative integer/);
   });
 
   it("recognizes only durable user-origin prompts", () => {

@@ -97,8 +97,10 @@ export function assembleContext(
   for (const n of params.recalledNodes) map.set(n.id, { ...n, src: "recalled" });
   for (const n of params.activeNodes) map.set(n.id, { ...n, src: "active" });
 
-  // 排序：本 session > SKILL优先 > validatedCount > 全局pagerank基线
-  const TYPE_PRI: Record<string, number> = { SKILL: 3, TASK: 2, EVENT: 1 };
+  // 排序：本 session > 可复用技能/稳定事实 > 临时任务 > 可信度/PPR。
+  // 对话记忆中的 EVENT 承载偏好、人物、项目状态和约定，不能因为
+  // TASK 的结构类型而在紧张预算下先被挤掉。
+  const TYPE_PRI: Record<string, number> = { SKILL: 3, EVENT: 2, TASK: 1 };
   const sorted = Array.from(map.values())
     .filter(n => n.status === "active")
     .sort((a, b) =>
@@ -134,6 +136,7 @@ export function assembleContext(
   // ── 溯源选拉：PPR top 3 节点 → 拉原始 user/assistant 对话 ──
   const topNodes = selected.slice(0, 3);
   const episodicParts: string[] = [];
+  const emittedEvidence = new Set<string>();
   let episodicCharsRemaining = Number.isFinite(budget)
     ? Math.max(0, Math.floor((budget - baseTokens) * CHARS_PER_TOKEN))
     : Number.POSITIVE_INFINITY;
@@ -152,7 +155,18 @@ export function assembleContext(
       : getEpisodicMessages(db, recentSessions, node.updatedAt, traceBudget);
     if (!msgs.length) continue;
 
-    const lines = msgs.map(m =>
+    // Several graph nodes are often extracted from the same turn. Emit each
+    // durable message once across all traces so one recalled conversation is
+    // not multiplied by the number of matching nodes.
+    const uniqueMsgs = msgs.filter((message) => {
+      const key = `${message.sessionId}\u0000${message.turnIndex}\u0000${message.role}\u0000${message.text}`;
+      if (emittedEvidence.has(key)) return false;
+      emittedEvidence.add(key);
+      return true;
+    });
+    if (!uniqueMsgs.length) continue;
+
+    const lines = uniqueMsgs.map(m =>
       `    [${m.role.toUpperCase()}] ${escapeXml(m.text)}`
     ).join("\n");
     const trace = `  <trace node="${node.name}">\n${lines}\n  </trace>`;

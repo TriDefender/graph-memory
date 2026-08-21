@@ -44,9 +44,13 @@ Typed edges such as `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, and `CONFL
 
 ### Smaller, cleaner context
 
+- Keeps the newest real user turns verbatim (`freshTurnCount`, default `5`).
+- Uses the agent-scoped public DSH compaction service to replace the older model-facing prefix with one rolling checkpoint; the durable source event log remains intact.
+- Indexes each landed checkpoint and preserves exact source-message provenance for later dereferencing.
 - Semantic vector retrieval with FTS5 lexical fallback.
 - Community detection, PageRank, personalized PageRank, and bounded graph traversal.
-- Only a relevant local subgraph enters the current prompt.
+- Only a relevant cross-session subgraph enters the current prompt, within `recallTokenBudget` (default `4096`).
+- Automatic injection uses a high-precision semantic gate (`autoRecallMinScore`, default `0.6`) and never falls back to query-independent community representatives; explicit `gm_search` remains broad.
 - Recalled history is marked as untrusted reference material and cannot override current user instructions.
 
 ### Local-first and lightweight
@@ -143,6 +147,9 @@ flowchart LR
 flowchart LR
   USER[User message] --> SESSION[DSH Session Events]
   SESSION --> ADAPTER[Graph Memory Cordis Adapter]
+  ADAPTER --> POLICY[Keep newest N user turns]
+  POLICY --> COMPACT[DSH public CompactionEngine]
+  COMPACT --> CHECKPOINT[Rolling model-surface checkpoint]
   ADAPTER --> EXTRACT[Structured Extraction]
   EXTRACT --> GRAPH[(SQLite / FTS5 / Vectors)]
 
@@ -177,13 +184,14 @@ graph-memory/
 | Capability | Status | Notes |
 |---|---|---|
 | Native Cordis loading | **Done** | No DSH fork required |
+| Rolling context ownership | **Done** | Configurable newest N turns; older surface prefix becomes a checkpoint |
 | Cross-session auto-recall | **Done** | Injected during Prompt Assembly |
 | Explicit record and search | **Done** | `gm_record`, `gm_search` |
 | Vector backfill and migration | **Done** | Model, dimension, and fingerprint tracked |
 | Visible plugin state | **Done** | Active in Plugin Inventory |
 | Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.1`. Local acceptance used DeepSeek Harness `0.1.0-rc.5`. DSH remains in Developer Preview and may introduce compatibility-breaking changes. Testing covered tarball installation, active plugin state, 1024-dimensional vector backfill, semantic recall across Sessions, persistence across restarts, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 111 automated tests passed.
+Current beta: `1.6.0-beta.8`. Local acceptance used DeepSeek Harness `0.1.0-rc.8`. Testing covered tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 127 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -211,12 +219,12 @@ npm pack
 Install the generated tarball into the DSH Web profile:
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.8.tgz
 npx @deepseek-ai/dsh --profile web --dump-config
 npx @deepseek-ai/dsh web
 
 # From a deepseek-harness source checkout:
-pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.1.tgz
+pnpm dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.8.tgz
 pnpm dsh web
 ```
 

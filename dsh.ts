@@ -31,7 +31,7 @@ import { detectCommunities } from "./src/graph/community.ts";
 import { DEFAULT_CONFIG, type GmConfig, type NodeType, type RecallResult } from "./src/types.ts";
 
 export const name = "graph-memory-dsh";
-export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "sessions", "credentials"];
+export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "agentPresets", "sessions", "credentials"];
 
 interface DshEmbeddingConfig {
   apiKeyEnv?: string;
@@ -47,6 +47,8 @@ export interface Config {
   recallEnabled?: boolean;
   recallMaxNodes?: number;
   recallMaxDepth?: number;
+  /** High-precision cosine gate used only for automatic prompt injection. */
+  autoRecallMinScore?: number;
   /** Maximum Graph Memory prompt tokens injected for one DSH request. */
   recallTokenBudget?: number;
   maintenanceInterval?: number;
@@ -79,6 +81,12 @@ interface DshContext {
   };
   credentials: {
     resolve(ref: string): Promise<{ value: string; source: string } | undefined>;
+  };
+  agents?: {
+    get(id: unknown): any;
+  };
+  agentPresets: {
+    serviceFor(agent: any, key: string): any;
   };
   on(event: string, listener: (...args: any[]) => any, options?: Record<string, unknown>): () => void;
   effect(register: () => (() => void | Promise<void>), label?: string): () => void;
@@ -157,6 +165,10 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   if (!Number.isInteger(recallTokenBudget) || recallTokenBudget < 1) {
     throw new TypeError(`[graph-memory] recallTokenBudget must be a positive integer, received ${recallTokenBudget}`);
   }
+  const autoRecallMinScore = input.autoRecallMinScore ?? 0.6;
+  if (!Number.isFinite(autoRecallMinScore) || autoRecallMinScore < 0 || autoRecallMinScore > 1) {
+    throw new TypeError(`[graph-memory] autoRecallMinScore must be between 0 and 1, received ${autoRecallMinScore}`);
+  }
   const credentialRef = input.embedding?.apiKeyEnv;
   if (credentialRef && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
     throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
@@ -191,6 +203,14 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     embeddingConfigured ? "initializing" : "fts-only";
   let closing = false;
   let warnedMissingCompaction = false;
+  const compactionAttached = new WeakSet<object>();
+  const compactionMetrics = {
+    attached: 0,
+    selected: 0,
+    succeeded: 0,
+    unavailable: 0,
+    failed: 0,
+  };
 
   if (embeddingConfigured) {
     void createEmbedFn(embedding).then(async (embed) => {
@@ -376,21 +396,32 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     scheduleExtract(id);
   }
 
-  ctx.on("agent/session-start", ({ agent }: any) => backfill(agent));
-
   // Graph Memory owns the rolling retention policy while DSH's public
-  // compaction service owns the durable summary/replacement transaction. This
-  // keeps the integration replaceable and avoids modifying Harness internals.
-  ctx.on("agent/pre-step", async (
-    { agent, signal }: any,
+  // compaction service owns the durable summary/replacement transaction. DSH
+  // routes pre-step waterfalls through each Agent scope, so the listener must
+  // be installed on agent.ctx rather than the host plugin context.
+  async function compactBeforeStep(
+    { agent, messages, signal }: any,
     next: () => Promise<any>,
-  ) => {
+  ) {
     if (contextCompactionEnabled && !closing && !signal?.aborted) {
       try {
-        const range = selectDshRollingCompactionRange(agent?.session, freshTurnCount);
+        const incomingUserTurns = Array.isArray(messages)
+          ? messages.filter(message => message?.source?.kind === "user").length
+          : 0;
+        const range = selectDshRollingCompactionRange(
+          agent?.session,
+          freshTurnCount,
+          incomingUserTurns,
+        );
         if (range) {
-          const compaction = agent?.ctx?.get?.("compaction") ?? agent?.ctx?.compaction;
+          compactionMetrics.selected += 1;
+          // Agent preset services live in an isolated standing scope. Use
+          // DSH's public roster seam instead of reaching through Cordis scope
+          // internals or requiring a change in Harness itself.
+          const compaction = ctx.agentPresets.serviceFor(agent, "compaction");
           if (!compaction?.compactRegion) {
+            compactionMetrics.unavailable += 1;
             if (!warnedMissingCompaction) {
               warnedMissingCompaction = true;
               ctx.logger.warn(
@@ -405,6 +436,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
               agent,
               signal,
             );
+            compactionMetrics.succeeded += 1;
             ctx.logger.info(
               `[graph-memory] compacted ${result?.shadowedSeqs?.length ?? range.shadowedSeqs.length} ` +
               `surface events; retained ${freshTurnCount} recent user turns`,
@@ -412,16 +444,39 @@ export function apply(ctx: DshContext, input: Config = {}): void {
           }
         }
       } catch (error) {
+        compactionMetrics.failed += 1;
         // DSH's native pressure/overflow compactor remains the safety fallback.
         ctx.logger.warn(`[graph-memory] rolling compaction deferred: ${String(error)}`);
       }
     }
     return next();
+  }
+
+  function attachRollingCompaction(agent: any): void {
+    if (!agent || typeof agent !== "object" || compactionAttached.has(agent)) return;
+    if (typeof agent.ctx?.on !== "function") return;
+    compactionAttached.add(agent);
+    compactionMetrics.attached += 1;
+    agent.ctx.on("agent/pre-step", compactBeforeStep, { prepend: true });
+  }
+
+  ctx.on("agent/created", ({ agent }: any) => attachRollingCompaction(agent));
+  ctx.on("agent/session-start", ({ agent }: any) => {
+    // session-start is also a resume-safe fallback for hosts that publish an
+    // existing Agent before this plugin fiber finishes loading.
+    attachRollingCompaction(agent);
+    backfill(agent);
   });
 
   ctx.on("session/event", (session: any, event: any) => {
     const id = session?.id;
     if (id === undefined) return;
+    // This event is the deterministic cross-scope bridge in composed DSH
+    // profiles. The first user append occurs after that turn's pre-step, then
+    // the public Agents registry lets later pre-steps use the attached hook.
+    if (event?.type === "user/message" && event.data?.source?.kind === "user") {
+      attachRollingCompaction(ctx.agents?.get(id));
+    }
     ingest(id, event);
     recordCompactionCapsule(id, event);
     if (event?.type === "turn/end") {
@@ -449,7 +504,16 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     try {
       let cached = recallCache.get(key);
       if (!cached || cached.query !== query) {
-        cached = { query, value: recaller.recall(query) };
+        // Automatic injection is intentionally high precision: unlike an
+        // explicit gm_search, it must not spend tokens on query-independent
+        // community representatives or weak semantic neighbors.
+        cached = {
+          query,
+          value: recaller.recall(query, {
+            minSemanticScore: autoRecallMinScore,
+            allowBroadFallback: false,
+          }),
+        };
         recallCache.set(key, cached);
       }
       const recalled = await cached.value;
@@ -499,7 +563,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       const embeddingModel = embeddingConfigured && input.embedding?.model
         ? ` (${input.embedding.model})`
         : "";
-      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}`;
+      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
     },
   });
 
