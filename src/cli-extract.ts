@@ -235,6 +235,11 @@ async function extractSessionLoop(
     const extraction = await extractor.extract({ messages: msgs, existingNames: existing });
 
     const nameToId = new Map<string, string>();
+    // 批内 fire-and-forget 的 syncEmbed 收集到批边界统一 await：
+    // closeDriver 在 finally 里执行，若不等待，最后一批在途的 embedding
+    // HTTP 请求会撞上已关闭的 driver 且错误被吞——向量丢失且不可自愈
+    // （markExtracted 已执行，重跑 extract 不会补）。
+    const pendingEmbeds: Promise<void>[] = [];
     for (const nc of extraction.nodes) {
       const { node } = await upsertNode(driver, {
         type: nc.type, name: nc.name,
@@ -242,7 +247,7 @@ async function extractSessionLoop(
       }, sessionId);
       nameToId.set(node.name, node.id);
       stats.nodes += 1;
-      void recaller.syncEmbed(node).catch(() => {});
+      pendingEmbeds.push(recaller.syncEmbed(node).catch(() => {}));
     }
 
     for (const ec of extraction.edges) {
@@ -258,6 +263,8 @@ async function extractSessionLoop(
         stats.edges += 1;
       }
     }
+
+    await Promise.allSettled(pendingEmbeds);
 
     const maxTurn = msgs.reduce((m, msg) => Math.max(m, msg.turn_index ?? 0), 0);
     await markExtracted(driver, sessionId, maxTurn);

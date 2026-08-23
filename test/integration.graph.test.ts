@@ -221,7 +221,19 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
     expect(summary?.summary).toBe("容器部署与编排技能");
     expect(summary?.memberSignature).toBe(buildCommunityMemberSignature(memberIds));
 
-    // detectCommunities 每轮按成员数重编号（c-1..c-N），ID 变但成员相同 → 按签名跨社区复用
+    // detectCommunities 每轮按成员数重编号（c-1..c-N），ID 变但成员相同 → 按签名跨社区复用。
+    // 生产链路里 updateCommunities 会先把成员 communityId 改写到新 id 再进 summarize ——
+    // 这里同样 SET 成员指向新 id（保持生产不变量），旧 id 成为"无人引用"的捐赠者，
+    // 复用查找发生在 prune 之前，捐赠者复制完摘要后才被 prune 清理。
+    const renumber = getSession(driver);
+    try {
+      await renumber.run(
+        "MATCH (n:MemoryNode) WHERE n.id IN $ids SET n.communityId = $cid",
+        { ids: memberIds, cid: "c-reuse-renumbered" },
+      );
+    } finally {
+      await renumber.close();
+    }
     const third = await summarizeCommunities(
       driver, new Map([["c-reuse-renumbered", memberIds]]), llm,
     );

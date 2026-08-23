@@ -16,11 +16,11 @@ import type { Driver } from "neo4j-driver";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type { Recaller } from "../recaller/recall.ts";
 import type { NodeType, EdgeType } from "../types.ts";
-import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
+import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_DIRECTION_RULES, EDGE_TYPES } from "../types.ts";
 import {
-  upsertNode, findById, allActiveNodes, allEdges,
+  upsertNode, findById, findByName, allActiveNodes, allEdges,
   upsertEdge, edgesFrom, edgesTo, deprecate, mergeNodes,
-  searchNodes, getStats,
+  searchNodes, getStats, normalizeName,
 } from "../store/store.ts";
 import { getSession } from "../store/db.ts";
 
@@ -262,12 +262,20 @@ async function handleUpdateNode(
     params.content = body.content as string;
   }
   if (body.name !== undefined) {
-    // Name change — normalize
-    const newName = (body.name as string).trim().toLowerCase()
-      .replace(/[\s_]+/g, "-")
-      .replace(/[^a-z0-9\u4e00-\u9fff\-]/g, "")
-      .replace(/-{2,}/g, "-")
-      .replace(/^-|-$/g, "");
+    // 与 store/extractor 的 normalizeName 同源（受 normalize-name.test.ts 跨文件一致性保护）
+    const newName = normalizeName(body.name as string);
+    if (!newName) {
+      json(res, 400, { error: "name normalizes to empty string" });
+      return true;
+    }
+    if (newName !== existing.name) {
+      // 重名预检：撞 *_name 唯一约束会让裸 session.run 抛成 500，提前回 409
+      const conflict = await findByName(driver, newName);
+      if (conflict && conflict.id !== existing.id) {
+        json(res, 409, { error: `Node name already exists: ${newName}` });
+        return true;
+      }
+    }
     updates.push("n.name = $newName");
     params.newName = newName;
   }
@@ -287,12 +295,40 @@ async function handleUpdateNode(
   if (updates.length > 1) {  // always has updatedAt
     const session = getSession(driver);
     try {
-      await session.run(
-        `MATCH (n:Task|Skill|Event {id: $id})
-         SET ${updates.join(", ")}
-         ${newType ? `REMOVE n:Task, n:Skill, n:Event SET n:${NODE_TYPE_TO_LABEL[newType]}` : ""}`,
-        params,
-      );
+      // 单事务：改 type 与非法边清理必须原子 —— 若 DELETE 瞬时失败而 SET 已提交，
+      // 节点会停留在"新 type + 违反白名单的存量边"状态（正是本端点要修复的不变量）
+      await session.executeWrite(async tx => {
+        await tx.run(
+          `MATCH (n:Task|Skill|Event {id: $id})
+           SET ${updates.join(", ")}
+           ${newType ? `REMOVE n:Task, n:Skill, n:Event SET n:${NODE_TYPE_TO_LABEL[newType]}` : ""}`,
+          params,
+        );
+
+        if (newType) {
+          // 清理方向白名单外的存量边（gm_* 工具链不允许改 type，仅此端点允许——
+          // 必须自己恢复图谱不变量）。合法谓词从 EDGE_DIRECTION_RULES 生成（与
+          // isValidEdgeDirection 同一事实源），出/入边各一条定向查询——无向匹配无法区分
+          // source/target，from/to 集合不对称时会误删合法边。
+          const legal = EDGE_TYPES
+            .map(t => {
+              const rule = EDGE_DIRECTION_RULES[t];
+              return `(type(r) = '${t}' AND source.type IN ${JSON.stringify(rule.from)} AND target.type IN ${JSON.stringify(rule.to)})`;
+            })
+            .join(" OR ");
+          const types = JSON.stringify([...EDGE_TYPES]);
+          await tx.run(`
+            MATCH (source:Task|Skill|Event {id: $id})-[r]->(target:Task|Skill|Event)
+            WHERE type(r) IN ${types} AND NOT (${legal})
+            DELETE r
+          `, { id });
+          await tx.run(`
+            MATCH (source:Task|Skill|Event)-[r]->(target:Task|Skill|Event {id: $id})
+            WHERE type(r) IN ${types} AND NOT (${legal})
+            DELETE r
+          `, { id });
+        }
+      });
     } finally {
       await session.close();
     }

@@ -219,7 +219,8 @@ export async function applyDecay(driver: Driver, cfg: Pick<GmConfig, "decay">): 
     return { enabled: true, scanned: 0, tierTransitions: { ...EMPTY_TRANSITIONS }, durationMs: 0 };
   }
 
-  const maxPagerank = Math.max(...nodes.map(n => n.pagerank), 0.0001);
+  // reduce 而非 Math.max(...map)：spread 在超大节点集（>10 万）会爆调用栈
+  const maxPagerank = nodes.reduce((m, n) => Math.max(m, n.pagerank), 0.0001);
 
   const updates: Array<{ id: string; tier: NodeTier; composite: number; tierChanged: boolean }> = [];
   const transitions: TierTransition = { ...EMPTY_TRANSITIONS };

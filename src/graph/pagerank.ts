@@ -122,30 +122,40 @@ export async function computeGlobalPageRank(driver: Driver, cfg: GmConfig): Prom
 
     await projectActiveGraph(session, graphName, existingTypes);
 
-    await session.run(`
-      CALL gds.pageRank.write('${graphName}', {
-        writeProperty: 'pagerank',
-        dampingFactor: $damping,
-        maxIterations: toInteger($iterations)
-      })
-    `, { damping: cfg.pagerankDamping, iterations: cfg.pagerankIterations });
-
-    await session.run(`CALL gds.graph.drop('${graphName}')`);
-
-    const topResult = await session.run(`
-      MATCH (n:Task|Skill|Event {status: 'active'}) RETURN n.id AS id, n.name AS name, n.pagerank AS score
-      ORDER BY n.pagerank DESC LIMIT 20
-    `);
-
-    const scores = new Map<string, number>();
-    const topK: Array<{ id: string; name: string; score: number }> = [];
-    for (const r of topResult.records) {
-      const rawScore = r.get("score");
-      const score = typeof rawScore === "number" ? rawScore : (rawScore?.toNumber?.() ?? 0);
-      scores.set(r.get("id"), score);
-      topK.push({ id: r.get("id"), name: r.get("name"), score });
+    try {
+      await session.run(`
+        CALL gds.pageRank.write('${graphName}', {
+          writeProperty: 'pagerank',
+          dampingFactor: $damping,
+          maxIterations: toInteger($iterations)
+        })
+      `, { damping: cfg.pagerankDamping, iterations: cfg.pagerankIterations });
+    } finally {
+      // drop 失败只能吞掉（宁泄漏一个临时投影）：此分支若抛错落入外层 catch，
+      // fallback 会用 1/(i+1) 覆盖刚 write 成功的真实 PageRank —— 数据损坏远重于投影泄漏
+      try { await session.run(`CALL gds.graph.drop('${graphName}')`); } catch {}
     }
-    return { scores, topK };
+
+    // write 已成功：pagerank 属性已是真值，后续读取失败只返回空排序，
+    // 绝不回落外层 catch 的 fallback（那会覆盖全图正确分数）
+    try {
+      const topResult = await session.run(`
+        MATCH (n:Task|Skill|Event {status: 'active'}) RETURN n.id AS id, n.name AS name, n.pagerank AS score
+        ORDER BY n.pagerank DESC LIMIT 20
+      `);
+
+      const scores = new Map<string, number>();
+      const topK: Array<{ id: string; name: string; score: number }> = [];
+      for (const r of topResult.records) {
+        const rawScore = r.get("score");
+        const score = typeof rawScore === "number" ? rawScore : (rawScore?.toNumber?.() ?? 0);
+        scores.set(r.get("id"), score);
+        topK.push({ id: r.get("id"), name: r.get("name"), score });
+      }
+      return { scores, topK };
+    } catch {
+      return { scores: new Map(), topK: [] };
+    }
   } catch {
     try { await session.run(`CALL gds.graph.drop('${graphName}')`); } catch {}
     // GDS 不可用时降级为确定性 fallback（与 PPR 一致：按稳定排序赋 1/(i+1)）

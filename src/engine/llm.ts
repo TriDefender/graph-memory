@@ -23,6 +23,7 @@
  * 超时：AbortController 强制；默认 60s，cfg.llm.timeoutMs 可调（慢速 API 用户可调大）。
  */
 
+import { stat } from "node:fs/promises";
 import {
   loadOAuthSession,
   needsRefresh,
@@ -144,13 +145,19 @@ export function createCompleteFn(
   // ── OAuth 会话缓存：单飞刷新，避免并发请求同时触发 refresh ──
   const oauthPath = provider === "oauth" ? llmConfig?.oauthPath : undefined;
   let cachedSessionPromise: Promise<OAuthSession> | null = null;
+  let cachedSessionMtimeMs: number | null = null;
   let refreshPromise: Promise<OAuthSession> | null = null;
 
   async function getOAuthSession(): Promise<OAuthSession> {
     if (!oauthPath) {
       throw new Error("[graph-memory] provider=oauth 需要 llm.oauthPath");
     }
-    if (!cachedSessionPromise) {
+    // oauthPath 可能被运行中的其他进程重写（CLI auth login / CLI extract 刷新 token）。
+    // 进程内缓存按 mtime 失效：文件更新后下一次调用即重载，无需重启网关。
+    let mtimeMs: number | null = null;
+    try { mtimeMs = (await stat(oauthPath)).mtimeMs; } catch { /* 文件暂不可达：沿用缓存 */ }
+    if (!cachedSessionPromise || (mtimeMs !== null && mtimeMs !== cachedSessionMtimeMs)) {
+      cachedSessionMtimeMs = mtimeMs;
       cachedSessionPromise = loadOAuthSession(oauthPath).catch((error) => {
         cachedSessionPromise = null;
         throw error;
@@ -163,6 +170,8 @@ export function createCompleteFn(
           .then(async (s) => {
             await saveOAuthSession(oauthPath, s);
             cachedSessionPromise = Promise.resolve(s);
+            // 同步 mtime 标记，避免下次调用因文件刚写入而多余重载一次
+            try { cachedSessionMtimeMs = (await stat(oauthPath)).mtimeMs; } catch {}
             refreshPromise = null;
             return s;
           })
@@ -251,7 +260,7 @@ export function createCompleteFn(
         );
       }
       const baseURL = (llmConfig?.baseURL ?? ANTHROPIC_DEFAULT_BASE_URL).replace(/\/+$/, "");
-      const res = await fetchWithTimeout(`${baseURL}/v1/messages`, {
+      const res = await fetchRetry(`${baseURL}/v1/messages`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -264,13 +273,19 @@ export function createCompleteFn(
           system,
           messages: [{ role: "user", content: user }],
         }),
-      }, timeoutMs);
+      }, 3, timeoutMs);
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         throw new Error(`[graph-memory] Anthropic API ${res.status}: ${errText.slice(0, 200)}`);
       }
       const data = await res.json() as any;
-      const text = data.content?.[0]?.text;
+      // 遍历 content 找 text 块：只看 content[0] 时，thinking 块在前会误报 empty content
+      const text = Array.isArray(data.content)
+        ? data.content
+            .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+            .map((b: any) => b.text)
+            .join("")
+        : "";
       if (text) return text;
       const stop = data.choices?.[0]?.finish_reason ?? data.stop_reason;
       throw new Error(
@@ -288,7 +303,7 @@ export function createCompleteFn(
       );
     }
     const url = `${baseURL.replace(/\/+$/, "")}/chat/completions`;
-    const res = await fetchWithTimeout(url, {
+    const res = await fetchRetry(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -303,7 +318,7 @@ export function createCompleteFn(
         max_tokens: maxTokens,
         temperature: 0.1,
       }),
-    }, timeoutMs);
+    }, 3, timeoutMs);
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
       throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, 200)}`);

@@ -117,13 +117,15 @@ export async function assembleContext(
     selectedIds.has(e.fromId) && selectedIds.has(e.toId) && !seen.has(e.id) && seen.add(e.id)
   );
 
-  // 预加载所有需要的社区摘要
-  const communityIds = new Set(selected.map(n => n.communityId).filter(Boolean) as string[]);
+  // 预加载所有需要的社区摘要（并发拉取，避免逐个 await 的串行往返）
+  const communityIds = Array.from(new Set(selected.map(n => n.communityId).filter(Boolean) as string[]));
+  const summaries = await Promise.all(
+    communityIds.map(cid => getCommunitySummary(driver, cid)),
+  );
   const communitySummaries = new Map<string, CommunitySummary>();
-  for (const cid of communityIds) {
-    const summary = await getCommunitySummary(driver, cid);
-    if (summary) communitySummaries.set(cid, summary);
-  }
+  communityIds.forEach((cid, i) => {
+    if (summaries[i]) communitySummaries.set(cid, summaries[i]!);
+  });
 
   // 按社区分组
   const byCommunity = new Map<string, typeof selected>();

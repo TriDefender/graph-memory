@@ -1,23 +1,19 @@
 /**
  * graph-memory-pro — Neo4j 连接管理（加固版）
  *
- * 解决 "Pool is closed" 问题：
  * - driver 是长生命周期单例，不在 dispose 时关闭
- * - getSession 在 driver 被意外关闭时自动重建
+ * - getSession 永远优先模块级单例（见函数注释）
  */
 
 import neo4j, { type Driver, type Session } from "neo4j-driver";
 import type { EmbeddingConfig, Neo4jConfig } from "../types.ts";
 
 let _driver: Driver | null = null;
-let _cfg: Neo4jConfig | null = null;
 
 /**
  * 获取 Neo4j Driver 单例
- * 保存配置，支持自动重连
  */
 export function getDriver(cfg: Neo4jConfig): Driver {
-  _cfg = cfg;
   if (_driver) return _driver;
   _driver = neo4j.driver(cfg.uri, neo4j.auth.basic(cfg.user, cfg.password), {
     maxConnectionPoolSize: 50,
@@ -30,25 +26,16 @@ export function getDriver(cfg: Neo4jConfig): Driver {
 
 /**
  * 获取一个 Session（用完必须 close）
- * 如果 driver 被关闭了，自动用保存的配置重建
+ *
+ * 永远优先模块级 _driver 单例：调用方（register() 启动时捕获一次并四处传递）
+ * 持有的旧引用在单例重建后会指向已关闭的池。入参仅作 getDriver 未初始化时
+ * 的回退兼容。
+ * 注：neo4j-driver 5.x 的 driver.session() 构造阶段不抛错，"Pool is closed"
+ * 在 session.run() 才报——掉线恢复由 gate 熔断 + 驱动自身连接池重连负责，
+ * 这里不做（也做不了）session 级重连。
  */
-export function getSession(driver: Driver): Session {
-  try {
-    return driver.session({ database: "neo4j" });
-  } catch (err) {
-    // Pool is closed — 尝试重建 driver
-    if (_cfg && String(err).includes("closed")) {
-      console.log("[graph-memory-pro] reconnecting Neo4j driver...");
-      _driver = neo4j.driver(_cfg.uri, neo4j.auth.basic(_cfg.user, _cfg.password), {
-        maxConnectionPoolSize: 50,
-        // 与 getDriver 保持一致：快速失败，让熔断门控尽早接手
-        connectionAcquisitionTimeout: 15_000,
-        maxTransactionRetryTime: 10_000,
-      });
-      return _driver.session({ database: "neo4j" });
-    }
-    throw err;
-  }
+export function getSession(passedDriver: Driver): Session {
+  return (_driver ?? passedDriver).session({ database: "neo4j" });
 }
 
 /**

@@ -155,7 +155,6 @@ export async function summarizeCommunities(
   llm: CompleteFn,
   embedFn?: EmbedFn,
 ): Promise<number> {
-  await pruneCommunitySummaries(driver);
   let generated = 0;
 
   for (const [communityId, memberIds] of communities) {
@@ -233,10 +232,15 @@ export async function summarizeCommunities(
 
       await upsertCommunitySummary(driver, communityId, cleaned, memberIds.length, embedding, memberSignature);
       generated++;
-    } catch (err) {
-      console.log(`  [WARN] community summary failed for ${communityId}: ${err}`);
+    } catch {
+      // 单社区摘要失败静默跳过（与 syncEmbed 的吞错策略一致）——库代码不直接写 stdout
     }
   }
+
+  // prune 必须在复用查找之后：detectCommunities 每轮按成员数重编号 c-1..c-N，
+  // 旧 id 社区（summary/memberSignature/embedding 的持有者）在新编号下"无人引用"，
+  // 先 prune 会把捐赠者删掉，签名复用永远不生效 → 每轮维护全量重算 LLM 摘要。
+  await pruneCommunitySummaries(driver);
 
   return generated;
 }

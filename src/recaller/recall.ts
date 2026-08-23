@@ -98,8 +98,17 @@ export class Recaller {
     const limit = this.cfg.recallMaxNodes;
     const timeRange = options ? parseTimeRange(options) : null;
 
-    const precise = await this.recallPrecise(query, limit, timeRange);
-    const generalized = await this.recallGeneralized(query, limit, timeRange);
+    // query 向量只算一次，两条路径共享；失败统一落 null（各路径走文本兜底）。
+    // 双路径并行执行 —— 原串行 + 各自 embed 会把 2 次调用放大成 4 次 API 调用
+    // 与 4 次图遍历，全部压在调用方的预算窗口内。
+    const embedPromise: Promise<number[] | null> = this.embed
+      ? this.embed(query, "query").catch(() => null)
+      : Promise.resolve(null);
+
+    const [precise, generalized] = await Promise.all([
+      this.recallPrecise(query, limit, timeRange, embedPromise),
+      this.recallGeneralized(limit, timeRange, embedPromise),
+    ]);
     const merged = this.mergeResults(precise, generalized);
 
     return merged;
@@ -112,12 +121,13 @@ export class Recaller {
     query: string,
     limit: number,
     timeRange: ParsedTimeRange | null,
+    embedPromise: Promise<number[] | null>,
   ): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
-    if (this.embed) {
+    const vec = await embedPromise;
+    if (vec) {
       try {
-        const vec = await this.embed(query, "query");
         const scored = await vectorSearchWithScore(this.driver, vec, Math.ceil(limit / 2));
         seeds = scored.map(s => s.node);
 
@@ -180,15 +190,15 @@ export class Recaller {
    * 泛化召回：社区向量搜索 → 图遍历 → PPR 排序
    */
   private async recallGeneralized(
-    query: string,
     limit: number,
     timeRange: ParsedTimeRange | null,
+    embedPromise: Promise<number[] | null>,
   ): Promise<RecallResult> {
     let seeds: GmNode[] = [];
 
-    if (this.embed) {
+    const vec = await embedPromise;
+    if (vec) {
       try {
-        const vec = await this.embed(query, "query");
         const scoredCommunities = await communityVectorSearch(this.driver, vec);
 
         if (scoredCommunities.length > 0) {

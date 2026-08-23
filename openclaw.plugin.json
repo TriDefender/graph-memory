@@ -23,9 +23,9 @@
         }
       },
       "compactTurnCount": { "type": "number", "default": 6 },
-      "recallMaxNodes": { "type": "number", "default": 3 },
+      "recallMaxNodes": { "type": "number", "default": 6 },
       "recallMaxDepth": { "type": "number", "default": 2 },
-      "freshTailCount": { "type": "number", "default": 10 },
+      "freshTailCount": { "type": "number", "default": 5, "description": "assemble 转录保留的最近轮数（裁剪窗口）" },
       "dedupThreshold": { "type": "number", "default": 0.90 },
       "pagerankDamping": { "type": "number", "default": 0.85 },
       "pagerankIterations": { "type": "number", "default": 20 },

@@ -14,7 +14,7 @@ import {
   markExtracted, isTurnExtracted,
   upsertNode, upsertEdge, findByName, updateNode,
   deleteNode, deprecateNodeAndDisconnect,
-  getBySession, edgesFrom, edgesTo,
+  getBySession, edgesTouching,
   deleteEdges, mergeNodes,
   deprecate, getStats,
 } from "./src/store/store.ts";
@@ -173,17 +173,18 @@ export function extractUserText(msg: any): string {
 
 export function sliceLastTurn(
   messages: any[],
+  keepTurns: number = KEEP_TURNS,
 ): { messages: any[]; tokens: number; dropped: number } {
   if (!messages.length) {
     return { messages: [], tokens: 0, dropped: 0 };
   }
 
-  // 找到最近 N 个 user 消息的位置
+  // 找到最近 N 个 user 消息的位置（N = keepTurns，由 cfg.freshTailCount 注入）
   const userIndices: number[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
       userIndices.push(i);
-      if (userIndices.length >= KEEP_TURNS) break;
+      if (userIndices.length >= keepTurns) break;
     }
   }
   if (!userIndices.length) {
@@ -232,8 +233,9 @@ export function sliceLastTurn(
 /** 图谱为空时也必须执行相同的裁剪、工具配对修复和 content 规范化。 */
 export function prepareAssemblyMessages(
   messages: any[],
+  keepTurns: number = KEEP_TURNS,
 ): { messages: any[]; tokens: number; dropped: number } {
-  const sliced = sliceLastTurn(messages);
+  const sliced = sliceLastTurn(messages, keepTurns);
   return {
     messages: normalizeMessageContent(sanitizeToolUseResultPairing(sliced.messages)),
     tokens: sliced.tokens,
@@ -450,6 +452,8 @@ const graphMemoryProPlugin = {
     const msgSeq = new Map<string, number>();
     const msgSeqLoaders = new Map<string, Promise<number>>();
     const recalled = new Map<string, RecallResult>();
+    // recalled 结果对应的 recall prompt（assemble 复用缓存判定用；继承路径不写，查不到则照常新鲜召回）
+    const recalledPrompt = new Map<string, string>();
     const sessionIdsByKey = new Map<string, string>();
     const pendingSubagentRecall = new Map<string, RecallResult>();
     const ingestedSinceTurn = new Map<string, number>();
@@ -539,6 +543,9 @@ const graphMemoryProPlugin = {
           }
           if (flushed > 0) {
             api.logger.info(`[graph-memory-pro] flushed ${flushed} buffered message(s) to neo4j`);
+            // 补偿掉线期间被熔断跳过的维护：缓冲消息已补录，趁 gate 可用重排一轮
+            // （scheduleMaintenance 自带单飞 + gate 检查，无会话时它是安全的 no-op 调用）
+            scheduleMaintenance();
           }
         } finally {
           flushRun = null;
@@ -572,6 +579,14 @@ const graphMemoryProPlugin = {
 
     const RECALL_BUDGET_MS = 5_000;
 
+    // 超时退避：withBudget 只放弃等待、不取消底层查询，反复超时会在后台堆积
+    // 占连接的 Neo4j 查询链；冷却窗口内跳过新 recall，直接走缓存/降级。
+    const RECALL_BACKOFF_MS = 30_000;
+    let recallBackoffUntil = 0;
+    function markRecallBackoffOnTimeout(err: unknown): void {
+      if (String(err).includes("timed out")) recallBackoffUntil = Date.now() + RECALL_BACKOFF_MS;
+    }
+
     /**
      * 给 Promise 加等待上限。不取消底层操作（Neo4j 查询会在后台自然完成、
      * 连接归还连接池），只是放弃等待 —— 慢 != 死。
@@ -591,25 +606,34 @@ const graphMemoryProPlugin = {
     // 全局单飞修掉多会话并发跑维护的竞态；运行期间的再次请求只标记 rerun，
     // 当前一轮结束后最多补跑一次（覆盖"最后一个结束的会话"）。
 
-    let maintenanceRun: Promise<void> | null = null;
+    let maintenanceRun: Promise<Awaited<ReturnType<typeof runMaintenance>> | { skipped: string } | { failed: string }> | null = null;
     let maintenanceRerunRequested = false;
 
-    function scheduleMaintenance(): void {
+    /**
+     * 唯一的维护入口（session_end 与 gm_maintain 共用）：
+     * - 在跑 → 标记 rerun（保留 session_end 的 trailing 补跑语义）并 join
+     *   同一个 in-flight promise（gm_maintain 据此拿到结果而非并发裸跑）
+     * - gate 打开（熔断）→ 返回 skipped 标记，不触碰数据库
+     * - 空闲 → 自己成为那一轮
+     * 并发跑两条维护链会导致 dedup 双计 validatedCount、communityId 互相覆盖。
+     */
+    function scheduleMaintenance(): Promise<Awaited<ReturnType<typeof runMaintenance>> | { skipped: string } | { failed: string }> {
       if (!neo4jGate.isAvailable()) {
         api.logger.info("[graph-memory-pro] maintenance skipped: neo4j unavailable (circuit open)");
-        return;
+        return Promise.resolve({ skipped: "neo4j unavailable (circuit open)" });
       }
       if (maintenanceRun) {
         maintenanceRerunRequested = true;
-        api.logger.info("[graph-memory-pro] maintenance already running, rerun queued");
-        return;
+        api.logger.info("[graph-memory-pro] maintenance already running, rerun queued + joining in-flight run");
+        return maintenanceRun;
       }
       maintenanceRun = (async () => {
         try {
+          let result: Awaited<ReturnType<typeof runMaintenance>>;
           do {
             maintenanceRerunRequested = false;
             const embedFn = recaller.embedFn ?? undefined;
-            const result = await runMaintenance(driver, cfg, llm, embedFn);
+            result = await runMaintenance(driver, cfg, llm, embedFn);
             neo4jGate.recordSuccess();
             api.logger.info(
               `[graph-memory-pro] maintenance: ${result.durationMs}ms, ` +
@@ -618,14 +642,17 @@ const graphMemoryProPlugin = {
               `top_pr=${result.pagerank.topK.slice(0, 3).map(n => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
             );
           } while (maintenanceRerunRequested && neo4jGate.isAvailable());
+          return result;
         } catch (err) {
           neo4jGate.recordFailure();
           api.logger.error(`[graph-memory-pro] maintenance failed: ${err}`);
+          return { failed: String(err) };
         } finally {
           maintenanceRun = null;
           maintenanceRerunRequested = false;
         }
       })();
+      return maintenanceRun;
     }
 
     // ── embedding 会话级 re-probe ──────────────────────────
@@ -663,6 +690,8 @@ const graphMemoryProPlugin = {
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
         // 熔断开启时跳过召回 —— assemble 也会走降级路径（仅转录文本）
         if (!neo4jGate.isAvailable()) return;
+        // 超时冷却窗口内跳过（后台可能仍有在途查询，不再叠加）
+        if (Date.now() < recallBackoffUntil) return;
 
         api.logger.info(`[graph-memory-pro] recall query: "${prompt.slice(0, 80)}"`);
 
@@ -673,10 +702,12 @@ const graphMemoryProPlugin = {
           if (sessionId) {
             bindSessionIdentity(sessionId, sessionKey);
             recalled.set(sessionId, res);
+            recalledPrompt.set(sessionId, prompt);
           }
           api.logger.info(`[graph-memory-pro] recalled ${res.nodes.length} nodes, ${res.edges.length} edges`);
         }
       } catch (err) {
+        markRecallBackoffOnTimeout(err);
         api.logger.warn(`[graph-memory-pro] recall failed: ${err}`);
       }
     });
@@ -717,7 +748,7 @@ const graphMemoryProPlugin = {
 
         // cron session 关闭图谱功能：仅做消息裁剪与配对修复，不注入图谱上下文
         if (isCronSessionKey(sessionKey) && !cronCfg.enabled) {
-          const prepared = prepareAssemblyMessages(messages);
+          const prepared = prepareAssemblyMessages(messages, cfg.freshTailCount);
           if (prepared.dropped > 0) {
             api.logger.info(
               `[graph-memory-pro] assemble: ${prepared.messages.length} msgs (~${prepared.tokens} tok), ` +
@@ -730,23 +761,25 @@ const graphMemoryProPlugin = {
           };
         }
 
-        // prompt-aware recall：优先用当前 prompt 做新鲜召回，回退到 before_agent_start 缓存
+        // prompt-aware recall：clean 后的 prompt 与缓存命中同一查询时直接复用
+        // before_agent_start 的结果，只有变化才发起第二次召回
         let rec = recalled.get(sessionId) ?? { nodes: [], edges: [] };
-        if (prompt && neo4jGate.isAvailable()) {
-          const cleaned = cleanPrompt(prompt);
-          if (cleaned) {
-            try {
-              const freshRec = await withBudget(recaller.recall(cleaned), RECALL_BUDGET_MS, "[graph-memory-pro] assemble recall");
-              if (freshRec.nodes.length) {
-                rec = freshRec;
-                recalled.set(sessionId, freshRec);
-              }
-            } catch (err) {
-              api.logger.warn(`[graph-memory-pro] assemble recall failed: ${err}`);
+        const cachedPrompt = recalledPrompt.get(sessionId);
+        const cleanedPrompt = prompt ? cleanPrompt(prompt) : "";
+        if (cleanedPrompt && neo4jGate.isAvailable() && Date.now() >= recallBackoffUntil && cleanedPrompt !== cachedPrompt) {
+          try {
+            const freshRec = await withBudget(recaller.recall(cleanedPrompt), RECALL_BUDGET_MS, "[graph-memory-pro] assemble recall");
+            if (freshRec.nodes.length) {
+              rec = freshRec;
+              recalled.set(sessionId, freshRec);
+              recalledPrompt.set(sessionId, cleanedPrompt);
             }
+          } catch (err) {
+            markRecallBackoffOnTimeout(err);
+            api.logger.warn(`[graph-memory-pro] assemble recall failed: ${err}`);
           }
         }
-        const prepared = prepareAssemblyMessages(messages);
+        const prepared = prepareAssemblyMessages(messages, cfg.freshTailCount);
 
         // 图谱段：门控 + 降级 —— Neo4j 掉线/超时时只返回裁剪后的转录，
         // 不让错误抛回 host（原实现无 catch，getBySession 失败会炸掉 assemble）
@@ -755,11 +788,8 @@ const graphMemoryProPlugin = {
         if (neo4jGate.isAvailable()) {
           try {
             const activeNodes = await getBySession(driver, sessionId);
-            const activeEdges: any[] = [];
-            for (const n of activeNodes) {
-              activeEdges.push(...await edgesFrom(driver, n.id));
-              activeEdges.push(...await edgesTo(driver, n.id));
-            }
+            // 单次批量查询替代逐节点 edgesFrom+edgesTo 的 2N 次串行往返
+            const activeEdges = await edgesTouching(driver, activeNodes.map(n => n.id));
 
             if (activeNodes.length + rec.nodes.length > 0) {
               const { xml, systemPrompt, tokens } = await assembleContext(driver, {
@@ -925,6 +955,7 @@ const graphMemoryProPlugin = {
         const childSessionId = sessionIdsByKey.get(childSessionKey);
         if (childSessionId) {
           recalled.delete(childSessionId);
+          recalledPrompt.delete(childSessionId);
           msgSeq.delete(childSessionId);
           msgSeqLoaders.delete(childSessionId);
           extractLocks.delete(childSessionId);
@@ -939,6 +970,7 @@ const graphMemoryProPlugin = {
         msgSeqLoaders.clear();
         extractLocks.clear();
         recalled.clear();
+        recalledPrompt.clear();
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
         ingestedSinceTurn.clear();
@@ -983,43 +1015,47 @@ const graphMemoryProPlugin = {
           return;
         }
         if (nodes.length) {
-          // 获取图谱摘要
-          const session = getSession(driver);
-          let summary = "";
-          try {
-            const summaryResult = await session.run(`
-              MATCH (n:Task|Skill|Event {status: 'active'})
-              RETURN n.name AS name, n.type AS type, n.validatedCount AS vc, n.pagerank AS pr
-              ORDER BY n.pagerank DESC LIMIT 20
-            `);
-            summary = summaryResult.records
-              .map(r => `${r.get("type")}:${r.get("name")}(v${r.get("vc")},pr${(r.get("pr") ?? 0).toFixed?.(3) ?? "0"})`)
-              .join(", ");
-          } finally {
-            await session.close();
-          }
-
-          const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
-
-          for (const nc of fin.promotedSkills) {
-            if (nc.name && nc.content) {
-              await upsertNode(driver, {
-                type: "SKILL", name: nc.name,
-                description: nc.description ?? "", content: nc.content,
-              }, sid);
+          // finalize 的 upsert 与 afterTurn/compact 的提取共用 per-session 互斥锁：
+          // 最后一轮的 afterTurn 提取可能仍在途，不串行化会重复 upsert（validatedCount 双递增）
+          await withExtractLock(sid, async () => {
+            // 获取图谱摘要
+            const session = getSession(driver);
+            let summary = "";
+            try {
+              const summaryResult = await session.run(`
+                MATCH (n:Task|Skill|Event {status: 'active'})
+                RETURN n.name AS name, n.type AS type, n.validatedCount AS vc, n.pagerank AS pr
+                ORDER BY n.pagerank DESC LIMIT 20
+              `);
+              summary = summaryResult.records
+                .map(r => `${r.get("type")}:${r.get("name")}(v${r.get("vc")},pr${(r.get("pr") ?? 0).toFixed?.(3) ?? "0"})`)
+                .join(", ");
+            } finally {
+              await session.close();
             }
-          }
-          for (const ec of fin.newEdges) {
-            const fromNode = await findByName(driver, ec.from);
-            const toNode = await findByName(driver, ec.to);
-            if (fromNode && toNode) {
-              await upsertEdge(driver, {
-                fromId: fromNode.id, toId: toNode.id, type: ec.type,
-                instruction: ec.instruction, sessionId: sid,
-              });
+
+            const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
+
+            for (const nc of fin.promotedSkills) {
+              if (nc.name && nc.content) {
+                await upsertNode(driver, {
+                  type: "SKILL", name: nc.name,
+                  description: nc.description ?? "", content: nc.content,
+                }, sid);
+              }
             }
-          }
-          for (const id of fin.invalidations) await deprecate(driver, id);
+            for (const ec of fin.newEdges) {
+              const fromNode = await findByName(driver, ec.from);
+              const toNode = await findByName(driver, ec.to);
+              if (fromNode && toNode) {
+                await upsertEdge(driver, {
+                  fromId: fromNode.id, toId: toNode.id, type: ec.type,
+                  instruction: ec.instruction, sessionId: sid,
+                });
+              }
+            }
+            for (const id of fin.invalidations) await deprecate(driver, id);
+          });
         }
 
         // 图维护：后台单飞（A1）—— 衰减→去重→PR→社区→LLM 摘要可能耗时数分钟，
@@ -1032,6 +1068,7 @@ const graphMemoryProPlugin = {
         msgSeqLoaders.delete(sid);
         extractLocks.delete(sid);
         recalled.delete(sid);
+        recalledPrompt.delete(sid);
         ingestedSinceTurn.delete(sid);
         if (sessionKey && sessionIdsByKey.get(sessionKey) === sid) {
           sessionIdsByKey.delete(sessionKey);
@@ -1123,7 +1160,8 @@ const graphMemoryProPlugin = {
           relatedSkill: Type.Optional(Type.String({ description: "关联的已有技能名" })),
         }),
         async execute(_toolCallId: string, p: any) {
-          const sid = ctx?.sessionKey ?? ctx?.sessionId ?? "manual";
+          // 溯源统一用 sessionId（与 getBySession 的会话视图对齐）；无会话上下文才落 "manual"
+          const sid = ctx?.sessionId ?? "manual";
           if (!["TASK", "SKILL", "EVENT"].includes(p.type)) {
             throw new Error(`[graph-memory-pro] 无效节点类型：${String(p.type)}`);
           }
@@ -1257,7 +1295,7 @@ const graphMemoryProPlugin = {
     );
 
     api.registerTool(
-      (_ctx: any) => ({
+      (ctx: any) => ({
         name: "gm_link",
         label: "Link Graph Memory Nodes",
         description:
@@ -1282,7 +1320,7 @@ const graphMemoryProPlugin = {
 
           const stored = await upsertEdge(driver, {
             fromId: fromNode.id, toId: toNode.id, type: p.type,
-            instruction: p.instruction, condition: p.condition, sessionId: "manual",
+            instruction: p.instruction, condition: p.condition, sessionId: ctx?.sessionId ?? "manual",
           });
           if (!stored) {
             throw new Error(
@@ -1448,8 +1486,16 @@ const graphMemoryProPlugin = {
         description: "手动触发图维护：衰减评分 + tier 转换、去重、PageRank、社区检测。",
         parameters: Type.Object({}),
         async execute() {
-          const embedFn = recaller.embedFn ?? undefined;
-          const result = await runMaintenance(driver, cfg, llm, embedFn);
+          // 走 scheduleMaintenance 单飞入口：后台维护在跑时 join 而非并发裸跑
+          // （并发会导致 dedup 双计 validatedCount、communityId 互相覆盖）
+          const result = await scheduleMaintenance();
+          if (!("decay" in result)) {
+            const reason = "skipped" in result ? result.skipped : result.failed;
+            return {
+              content: [{ type: "text", text: `⚠️ 图维护未完成：${reason}` }],
+              details: result,
+            };
+          }
           const t = result.decay.tierTransitions;
           const totalTransitions = t.coreToWorking + t.workingToPeripheral + t.peripheralToWorking + t.workingToCore;
           const text = [

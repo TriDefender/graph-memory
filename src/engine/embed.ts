@@ -128,8 +128,8 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
     return async (text: string, mode: EmbedMode = "db"): Promise<number[]> => {
       return callEmbedding(text.slice(0, 8000), mode);
     };
-  } catch (err) {
-    console.error(`[graph-memory-pro] embedding probe failed:`, err);
+  } catch {
+    // probe 失败返回 null（调用方日志已有 "text search mode" 降级提示），不在库代码里写 stdout
     return null;
   }
 }

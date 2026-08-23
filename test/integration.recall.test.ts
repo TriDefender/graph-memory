@@ -17,6 +17,7 @@ import { Recaller, buildNodeEmbeddingText } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "../src/types.ts";
 
 const ENABLED = !!process.env.NEO4J_INTEGRATION;
+const NEO4J_URI = process.env.NEO4J_TEST_URI ?? "bolt://localhost:7687";
 
 let driver: Driver;
 const TEST_SID = `recall-${Date.now()}`;
@@ -24,7 +25,7 @@ const cfg: GmConfig = { ...DEFAULT_CONFIG, recallMaxNodes: 5, recallMaxDepth: 2 
 
 describe.skipIf(!ENABLED)("Recaller integration", () => {
   beforeAll(async () => {
-    driver = getDriver({ uri: "bolt://localhost:7687", user: "neo4j", password: "graphmemory" });
+    driver = getDriver({ uri: NEO4J_URI, user: "neo4j", password: "graphmemory" });
     await initSchema(driver);
 
     // 构造可被关键词召回的图

@@ -65,7 +65,7 @@ export const EDGE_TYPES = [
 
 export type EdgeType = (typeof EDGE_TYPES)[number];
 
-const EDGE_DIRECTION_RULES: Record<EdgeType, {
+export const EDGE_DIRECTION_RULES: Record<EdgeType, {
   from: readonly NodeType[];
   to: readonly NodeType[];
 }> = {
@@ -214,6 +214,7 @@ export interface GmConfig {
   compactTurnCount: number;
   recallMaxNodes: number;
   recallMaxDepth: number;
+  /** assemble 保留的最近轮数（裁剪窗口）；默认 5，与 sliceLastTurn 的回退值一致。 */
   freshTailCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
@@ -247,7 +248,7 @@ export const DEFAULT_CONFIG: GmConfig = {
   compactTurnCount: 6,
   recallMaxNodes: 6,
   recallMaxDepth: 2,
-  freshTailCount: 10,
+  freshTailCount: 5,
   dedupThreshold: 0.90,
   pagerankDamping: 0.85,
   pagerankIterations: 20,

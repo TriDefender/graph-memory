@@ -44,6 +44,7 @@ vi.mock("../src/store/store.ts", () => ({
   getBySession: mocks.getBySession,
   edgesFrom: async () => [],
   edgesTo: async () => [],
+  edgesTouching: async () => [],
   deprecate: async () => {},
   getStats: async () => ({}),
 }));

@@ -9,7 +9,7 @@ import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { createHash } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType, NodeTier } from "../types.ts";
-import { NODE_TYPE_TO_LABEL, isValidEdgeDirection } from "../types.ts";
+import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_TYPES } from "../types.ts";
 import { getSession } from "./db.ts";
 
 /** Neo4j LIMIT/索引参数必须是 Integer */
@@ -141,6 +141,12 @@ export async function allEdges(driver: Driver): Promise<GmEdge[]> {
   }
 }
 
+/** 判断错误是否为 *_name 唯一约束冲突（CREATE 撞上并发创建时用于幂等回退） */
+function isNameConstraintViolation(err: unknown): boolean {
+  const s = String(err);
+  return s.includes("ConstraintValidationFailed") || s.includes("already exists with label");
+}
+
 export async function upsertNode(
   driver: Driver,
   c: { type: NodeType; name: string; description: string; content: string },
@@ -150,6 +156,35 @@ export async function upsertNode(
   const label = NODE_TYPE_TO_LABEL[c.type as NodeType];
   if (!label) throw new Error(`[graph-memory-pro] Invalid node type: ${String(c.type)}`);
   const session = getSession(driver);
+  /** 按 name 更新已存在节点（find 命中与撞约束回退两条路径共用） */
+  const updateExisting = async (): Promise<{ node: GmNode; isNew: boolean }> => {
+    await session.run(`
+      MATCH (n:Task|Skill|Event {name: $name})
+      SET n.content = CASE WHEN size($content) > size(n.content) THEN $content ELSE n.content END,
+          n.description = CASE WHEN size($description) > size(n.description) THEN $description ELSE n.description END,
+          n.validatedCount = n.validatedCount + 1,
+          n.sourceSessions = CASE
+            WHEN NOT $sessionId IN n.sourceSessions
+            THEN n.sourceSessions + $sessionId
+            ELSE n.sourceSessions
+          END,
+          n.lastAccessedAt = $now,
+          n.updatedAt = $now
+      RETURN n
+    `, { name, content: c.content, description: c.description, sessionId, now: Date.now() });
+
+    const updated = await session.run(
+      "MATCH (n:Task|Skill|Event {name: $name}) RETURN n",
+      { name },
+    );
+    // 撞约束回退路径存在窄窗口：并发创建的同名节点可能在 MATCH 前被删除
+    //（如 maintenance mergeNodes）——守卫让单个节点失败而不是 TypeError 炸整批
+    const record = updated.records[0]?.get("n");
+    if (!record) {
+      throw new Error(`[graph-memory-pro] upsertNode: node "${name}" disappeared during update`);
+    }
+    return { node: toNode(record), isNew: false };
+  };
   try {
     // Try to find existing node with this name across all knowledge labels
     const existing = await session.run(
@@ -158,29 +193,12 @@ export async function upsertNode(
     );
 
     if (existing.records.length > 0) {
-      // Update existing node
-      await session.run(`
-        MATCH (n:Task|Skill|Event {name: $name})
-        SET n.content = CASE WHEN size($content) > size(n.content) THEN $content ELSE n.content END,
-            n.description = CASE WHEN size($description) > size(n.description) THEN $description ELSE n.description END,
-            n.validatedCount = n.validatedCount + 1,
-            n.sourceSessions = CASE
-              WHEN NOT $sessionId IN n.sourceSessions
-              THEN n.sourceSessions + $sessionId
-              ELSE n.sourceSessions
-            END,
-            n.lastAccessedAt = $now,
-            n.updatedAt = $now
-        RETURN n
-      `, { name, content: c.content, description: c.description, sessionId, now: Date.now() });
-
-      const updated = await session.run(
-        "MATCH (n:Task|Skill|Event {name: $name}) RETURN n",
-        { name },
-      );
-      return { node: toNode(updated.records[0].get("n")), isNew: false };
-    } else {
-      // Create new node with specific label
+      // 必须 return await：否则 finally 的 session.close() 会与闭包内的
+      // 第二次 session.run 竞态（closed session 错误）
+      return await updateExisting();
+    }
+    // Create new node with specific label
+    try {
       const now = Date.now();
       const result = await session.run(`
         CREATE (n:MemoryNode:${label} {
@@ -198,6 +216,11 @@ export async function upsertNode(
         sessions: [sessionId], now,
       });
       return { node: toNode(result.records[0].get("n")), isNew: true };
+    } catch (err) {
+      // find-then-create 窗口内并发路径抢先创建了同名节点（撞 *_name 唯一约束）
+      // → 退回更新路径保持幂等，而不是让整轮提取失败重试
+      if (isNameConstraintViolation(err)) return await updateExisting();
+      throw err;
     }
   } finally {
     await session.close();
@@ -458,42 +481,25 @@ export async function upsertEdge(
     const toType = endpoints.records[0].get("toType");
     if (!isValidEdgeDirection(e.type, fromType, toType)) return false;
 
-    // 检查是否已存在同 from+to+type 的边
-    const existing = await session.run(`
-      MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
-      WHERE type(r) = $type
-      RETURN r
-    `, { fromId: e.fromId, toId: e.toId, type: e.type });
-
-    if (existing.records.length > 0) {
-      await session.run(`
-        MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
-        WHERE type(r) = $type
-        SET r.instruction = $instruction
-      `, { fromId: e.fromId, toId: e.toId, type: e.type, instruction: e.instruction });
-    } else {
-      // 用 APOC 动态创建关系（type 是变量）
-      await session.run(`
-        MATCH (a:Task|Skill|Event {id: $fromId}), (b:Task|Skill|Event {id: $toId})
-        CALL apoc.create.relationship(a, $type, {
-          id: $id,
-          instruction: $instruction,
-          condition: $condition,
-          sessionId: $sessionId,
-          createdAt: $now
-        }, b) YIELD rel
-        RETURN rel
-      `, {
-        fromId: e.fromId,
-        toId: e.toId,
-        type: e.type,
-        id: uid("e"),
-        instruction: e.instruction,
-        condition: e.condition ?? null,
-        sessionId: e.sessionId,
-        now: Date.now(),
-      });
-    }
+    // MERGE 语义：查重 + 创建/更新合并为单条原子语句，消除并发下绕过查重产生重复边的窗口。
+    // onCreate 写入全部属性；onMatch 仅刷新 instruction（与原查重-更新分支行为一致）。
+    await session.run(`
+      MATCH (a:Task|Skill|Event {id: $fromId}), (b:Task|Skill|Event {id: $toId})
+      CALL apoc.merge.relationship(a, $type, {}, {
+        id: $id, instruction: $instruction, condition: $condition,
+        sessionId: $sessionId, createdAt: $now
+      }, b, { instruction: $instruction }) YIELD rel
+      RETURN rel
+    `, {
+      fromId: e.fromId,
+      toId: e.toId,
+      type: e.type,
+      id: uid("e"),
+      instruction: e.instruction,
+      condition: e.condition ?? null,
+      sessionId: e.sessionId,
+      now: Date.now(),
+    });
     return true;
   } finally {
     await session.close();
@@ -535,6 +541,34 @@ export async function edgesTo(driver: Driver, id: string): Promise<GmEdge[]> {
              r.instruction AS instruction, r.condition AS condition,
              r.sessionId AS sessionId, r.createdAt AS createdAt
     `, { id });
+    return result.records.map(r => ({
+      id: r.get("id"),
+      fromId: r.get("fromId"),
+      toId: r.get("toId"),
+      type: r.get("type") as EdgeType,
+      instruction: r.get("instruction"),
+      condition: r.get("condition") ?? undefined,
+      sessionId: r.get("sessionId"),
+      createdAt: toInt(r.get("createdAt")),
+    }));
+  } finally {
+    await session.close();
+  }
+}
+
+/** 批量查询至少一端在 ids 内的知识边 —— 一次往返替代逐节点 edgesFrom+edgesTo 的 2N 次往返。 */
+export async function edgesTouching(driver: Driver, ids: string[]): Promise<GmEdge[]> {
+  if (!ids.length) return [];
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      MATCH (a:Task|Skill|Event)-[r]->(b:Task|Skill|Event)
+      WHERE (a.id IN $ids OR b.id IN $ids)
+        AND type(r) IN ${JSON.stringify([...EDGE_TYPES])}
+      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
+             r.instruction AS instruction, r.condition AS condition,
+             r.sessionId AS sessionId, r.createdAt AS createdAt
+    `, { ids });
     return result.records.map(r => ({
       id: r.get("id"),
       fromId: r.get("fromId"),
@@ -743,6 +777,10 @@ export async function graphWalk(
 ): Promise<{ nodes: GmNode[]; edges: GmEdge[] }> {
   if (!seedIds.length) return { nodes: [], edges: [] };
 
+  // maxDepth 来自配置且直接内插进 Cypher —— clamp 到 [1,4]，非法值只会得到安全深度而非语法错误
+  const parsedDepth = Number(maxDepth);
+  const depth = Math.max(1, Math.min(4, Number.isFinite(parsedDepth) ? Math.floor(parsedDepth) : 2));
+
   const session = getSession(driver);
   try {
     // 用 Neo4j 的变长路径匹配做图遍历
@@ -751,7 +789,7 @@ export async function graphWalk(
       WHERE seed.id IN $seedIds AND seed.status = 'active'
       CALL {
         WITH seed
-        MATCH path = (seed)-[*0..${maxDepth}]-(neighbor:Task|Skill|Event {status: 'active'})
+        MATCH path = (seed)-[*0..${depth}]-(neighbor:Task|Skill|Event {status: 'active'})
         WHERE all(node IN nodes(path) WHERE node.status = 'active')
         RETURN DISTINCT neighbor
       }
@@ -807,7 +845,16 @@ export async function getBySession(driver: Driver, sessionId: string): Promise<G
 
 // ─── 社区代表节点 ──────────────────────────────────────────
 
-export async function communityRepresentatives(driver: Driver, perCommunity = 2): Promise<GmNode[]> {
+/**
+ * 每社区取最近更新的 perCommunity 个代表节点。
+ * totalLimit 封顶总返回数（按社区规模降序截断）—— recall 兜底路径用它做
+ * graphWalk 种子，社区很多时无上限种子会把遍历放大成全图扫描。
+ */
+export async function communityRepresentatives(
+  driver: Driver,
+  perCommunity = 2,
+  totalLimit = 20,
+): Promise<GmNode[]> {
   const session = getSession(driver);
   try {
     const result = await session.run(`
@@ -816,9 +863,11 @@ export async function communityRepresentatives(driver: Driver, perCommunity = 2)
       WITH n.communityId AS cid, n
       ORDER BY n.updatedAt DESC
       WITH cid, collect(n) AS members
+      ORDER BY size(members) DESC
       UNWIND members[0..toInteger($perCommunity)] AS m
       RETURN m AS n
-    `, { perCommunity });
+      LIMIT toInteger($totalLimit)
+    `, { perCommunity, totalLimit });
     return result.records.map(r => toNode(r.get("n")));
   } finally {
     await session.close();
