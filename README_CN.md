@@ -8,6 +8,11 @@
 </p>
 
 <p align="center">
+  <a href="https://www.dsh.so/zh/artifact/graph-memory"><img src="https://www.dsh.so/badge/graph-memory.svg" alt="dsh.so 安全徽章"></a>
+  <a href="https://www.dsh.so/zh/artifact/graph-memory"><img src="https://www.dsh.so/badge/install/graph-memory.svg" alt="dsh.so 安装徽章"></a>
+</p>
+
+<p align="center">
   <a href="README.md">English</a> ·
   <a href="#核心优势">核心优势</a> ·
   <a href="#图记忆架构">图架构</a> ·
@@ -173,7 +178,7 @@ graph-memory/
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.9`。本机验收宿主为 DeepSeek Harness `0.1.0-rc.8`。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；130 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
+当前 beta：`1.6.0-beta.9`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；130 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -190,7 +195,7 @@ graph-memory/
 前置条件：Node.js `22.13+`。当前 beta 尚未发布到 npm，但仓库已经包含预构建运行产物，可以直接安装且不需要授权安装脚本：
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add git+https://github.com/adoresever/graph-memory.git
+npx @deepseek-ai/dsh plugin --profile web add github:adoresever/graph-memory
 npx @deepseek-ai/dsh --profile web --dump-config
 npx @deepseek-ai/dsh web
 ```

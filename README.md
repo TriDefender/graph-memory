@@ -8,6 +8,11 @@
 </p>
 
 <p align="center">
+  <a href="https://www.dsh.so/artifact/graph-memory"><img src="https://www.dsh.so/badge/graph-memory.svg" alt="dsh.so security badge"></a>
+  <a href="https://www.dsh.so/artifact/graph-memory"><img src="https://www.dsh.so/badge/install/graph-memory.svg" alt="dsh.so install badge"></a>
+</p>
+
+<p align="center">
   <a href="README_CN.md">中文</a> ·
   <a href="#core-advantages">Advantages</a> ·
   <a href="#graph-memory-architecture">Architecture</a> ·
@@ -191,7 +196,7 @@ graph-memory/
 | Visible plugin state | **Done** | Active in Plugin Inventory |
 | Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.9`. Local acceptance used DeepSeek Harness `0.1.0-rc.8`. Testing covered script-free Git and tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 130 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
+Current beta: `1.6.0-beta.9`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 130 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -208,7 +213,7 @@ Current beta: `1.6.0-beta.9`. Local acceptance used DeepSeek Harness `0.1.0-rc.8
 Prerequisite: Node.js `22.13+`. The current beta is not yet published to npm, but the repository ships its prebuilt runtime and can be installed without authorizing install scripts:
 
 ```bash
-npx @deepseek-ai/dsh plugin --profile web add git+https://github.com/adoresever/graph-memory.git
+npx @deepseek-ai/dsh plugin --profile web add github:adoresever/graph-memory
 npx @deepseek-ai/dsh --profile web --dump-config
 npx @deepseek-ai/dsh web
 ```
