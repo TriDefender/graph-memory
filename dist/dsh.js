@@ -8,7 +8,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { openDb } from "./src/store/db.js";
 import { allActiveNodes, findByName, getBySession, getStats, getVectorStats, getUnextracted, markExtracted, saveMessageOnce, updateNode, upsertEdge, upsertNode, } from "./src/store/store.js";
-import { Extractor } from "./src/extractor/extract.js";
+import { Extractor, normalizeExtractionContent } from "./src/extractor/extract.js";
 import { Recaller } from "./src/recaller/recall.js";
 import { assembleContext } from "./src/format/assemble.js";
 import { selectDshRollingCompactionRange } from "./src/format/dsh-compaction.js";
@@ -17,7 +17,20 @@ import { createEmbedFn } from "./src/engine/embed.js";
 import { computeGlobalPageRank, invalidateGraphCache } from "./src/graph/pagerank.js";
 import { detectCommunities } from "./src/graph/community.js";
 import { DEFAULT_CONFIG } from "./src/types.js";
-import { messageRetentionPolicyRevision, normalizeMessageRetentionPolicy, runMessageRetention, } from "./src/store/retention.js";
+// Extraction resilience bounds (see extractPending / drainBatch):
+// - one extraction request is capped by accumulated normalized characters,
+//   then by message count, so a burst of long tool results cannot build a
+//   request that stalls the LLM stream for the whole timeout;
+// - a stalled stream (no finish/error chunk) is hard-bounded by this timeout;
+// - a batch that still fails after retries is bisected, and a single message
+//   that keeps failing is marked extracted so the drain can never deadlock.
+const EXTRACTION_BATCH_MAX_CHARS = 8_000;
+const EXTRACTION_BATCH_MAX_MESSAGES = 15;
+const EXTRACTION_NAMES_MAX_ENTRIES = 150;
+const EXTRACTION_NAMES_MAX_CHARS = 3_000;
+const EXTRACTION_STREAM_TIMEOUT_MS = 180_000;
+const EXTRACTION_MAX_RETRIES = 2;
+const EXTRACTION_RETRY_DELAYS_MS = [5_000, 15_000];
 export const name = "graph-memory-dsh";
 export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "agentPresets", "sessions", "credentials"];
 const HOST = "dsh";
@@ -97,11 +110,6 @@ export function apply(ctx, input = {}) {
     if (!Number.isFinite(autoRecallMinScore) || autoRecallMinScore < 0 || autoRecallMinScore > 1) {
         throw new TypeError(`[graph-memory] autoRecallMinScore must be between 0 and 1, received ${autoRecallMinScore}`);
     }
-    const maintenanceInterval = input.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount;
-    if (!Number.isInteger(maintenanceInterval) || maintenanceInterval < 1) {
-        throw new TypeError(`[graph-memory] maintenanceInterval must be a positive integer, received ${maintenanceInterval}`);
-    }
-    const messageRetention = normalizeMessageRetentionPolicy(input.messageRetention);
     const credentialRef = input.embedding?.apiKeyEnv;
     if (credentialRef && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
         throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
@@ -115,7 +123,7 @@ export function apply(ctx, input = {}) {
     const config = {
         ...DEFAULT_CONFIG,
         dbPath: input.dbPath ?? "~/.dsh/graph-memory/graph-memory.db",
-        compactTurnCount: maintenanceInterval,
+        compactTurnCount: input.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount,
         recallMaxNodes: input.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes,
         recallMaxDepth: input.recallMaxDepth ?? DEFAULT_CONFIG.recallMaxDepth,
         embedding,
@@ -140,14 +148,6 @@ export function apply(ctx, input = {}) {
         succeeded: 0,
         unavailable: 0,
         failed: 0,
-    };
-    const retentionMetrics = {
-        runs: 0,
-        dryRuns: 0,
-        selectedRows: 0,
-        deletedRows: 0,
-        deletedBytes: 0,
-        last: undefined,
     };
     if (embeddingConfigured) {
         void createEmbedFn(embedding).then(async (embed) => {
@@ -194,14 +194,33 @@ export function apply(ctx, input = {}) {
         });
         let text = "";
         let blockText = "";
-        for await (const chunk of chunks) {
-            if (chunk?.type === "text-delta" && typeof chunk.text === "string")
-                text += chunk.text;
-            if (chunk?.type === "block-end" && chunk.block?.type === "text")
-                blockText += chunk.block.text ?? "";
-            if (chunk?.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
-                throw new Error(`[graph-memory] DSH LLM ${chunk.reason.kind}: ${chunk.reason.failure?.message ?? "unknown failure"}`);
-            }
+        // A streaming LLM call can stall without ever emitting a finish/error
+        // chunk (observed in the wild with long extraction batches). Bound the
+        // whole stream with a hard timeout so a hung provider cannot pin this
+        // session's extraction chain forever — previously this loop had no
+        // timeout at all, and a stall blocked every later turn's extraction.
+        let streamTimer;
+        const timedOut = await Promise.race([
+            (async () => {
+                for await (const chunk of chunks) {
+                    if (chunk?.type === "text-delta" && typeof chunk.text === "string")
+                        text += chunk.text;
+                    if (chunk?.type === "block-end" && chunk.block?.type === "text")
+                        blockText += chunk.block.text ?? "";
+                    if (chunk?.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
+                        throw new Error(`[graph-memory] DSH LLM ${chunk.reason.kind}: ${chunk.reason.failure?.message ?? "unknown failure"}`);
+                    }
+                }
+                return false;
+            })(),
+            new Promise((resolve) => {
+                streamTimer = setTimeout(() => resolve(true), EXTRACTION_STREAM_TIMEOUT_MS);
+            }),
+        ]);
+        if (streamTimer)
+            clearTimeout(streamTimer);
+        if (timedOut) {
+            throw new Error(`[graph-memory] DSH LLM extraction stream timed out after ${EXTRACTION_STREAM_TIMEOUT_MS / 1000}s (no finish chunk)`);
         }
         const result = text || blockText;
         if (!result.trim())
@@ -252,53 +271,117 @@ export function apply(ctx, input = {}) {
         void recaller.syncEmbed(node);
         invalidateGraphCache();
     }
+    // Bound the dedup/name hint list fed into extraction. Unbounded it could
+    // grow to tens of thousands of characters (every node name ever created
+    // for this session), pushing the request over the LLM context window.
+    function existingNameList(sid) {
+        const names = [];
+        let chars = 0;
+        for (const node of getBySession(db, sid)) {
+            const name = typeof node.name === "string" ? node.name : "";
+            if (!name)
+                continue;
+            if (names.length >= EXTRACTION_NAMES_MAX_ENTRIES || (names.length > 0 && chars + name.length > EXTRACTION_NAMES_MAX_CHARS))
+                break;
+            names.push(name);
+            chars += name.length;
+        }
+        return names;
+    }
+    // Extract one bounded batch with resilience: retry transient failures with
+    // backoff, then bisect so a single poison message cannot sink the rest, and
+    // only as a last resort mark a lone failing message extracted so the drain
+    // always makes progress. The previous behaviour stopped the whole drain on
+    // the first error and left the batch unextracted forever — every restart
+    // retried the same failing batch, pinning the backlog indefinitely.
+    async function drainBatch(sessionId, sid, messages, attempt) {
+        if (closing)
+            return;
+        // A single message that keeps failing would pin the drain forever. Mark
+        // it extracted (the raw message stays in gm_messages) after retries so
+        // the rest of the backlog can still be learned from.
+        if (messages.length === 1 && attempt > 0) {
+            markExtracted(db, sid, Number(messages[0].turn_index));
+            ctx.logger.warn(`[graph-memory] DSH extraction SKIP turn=${messages[0].turn_index} after ${attempt} tries for ${sid}`);
+            return;
+        }
+        try {
+            // Extraction follows this exact conversation's latest logged route. A
+            // shared "last model wins" closure would mix providers when sessions
+            // finish concurrently.
+            const route = latestRoute.get(String(sessionId));
+            const extractor = new Extractor(config, (system, user) => complete(route, system, user));
+            const existingNames = existingNameList(sid);
+            const result = await extractor.extract({ messages, existingNames });
+            const names = new Map();
+            for (const candidate of result.nodes) {
+                const { node } = upsertNode(db, candidate, sid, extractionSources(candidate, messages));
+                names.set(node.name, node.id);
+                void recaller.syncEmbed(node);
+            }
+            for (const edge of result.edges) {
+                const fromId = names.get(edge.from) ?? findByName(db, edge.from)?.id;
+                const toId = names.get(edge.to) ?? findByName(db, edge.to)?.id;
+                if (!fromId || !toId)
+                    continue;
+                upsertEdge(db, {
+                    fromId,
+                    toId,
+                    type: edge.type,
+                    instruction: edge.instruction,
+                    condition: edge.condition,
+                    sessionId: sid,
+                });
+            }
+            markExtracted(db, sid, Math.max(...messages.map((message) => Number(message.turn_index))));
+            if (result.nodes.length || result.edges.length)
+                invalidateGraphCache();
+            ctx.logger.info(`[graph-memory] DSH extracted ${result.nodes.length} nodes and ${result.edges.length} edges from ${sid}`);
+        }
+        catch (error) {
+            // Back off and retry a couple of times for transient provider hiccups.
+            if (attempt < EXTRACTION_MAX_RETRIES) {
+                const delayMs = EXTRACTION_RETRY_DELAYS_MS[attempt] ?? 15_000;
+                ctx.logger.warn(`[graph-memory] DSH extraction retry in ${Math.round(delayMs / 1000)}s for ${sid}: ${String(error)}`);
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+                return drainBatch(sessionId, sid, messages, attempt + 1);
+            }
+            // Still failing: bisect so one poison message cannot sink the rest.
+            if (messages.length > 1) {
+                const mid = Math.ceil(messages.length / 2);
+                ctx.logger.warn(`[graph-memory] DSH extraction split ${messages.length} -> ${mid}+${messages.length - mid} for ${sid}: ${String(error)}`);
+                await drainBatch(sessionId, sid, messages.slice(0, mid), 0);
+                await drainBatch(sessionId, sid, messages.slice(mid), 0);
+                return;
+            }
+            markExtracted(db, sid, Number(messages[0].turn_index));
+            ctx.logger.warn(`[graph-memory] DSH extraction SKIP turn=${messages[0].turn_index} after ${EXTRACTION_MAX_RETRIES + 1} tries for ${sid}`);
+        }
+    }
     async function extractPending(sessionId) {
         if (!extractionEnabled || closing)
             return;
         const sid = sessionKey(sessionId);
         while (!closing) {
-            const messages = getUnextracted(db, sid, 50);
+            // Take the oldest unextracted messages in order, bounded by accumulated
+            // normalized length first (a single long message always fits so the
+            // drain can make progress), then by count. Order matters: we mark
+            // extracted up to the max turn_index of the batch, so skipping a
+            // middle message would mis-mark it as extracted.
+            const messages = [];
+            let chars = 0;
+            for (const message of getUnextracted(db, sid, EXTRACTION_BATCH_MAX_MESSAGES * 16)) {
+                const content = normalizeExtractionContent(message.content);
+                if (messages.length > 0 && chars + content.length > EXTRACTION_BATCH_MAX_CHARS)
+                    break;
+                messages.push({ ...message, content });
+                chars += content.length;
+                if (messages.length >= EXTRACTION_BATCH_MAX_MESSAGES)
+                    break;
+            }
             if (!messages.length)
                 return;
-            try {
-                // Extraction follows this exact conversation's latest logged route. A
-                // shared "last model wins" closure would mix providers when sessions
-                // finish concurrently.
-                const route = latestRoute.get(String(sessionId));
-                const extractor = new Extractor(config, (system, user) => complete(route, system, user));
-                const existingNames = getBySession(db, sid).map((node) => node.name);
-                const result = await extractor.extract({ messages, existingNames });
-                const names = new Map();
-                for (const candidate of result.nodes) {
-                    const { node } = upsertNode(db, candidate, sid, extractionSources(candidate, messages));
-                    names.set(node.name, node.id);
-                    void recaller.syncEmbed(node);
-                }
-                for (const edge of result.edges) {
-                    const fromId = names.get(edge.from) ?? findByName(db, edge.from)?.id;
-                    const toId = names.get(edge.to) ?? findByName(db, edge.to)?.id;
-                    if (!fromId || !toId)
-                        continue;
-                    upsertEdge(db, {
-                        fromId,
-                        toId,
-                        type: edge.type,
-                        instruction: edge.instruction,
-                        condition: edge.condition,
-                        sessionId: sid,
-                    });
-                }
-                markExtracted(db, sid, Math.max(...messages.map((message) => Number(message.turn_index))));
-                if (result.nodes.length || result.edges.length)
-                    invalidateGraphCache();
-                ctx.logger.info(`[graph-memory] DSH extracted ${result.nodes.length} nodes and ${result.edges.length} edges from ${sid}`);
-            }
-            catch (error) {
-                // Leave this batch unextracted so a later turn/restart can retry. Stop
-                // the drain now to avoid hammering the same failing provider request.
-                ctx.logger.warn(`[graph-memory] DSH extraction deferred for ${sid}: ${String(error)}`);
-                return;
-            }
+            await drainBatch(sessionId, sid, messages, 0);
         }
     }
     function scheduleExtract(sessionId) {
@@ -311,55 +394,20 @@ export function apply(ctx, input = {}) {
                 extractChain.delete(key);
         });
     }
-    function runConfiguredRetention() {
-        const result = runMessageRetention(db, messageRetention);
-        retentionMetrics.runs += 1;
-        if (result.dryRun)
-            retentionMetrics.dryRuns += 1;
-        retentionMetrics.selectedRows += result.selectedRows;
-        retentionMetrics.deletedRows += result.deletedRows;
-        retentionMetrics.deletedBytes += result.deletedBytes;
-        retentionMetrics.last = result;
-        if (result.selectedRows > 0) {
-            const action = result.dryRun ? "would prune" : "pruned";
-            ctx.logger.info(`[graph-memory] retention ${action} ${result.dryRun ? result.selectedRows : result.deletedRows} ` +
-                `unreferenced extracted messages (${result.selectedBytes} estimated bytes, more=${result.hasMore})`);
-        }
-        return result;
-    }
-    function runGraphMaintenance() {
-        invalidateGraphCache();
-        const pagerank = computeGlobalPageRank(db, config);
-        const communities = detectCommunities(db);
-        return { pagerankNodes: pagerank.scores.size, communities: communities.count };
-    }
-    function runMaintenanceTick() {
-        const result = { errors: [] };
-        try {
-            result.graph = runGraphMaintenance();
-        }
-        catch (error) {
-            const message = `graph maintenance failed: ${String(error)}`;
-            result.errors.push(message);
-            ctx.logger.warn(`[graph-memory] DSH ${message}`);
-        }
-        try {
-            result.retention = runConfiguredRetention();
-        }
-        catch (error) {
-            const message = `message retention failed: ${String(error)}`;
-            result.errors.push(message);
-            ctx.logger.warn(`[graph-memory] DSH ${message}`);
-        }
-        return result;
-    }
     function maintain(sessionId) {
         const key = String(sessionId);
         const turns = (turnCounts.get(key) ?? 0) + 1;
         turnCounts.set(key, turns);
         if (turns % config.compactTurnCount !== 0)
             return;
-        runMaintenanceTick();
+        try {
+            invalidateGraphCache();
+            computeGlobalPageRank(db, config);
+            detectCommunities(db);
+        }
+        catch (error) {
+            ctx.logger.warn(`[graph-memory] DSH graph maintenance failed: ${String(error)}`);
+        }
     }
     function backfill(agent) {
         const id = agent?.id ?? agent?.session?.id;
@@ -527,9 +575,7 @@ export function apply(ctx, input = {}) {
             const embeddingModel = embeddingConfigured && input.embedding?.model
                 ? ` (${input.embedding.model})`
                 : "";
-            const messageCount = Number(db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get()?.count ?? 0);
-            const retentionRevision = messageRetentionPolicyRevision(messageRetention);
-            return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
+            return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
         },
     });
     ctx.tools.register({
@@ -579,21 +625,13 @@ export function apply(ctx, input = {}) {
     });
     ctx.tools.register({
         name: "gm_stats",
-        description: "Show Graph Memory graph, durable-message and retention statistics.",
+        description: "Show Graph Memory node, edge and community counts.",
         parameters: { type: "object", properties: {}, additionalProperties: false },
         output: stringOutput("Graph Memory statistics"),
         execute: async () => {
             const stats = getStats(db);
-            const messageCount = Number(db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get()?.count ?? 0);
-            return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nMessages: ${messageCount}\nBy type: ${JSON.stringify(stats.byType)}\nRetention policy: ${JSON.stringify({ ...messageRetention, revision: messageRetentionPolicyRevision(messageRetention) })}\nRetention totals: ${JSON.stringify({ runs: retentionMetrics.runs, dryRuns: retentionMetrics.dryRuns, selectedRows: retentionMetrics.selectedRows, deletedRows: retentionMetrics.deletedRows, deletedBytes: retentionMetrics.deletedBytes })}\nLast retention receipt: ${JSON.stringify(retentionMetrics.last ?? null)}`;
+            return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nBy type: ${JSON.stringify(stats.byType)}`;
         },
-    });
-    ctx.tools.register({
-        name: "gm_maintain",
-        description: "Run one bounded Graph Memory maintenance tick using the configured retention policy.",
-        parameters: { type: "object", properties: {}, additionalProperties: false },
-        output: stringOutput("Graph Memory maintenance"),
-        execute: async () => JSON.stringify(runMaintenanceTick()),
     });
     ctx.effect(() => async () => {
         closing = true;
@@ -604,10 +642,5 @@ export function apply(ctx, input = {}) {
         turnCounts.clear();
         db.close();
     }, "graph-memory.close");
-    if (messageRetention.keep !== "all") {
-        const mode = messageRetention.dryRun ? "dry-run" : "deletion enabled";
-        ctx.logger.warn(`[graph-memory] durable message retention is ${mode} (${JSON.stringify(messageRetention)}). ` +
-            `Back up ${config.dbPath} before the first non-dry run; VACUUM remains a separate admin action.`);
-    }
     ctx.logger.info(`[graph-memory] native DSH adapter active at ${config.dbPath}`);
 }
