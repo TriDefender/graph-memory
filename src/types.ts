@@ -207,6 +207,31 @@ export const DEFAULT_CRON_CONFIG: CronConfig = {
   finalizeAndMaintain: true,
 };
 
+// ─── 原始消息保留（opt-in 有界清理）──────────────────────────
+//
+// 设计原则（移植自上游 #96）："上下文压缩改变的是模型可见面，
+// 不构成删除持久证据的授权。" 默认 keep=all 零行为变化；
+// 清理逻辑实现在 src/store/retention.ts，挂在 runMaintenance 尾部。
+
+export type MessageRetentionMode = "all" | "referenced" | "recent";
+
+export interface MessageRetentionConfig {
+  /**
+   * all（默认）保留全部原始消息，零开销；
+   * referenced 只删"已提取完成"的消息（知识已固化进图谱，原始文本退役）；
+   * recent 在 referenced 的基础上按时间窗保护最近内容。
+   */
+  keep?: MessageRetentionMode;
+  /** keep=recent：每个 session 保留最近 N 轮真实用户发言（该轮及其后全部保留）。 */
+  recentTurns?: number;
+  /** keep=recent：保留最近 N 天内入库的消息。 */
+  retentionDays?: number;
+  /** 单个维护周期最多处理的行数（保证维护链工作有界）。默认 500。 */
+  batchSize?: number;
+  /** true 时只报告候选集不删除 —— 启用前先跑一轮 dryRun 验证。 */
+  dryRun?: boolean;
+}
+
 // ─── 插件配置 ─────────────────────────────────────────────────
 
 export interface GmConfig {
@@ -237,6 +262,8 @@ export interface GmConfig {
   /** 遗忘曲线衰减配置；未提供时使用 DEFAULT_CONFIG.decay。 */
   decay?: DecayConfig;
   cron?: CronConfig;
+  /** 原始消息保留策略；未提供时等价 keep=all（永不删除）。 */
+  messageRetention?: MessageRetentionConfig;
 }
 
 export const DEFAULT_CONFIG: GmConfig = {

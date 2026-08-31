@@ -2,7 +2,7 @@
  * graph-memory-pro — 图谱维护
  *
  * 调用时机：session_end（finalize 之后）
- * 执行顺序：衰减 → 去重 → 全局 PageRank → 社区检测 → 社区描述
+ * 执行顺序：衰减 → 去重 → 全局 PageRank → 社区检测 → 社区描述 → 消息保留（opt-in）
  */
 
 import type { Driver } from "neo4j-driver";
@@ -13,6 +13,10 @@ import { computeGlobalPageRank, type GlobalPageRankResult } from "./pagerank.ts"
 import { detectCommunities, summarizeCommunities, type CommunityResult } from "./community.ts";
 import { dedup, type DedupResult } from "./dedup.ts";
 import { applyDecay, type DecayResult } from "./decay.ts";
+import {
+  normalizeMessageRetentionPolicy, runMessageRetention,
+  type MessageRetentionResult,
+} from "../store/retention.ts";
 
 export interface MaintenanceResult {
   decay: DecayResult;
@@ -20,6 +24,8 @@ export interface MaintenanceResult {
   pagerank: GlobalPageRankResult;
   community: CommunityResult;
   communitySummaries: number;
+  /** 原始消息保留（opt-in）；未配置 messageRetention 或 keep=all 时为 undefined。 */
+  retention?: MessageRetentionResult;
   durationMs: number;
 }
 
@@ -48,12 +54,23 @@ export async function runMaintenance(
     } catch {}
   }
 
+  // 5. 原始消息保留（opt-in；keep=all 零开销直返）。
+  // 非法策略 fail closed：抛错终止维护、不删任何东西，由调用方记录。
+  let retention: MessageRetentionResult | undefined;
+  if (cfg.messageRetention) {
+    const policy = normalizeMessageRetentionPolicy(cfg.messageRetention);
+    if (policy.keep !== "all") {
+      retention = await runMessageRetention(driver, policy);
+    }
+  }
+
   return {
     decay: decayResult,
     dedup: dedupResult,
     pagerank: pagerankResult,
     community: communityResult,
     communitySummaries,
+    ...(retention ? { retention } : {}),
     durationMs: Date.now() - start,
   };
 }

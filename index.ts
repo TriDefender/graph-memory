@@ -25,6 +25,7 @@ import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
+import { normalizeMessageRetentionPolicy } from "./src/store/retention.ts";
 import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
@@ -313,6 +314,19 @@ const graphMemoryProPlugin = {
       typeof rawEmbedding.baseUrl === "string" && rawEmbedding.baseUrl.trim()
     ) {
       cfg.embedding = { ...cfg.embedding, baseURL: rawEmbedding.baseUrl.trim() };
+    }
+
+    // messageRetention 配置预校验：非法策略在启动时报错并回退 keep=all（fail closed），
+    // 而不是等到 session_end 维护链里每次抛错
+    if (cfg.messageRetention) {
+      try {
+        normalizeMessageRetentionPolicy(cfg.messageRetention);
+      } catch (err) {
+        api.logger.error(
+          `[graph-memory-pro] messageRetention 配置非法，保留策略回退为 keep=all（不删除任何消息）：${err}`,
+        );
+        delete cfg.messageRetention;
+      }
     }
     const cronCfg = cfg.cron ?? DEFAULT_CRON_CONFIG;
 
@@ -670,6 +684,10 @@ const graphMemoryProPlugin = {
               `[graph-memory-pro] maintenance: ${result.durationMs}ms, ` +
               `dedup=${result.dedup.merged}, communities=${result.community.count}, ` +
               `summaries=${result.communitySummaries}, ` +
+              (result.retention
+                ? `retention=${result.retention.dryRun ? "dryRun:" : ""}` +
+                  `${result.retention.deletedRows}/${result.retention.selectedRows} msgs, `
+                : "") +
               `top_pr=${result.pagerank.topK.slice(0, 3).map(n => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
             );
           } while (maintenanceRerunRequested && neo4jGate.isAvailable());

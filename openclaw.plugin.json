@@ -60,6 +60,22 @@
           "finalizeAndMaintain": { "type": "boolean", "default": true, "description": "cron session 结束时是否执行 finalize（EVENT→SKILL 晋升）和图维护（decay/PageRank/社区检测）。频繁的 cron 任务可关闭以避免每次结束都跑全局维护。" }
         }
       },
+      "messageRetention": {
+        "type": "object",
+        "description": "原始消息（GmMessage）有界保留策略。默认 keep=all 永不删除；上下文压缩不构成删除持久证据的授权。挂在图维护链尾部，每个维护周期最多处理 batchSize 行。建议先配 dryRun=true 观察候选集再实际启用。",
+        "properties": {
+          "keep": {
+            "type": "string",
+            "enum": ["all", "referenced", "recent"],
+            "default": "all",
+            "description": "all=全部保留（默认）；referenced=只删已提取完成的消息（知识已固化进图谱）；recent=在 referenced 基础上按时间窗保护最近内容（需配 recentTurns 或 retentionDays）"
+          },
+          "recentTurns": { "type": "number", "default": 0, "description": "keep=recent：每 session 保留最近 N 轮真实用户发言（该轮及其后的全部消息保留）。" },
+          "retentionDays": { "type": "number", "default": 0, "description": "keep=recent：保留最近 N 天内入库的消息。" },
+          "batchSize": { "type": "number", "default": 500, "description": "单个维护周期最多处理的行数（1~10000），保证维护链工作有界。" },
+          "dryRun": { "type": "boolean", "default": false, "description": "true 时只报告候选集不删除 —— 启用前先跑一轮 dryRun 验证。" }
+        }
+      },
       "llm": {
         "type": "object",
         "properties": {
