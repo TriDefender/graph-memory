@@ -61,11 +61,19 @@ export function createTestDb(): DatabaseSyncInstance {
       role        TEXT NOT NULL,
       content     TEXT NOT NULL,
       extracted   INTEGER NOT NULL DEFAULT 0,
+      extraction_state TEXT NOT NULL DEFAULT 'pending'
+        CHECK(extraction_state IN ('pending', 'succeeded', 'quarantined')),
+      extraction_attempts INTEGER NOT NULL DEFAULT 0,
+      extraction_error TEXT,
+      extraction_next_retry_at INTEGER,
+      extraction_updated_at INTEGER,
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
     CREATE INDEX IF NOT EXISTS ix_gm_msg_retention
       ON gm_messages(extracted, created_at, session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_extraction_queue
+      ON gm_messages(extraction_state, extraction_next_retry_at, session_id, turn_index);
   `);
 
   // m3: 信号

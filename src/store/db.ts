@@ -80,11 +80,44 @@ function migrate(db: DatabaseSyncInstance): void {
     m8_backfill_community_signatures,
     m9_node_sources,
     m10_message_retention_index,
+    m11_extraction_queue_state,
   ];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
   }
+}
+
+// ─── 可审计抽取队列：待处理 / 成功 / 隔离 ──────────────────────
+
+function m11_extraction_queue_state(db: DatabaseSyncInstance): void {
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(gm_messages)").all() as Array<{ name: string }>)
+      .map(column => column.name),
+  );
+  if (!columns.has("extraction_state")) {
+    db.exec(`ALTER TABLE gm_messages ADD COLUMN extraction_state TEXT NOT NULL DEFAULT 'pending'
+      CHECK(extraction_state IN ('pending', 'succeeded', 'quarantined'))`);
+  }
+  if (!columns.has("extraction_attempts")) {
+    db.exec("ALTER TABLE gm_messages ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!columns.has("extraction_error")) {
+    db.exec("ALTER TABLE gm_messages ADD COLUMN extraction_error TEXT");
+  }
+  if (!columns.has("extraction_next_retry_at")) {
+    db.exec("ALTER TABLE gm_messages ADD COLUMN extraction_next_retry_at INTEGER");
+  }
+  if (!columns.has("extraction_updated_at")) {
+    db.exec("ALTER TABLE gm_messages ADD COLUMN extraction_updated_at INTEGER");
+  }
+  db.exec(`
+    UPDATE gm_messages
+      SET extraction_state=CASE WHEN extracted=1 THEN 'succeeded' ELSE 'pending' END,
+          extraction_updated_at=COALESCE(extraction_updated_at, created_at);
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_extraction_queue
+      ON gm_messages(extraction_state, extraction_next_retry_at, session_id, turn_index);
+  `);
 }
 
 // ─── 有界原始消息保留策略查询 ────────────────────────────────

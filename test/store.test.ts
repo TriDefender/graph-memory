@@ -13,6 +13,7 @@ import {
   mergeNodes, edgesFrom, edgesTo, allActiveNodes, allEdges,
   searchNodes, topNodes, graphWalk, getBySession,
   saveMessage, saveMessageOnce, getMessages, getUnextracted, markExtracted, getEpisodicMessages,
+  getExtractionStats, markMessagesExtracted, quarantineMessages, requeueQuarantined,
   getNodeSourceMessages,
   saveSignal, pendingSignals, markSignalsDone,
   getStats, saveVector, vectorSearch, getAllVectors, upsertCommunitySummary,
@@ -370,6 +371,20 @@ describe("messages & signals", () => {
     unext = getUnextracted(db, "s1", 10);
     expect(unext).toHaveLength(1);
     expect(unext[0].turn_index).toBe(3);
+  });
+
+  it("tracks exact extraction success and quarantine without crossing turn boundaries", () => {
+    saveMessageOnce(db, "a", "s1", 1, "user", "first");
+    saveMessageOnce(db, "b", "s1", 1, "tool", "same turn, different event");
+    saveMessageOnce(db, "c", "s1", 2, "assistant", "third");
+
+    markMessagesExtracted(db, ["b"]);
+    quarantineMessages(db, ["a"], "poison input");
+    expect(getExtractionStats(db)).toEqual({ pending: 1, succeeded: 1, quarantined: 1 });
+    expect((db.prepare("SELECT extracted FROM gm_messages WHERE id='a'").get() as any).extracted).toBe(0);
+
+    expect(requeueQuarantined(db, "s1")).toBe(1);
+    expect(getExtractionStats(db)).toEqual({ pending: 2, succeeded: 1, quarantined: 0 });
   });
 
   it("saveSignal + pendingSignals + markSignalsDone", () => {

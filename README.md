@@ -196,7 +196,7 @@ graph-memory/
 | Visible plugin state | **Done** | Active in Plugin Inventory |
 | Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.10`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, bounded raw-message retention, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 139 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
+Current beta: `1.6.0-beta.11`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web and Headless profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, a lossless bounded extraction queue, failure quarantine and recovery, bounded raw-message retention, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 149 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -289,6 +289,9 @@ Before enabling deletion, back up `$DSH_HOME/graph-memory/graph-memory.db`, keep
 | `gm_record` | Persist a TASK, SKILL, or EVENT |
 | `gm_stats` | Graph, durable-message, and retention receipts/statistics |
 | `gm_maintain` | Run one bounded graph + configured retention maintenance tick |
+| `gm_retry_extraction` | Requeue quarantined extraction failures without deleting or truncating source messages |
+
+The extraction queue bounds each temporary projection to 8,000 characters and 15 messages by default. One oversized message is extracted in semantic chunks while its durable SQLite event remains complete. Repeated failures become `quarantined`: they are never mislabeled as learned and retention cannot delete them. `gm_status` and `gm_stats` expose pending, succeeded, and quarantined counts. All bounds live under `extractionDrain`; see `cordis.patch.yml` for defaults.
 
 Automatic recall does not require an explicit `gm_search` tool call. The plugin retrieves relevant memory during Prompt Assembly.
 
@@ -408,7 +411,7 @@ Release checks:
 ## Current limitations
 
 - Automatic extraction depends on auxiliary-model output stability. Use `gm_record` for critical beta knowledge.
-- DSH does not yet expose `gm_update` and `gm_maintain`; those remain OpenClaw-entry tools.
+- DSH does not yet expose `gm_update`; `gm_maintain` and `gm_retry_extraction` are native tools.
 - Pro Lite currently has a read-only card client; 2D/3D, split view, and controlled drag-to-context are not implemented.
 - npm registry publication is pending; install the current beta from a GitHub-built tarball.
 

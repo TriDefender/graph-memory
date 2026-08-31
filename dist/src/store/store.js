@@ -292,12 +292,95 @@ export function getMessages(db, sid, limit) {
         .all(sid);
 }
 export function getUnextracted(db, sid, limit) {
-    return db.prepare("SELECT * FROM gm_messages WHERE session_id=? AND extracted=0 ORDER BY turn_index LIMIT ?")
-        .all(sid, limit);
+    return db.prepare(`
+    SELECT * FROM gm_messages
+    WHERE session_id=? AND extracted=0 AND extraction_state='pending'
+      AND (extraction_next_retry_at IS NULL OR extraction_next_retry_at<=?)
+    ORDER BY turn_index, id LIMIT ?
+  `).all(sid, Date.now(), limit);
 }
 export function markExtracted(db, sid, upToTurn) {
-    db.prepare("UPDATE gm_messages SET extracted=1 WHERE session_id=? AND turn_index<=?")
-        .run(sid, upToTurn);
+    db.prepare(`
+    UPDATE gm_messages
+    SET extracted=1, extraction_state='succeeded', extraction_error=NULL,
+        extraction_next_retry_at=NULL, extraction_updated_at=?
+    WHERE session_id=? AND turn_index<=? AND extraction_state='pending'
+  `).run(Date.now(), sid, upToTurn);
+}
+function messageIdPlaceholders(ids) {
+    return ids.map(() => "?").join(",");
+}
+/** Mark only the source rows actually accepted by the extractor. */
+export function markMessagesExtracted(db, ids) {
+    if (!ids.length)
+        return 0;
+    const result = db.prepare(`
+    UPDATE gm_messages
+    SET extracted=1, extraction_state='succeeded', extraction_error=NULL,
+        extraction_next_retry_at=NULL, extraction_updated_at=?
+    WHERE id IN (${messageIdPlaceholders(ids)}) AND extraction_state='pending'
+  `).run(Date.now(), ...ids);
+    return Number(result.changes);
+}
+export function recordExtractionFailure(db, ids, error, nextRetryAt) {
+    if (!ids.length)
+        return 0;
+    const result = db.prepare(`
+    UPDATE gm_messages
+    SET extraction_attempts=extraction_attempts+1, extraction_error=?,
+        extraction_next_retry_at=?, extraction_updated_at=?
+    WHERE id IN (${messageIdPlaceholders(ids)}) AND extraction_state='pending'
+  `).run(error.slice(0, 2_000), nextRetryAt, Date.now(), ...ids);
+    return Number(result.changes);
+}
+/** A poison message remains durable and explicitly unlearned until retried. */
+export function quarantineMessages(db, ids, error) {
+    if (!ids.length)
+        return 0;
+    const result = db.prepare(`
+    UPDATE gm_messages
+    SET extracted=0, extraction_state='quarantined', extraction_error=?,
+        extraction_next_retry_at=NULL, extraction_updated_at=?
+    WHERE id IN (${messageIdPlaceholders(ids)}) AND extraction_state='pending'
+  `).run(error.slice(0, 2_000), Date.now(), ...ids);
+    return Number(result.changes);
+}
+export function requeueQuarantined(db, sid) {
+    const result = sid
+        ? db.prepare(`
+        UPDATE gm_messages
+        SET extraction_state='pending', extraction_error=NULL,
+            extraction_next_retry_at=NULL, extraction_updated_at=?
+        WHERE extraction_state='quarantined' AND session_id=?
+      `).run(Date.now(), sid)
+        : db.prepare(`
+        UPDATE gm_messages
+        SET extraction_state='pending', extraction_error=NULL,
+            extraction_next_retry_at=NULL, extraction_updated_at=?
+        WHERE extraction_state='quarantined'
+      `).run(Date.now());
+    return Number(result.changes);
+}
+export function getExtractionStats(db) {
+    const rows = db.prepare(`
+    SELECT extraction_state AS state, COUNT(*) AS count
+    FROM gm_messages GROUP BY extraction_state
+  `).all();
+    const result = { pending: 0, succeeded: 0, quarantined: 0 };
+    for (const row of rows) {
+        if (row.state in result)
+            result[row.state] = Number(row.count);
+    }
+    return result;
+}
+export function getPendingSessionIds(db, limit = 100) {
+    return db.prepare(`
+    SELECT session_id, MIN(turn_index) AS first_turn
+    FROM gm_messages
+    WHERE extracted=0 AND extraction_state='pending'
+      AND (extraction_next_retry_at IS NULL OR extraction_next_retry_at<=?)
+    GROUP BY session_id ORDER BY first_turn, session_id LIMIT ?
+  `).all(Date.now(), limit).map(row => row.session_id);
 }
 /**
  * 溯源选拉：按 session 拉取 user/assistant 核心对话（跳过 tool/toolResult）
