@@ -64,6 +64,8 @@ export function createTestDb(): DatabaseSyncInstance {
       created_at  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS ix_gm_msg_session ON gm_messages(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention
+      ON gm_messages(extracted, created_at, session_id, turn_index);
   `);
 
   // m3: 信号

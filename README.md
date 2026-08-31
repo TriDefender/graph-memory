@@ -196,7 +196,7 @@ graph-memory/
 | Visible plugin state | **Done** | Active in Plugin Inventory |
 | Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.9`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 130 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
+Current beta: `1.6.0-beta.10`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, bounded raw-message retention, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 139 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -226,7 +226,7 @@ cd graph-memory
 npm install
 npm test
 npm pack
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.9.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.10.tgz
 ```
 
 After installation, verify that `graph-memory/dsh` is enabled under **Settings → Plugins → Plugin list**.
@@ -257,14 +257,38 @@ Without embeddings, Graph Memory continues with FTS5 and does not block conversa
 
 ![Vector status](docs/images/dsh/vector-status.png)
 
+## Durable message retention (opt-in)
+
+DSH context compaction and SQLite retention are intentionally separate. Compaction bounds the model surface; it does not delete provenance from `gm_messages`. The default policy is `keep: all`, so upgrading never removes existing data.
+
+For large stores, configure `messageRetention` on `graph-memory/dsh` and roll it out in dry-run mode first:
+
+```yaml
+messageRetention:
+  keep: referenced
+  recentTurns: 20
+  retentionDays: 30
+  batchSize: 500
+  dryRun: true
+```
+
+- `all`: preserve every durable event; this is the default.
+- `referenced`: prune extracted, unreferenced rows; optional turn/day windows remain protected.
+- `recent`: requires `recentTurns` or `retentionDays`, and also always preserves referenced or pending rows.
+
+`recentTurns` counts real user turns per session and keeps their following assistant/tool events. When both windows are set, a row is eligible only after it falls outside both. Invalid timestamps are retained. Each maintenance tick uses one bounded transaction, re-checks `gm_node_sources`, and never runs `VACUUM` automatically.
+
+Before enabling deletion, back up `$DSH_HOME/graph-memory/graph-memory.db`, keep `dryRun: true`, run `gm_maintain`, and inspect `gm_stats`. Change `dryRun` to `false` only after the candidate receipt matches the intended policy.
+
 ## DSH tools
 
 | Tool | Purpose |
 |---|---|
-| `gm_status` | Plugin, store, extraction, recall, and vector state |
+| `gm_status` | Plugin, store, extraction, recall, vector, and retention state |
 | `gm_search` | Explicit long-term graph search |
 | `gm_record` | Persist a TASK, SKILL, or EVENT |
-| `gm_stats` | Node, edge, type, and community statistics |
+| `gm_stats` | Graph, durable-message, and retention receipts/statistics |
+| `gm_maintain` | Run one bounded graph + configured retention maintenance tick |
 
 Automatic recall does not require an explicit `gm_search` tool call. The plugin retrieves relevant memory during Prompt Assembly.
 

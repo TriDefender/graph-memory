@@ -10,6 +10,15 @@
         autoRecallMinScore: 0.6
         recallTokenBudget: 4096
         maintenanceInterval: 6
+        # Durable events are separate from the compacted model surface. The
+        # safe default never deletes raw messages. To opt in, first use
+        # keep: referenced with dryRun: true and inspect gm_stats/gm_maintain.
+        messageRetention:
+          keep: all
+          recentTurns: 0
+          retentionDays: 0
+          batchSize: 500
+          dryRun: false
         # Graph Memory retains the newest real user turns and asks the agent's
         # public DSH compaction provider to summarize/replace the older prefix.
         contextCompactionEnabled: true

@@ -72,11 +72,19 @@ function migrate(db) {
         m7_community_signature,
         m8_backfill_community_signatures,
         m9_node_sources,
+        m10_message_retention_index,
     ];
     for (let i = cur; i < steps.length; i++) {
         steps[i](db);
         db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
     }
+}
+// ─── 有界原始消息保留策略查询 ────────────────────────────────
+function m10_message_retention_index(db) {
+    db.exec(`
+    CREATE INDEX IF NOT EXISTS ix_gm_msg_retention
+    ON gm_messages(extracted, created_at, session_id, turn_index);
+  `);
 }
 // ─── 精确溯源：图节点 → 原始消息 ──────────────────────────────
 function m9_node_sources(db) {
