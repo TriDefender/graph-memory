@@ -24,6 +24,7 @@
  */
 
 import { stat } from "node:fs/promises";
+import { LlmFailureGuard } from "./llm-guard.ts";
 import {
   loadOAuthSession,
   needsRefresh,
@@ -185,7 +186,7 @@ export function createCompleteFn(
     return session;
   }
 
-  return async (system, user) => {
+  const complete = async (system: string, user: string): Promise<string> => {
     // ── 路径 C：OAuth Codex Responses API ──
     if (provider === "oauth") {
       if (!oauthPath) {
@@ -334,5 +335,25 @@ export function createCompleteFn(
       (reasoningTokens ? ` — reasoning consumed ${reasoningTokens} of ${maxTokens} tokens` : "") +
       `. Raise llm.maxTokens if recurring.`,
     );
+  };
+
+  // ── 失败冷却守卫：持久性配置错误（401/403/404）后冷却 10 分钟，快速失败 ──
+  // 避免凭证失效/模型名错误时每轮照付一次完整请求 + 超时等待。成功调用即清除。
+  const guard = new LlmFailureGuard();
+  return async (system: string, user: string): Promise<string> => {
+    if (!guard.canRun()) {
+      const seconds = Math.max(1, Math.ceil(guard.remainingMs() / 1000));
+      throw new Error(
+        `[graph-memory] LLM paused for ${seconds}s after a previous permanent API error`,
+      );
+    }
+    try {
+      const text = await complete(system, user);
+      guard.reset();
+      return text;
+    } catch (err) {
+      guard.tripIfNeeded(err);
+      throw err;
+    }
   };
 }
