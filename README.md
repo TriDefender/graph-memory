@@ -210,13 +210,13 @@ Inspect the graph with the bundled Cypher shell:
 | `gm_unlink` | Remove edges between two nodes by name; optional `type` filter, otherwise all from→to edges |
 | `gm_merge` | Merge two same-type duplicate nodes: keep absorbs content/validatedCount/sessions + dedup-aware edge migration; merge is soft-deleted |
 | `gm_stats` | Show node, relationship, community, and PageRank statistics |
-| `gm_maintain` | Run deduplication, PageRank, and community maintenance |
+| `gm_maintain` | Run decay scoring, deduplication, PageRank, and community maintenance |
 
 ## Development
 
 ```bash
 npm install
-npm run build     # tsc --noEmit
+npm run build     # compiles to dist/
 npm test          # unit tests only (no Neo4j required)
 ```
 

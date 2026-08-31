@@ -62,6 +62,7 @@ bash setup-graph-memory-pro.sh --uninstall
             "password": "你的 Neo4j 密码"
           },
           "llm": {
+            "provider": "openai",
             "apiKey": "你的 LLM API Key",
             "baseURL": "https://api.openai.com/v1",
             "model": "gpt-4o-mini"
@@ -79,7 +80,40 @@ bash setup-graph-memory-pro.sh --uninstall
 }
 ```
 
+Anthropic 直连（Claude）——去掉 `baseURL`，切换 `provider`：
+
+```json
+"llm": {
+  "provider": "anthropic",
+  "apiKey": "sk-ant-...",
+  "model": "claude-3-5-sonnet-20241022"
+}
+```
+
 `embedding` 可选。设置时，`dimensions` 必须与 Neo4j 向量索引维度一致。新数据库会在插件启动时按配置创建索引；更换维度后需要重建向量索引或 Neo4j 数据库。
+
+### 记忆衰减（遗忘曲线）
+
+每个维护周期对全部 active 节点做三因子加权评分（recency + frequency + intrinsic），并在三个 tier 之间双向转换：`core` / `working` / `peripheral`。衰减不会把节点置为 `status=deprecated`——只有手动弃用 / 合并才会。decay 只调整 `tier`，所有 active 节点始终保持可搜索。
+
+完整公式、字段映射、默认值依据与调参指南见 **[`docs/decay.md`](docs/decay.md)**。
+
+最小配置（所有字段可选，默认值如下）：
+
+```json
+"decay": { "enabled": true }
+```
+
+常用覆盖——完整参数见 `docs/decay.md` §4：
+
+```json
+"decay": {
+  "enabled": true,
+  "recencyHalfLifeDays": 30,
+  "peripheralCompositeThreshold": 0.15,
+  "workingAccessThreshold": 3
+}
+```
 
 ### cron 会话行为控制
 
@@ -122,7 +156,7 @@ openclaw graph-memory auth login
   -> embedding -> 向量召回 + 社区扩展 + GDS PPR
   -> XML 上下文注入
 
-会话结束 -> 去重 -> 全局 PageRank -> 社区 -> 社区摘要
+会话结束 -> 衰减（遗忘曲线）-> 去重 -> 全局 PageRank -> 社区 -> 社区摘要
 ```
 
 ## 验证
@@ -156,7 +190,7 @@ openclaw gateway --verbose
 | `gm_unlink` | 按名称删除两节点之间的关系边；可选 type 过滤，不传则删除 from→to 之间所有边 |
 | `gm_merge` | 合并两个同类型重复节点：keep 吸收 content/validatedCount/sessions + 去重边迁移；merge 节点被软删除（deprecated） |
 | `gm_stats` | 查看节点、关系、社区和 PageRank 统计 |
-| `gm_maintain` | 执行去重、PageRank 和社区维护 |
+| `gm_maintain` | 执行衰减评分、去重、PageRank 和社区维护 |
 
 ## 开发
 
