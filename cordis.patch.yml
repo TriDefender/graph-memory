@@ -10,6 +10,18 @@
         autoRecallMinScore: 0.6
         recallTokenBudget: 4096
         maintenanceInterval: 6
+        # Extraction is lossless: these limits bound temporary LLM projections
+        # only. Original DSH events remain complete in SQLite. Repeated poison
+        # inputs are quarantined for explicit gm_retry_extraction recovery.
+        extractionDrain:
+          maxBatchChars: 8000
+          maxBatchMessages: 15
+          existingNamesMaxEntries: 150
+          existingNamesMaxChars: 3000
+          streamTimeoutMs: 180000
+          maxRetries: 2
+          retryDelaysMs: [5000, 15000]
+          shutdownGraceMs: 30000
         # Durable events are separate from the compacted model surface. The
         # safe default never deletes raw messages. To opt in, first use
         # keep: referenced with dryRun: true and inspect gm_stats/gm_maintain.

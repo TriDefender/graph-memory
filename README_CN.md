@@ -178,7 +178,7 @@ graph-memory/
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.10`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、有界原始消息保留策略、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；139 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
+当前 beta：`1.6.0-beta.11`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web / Headless profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、无损有界抽取队列、失败隔离与恢复、有界原始消息保留策略、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；149 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -269,6 +269,9 @@ messageRetention:
 | `gm_record` | 确定性记录 TASK、SKILL 或 EVENT |
 | `gm_stats` | 查看图谱、原始消息和保留策略回执/统计 |
 | `gm_maintain` | 执行一次有界图维护与已配置的消息保留批次 |
+| `gm_retry_extraction` | 将隔离的抽取失败消息重新入队，不删除或截断原始对话 |
+
+抽取队列默认按 8,000 个字符和 15 条消息限制单次临时投影。超长的单条消息会按语义边界分段抽取，SQLite 中的原始事件保持完整；连续失败的消息进入 `quarantined`，不会伪装成已抽取，也不会被消息保留策略删除。`gm_status` / `gm_stats` 会分别显示 pending、succeeded 和 quarantined 数量。参数统一位于 `extractionDrain`，默认值见 `cordis.patch.yml`。
 
 自动召回不要求模型主动调用 `gm_search`；适配器会在 Prompt Assembly 阶段检索并注入相关记忆。
 
@@ -370,7 +373,7 @@ npm pack
 ## 当前限制
 
 - 自动抽取依赖辅助模型输出稳定性；关键知识在 beta 阶段建议使用 `gm_record`。
-- DSH 版暂未提供 `gm_update` 和 `gm_maintain`，这两个工具目前属于 OpenClaw 入口。
+- DSH 版暂未提供 `gm_update`；`gm_maintain` 与 `gm_retry_extraction` 已作为原生工具提供。
 - Pro Lite 目前只有只读卡片式 Client；2D/3D、分屏和受控拖拽尚未实现。
 - npm registry 发布尚未完成，当前使用 GitHub 源码 tarball 安装。
 

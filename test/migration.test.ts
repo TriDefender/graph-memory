@@ -70,6 +70,10 @@ describe("database migrations", () => {
       INSERT INTO gm_communities
         (id, summary, node_count, embedding, created_at, updated_at)
         VALUES ('c1', 'legacy summary', 2, NULL, 1, 1);
+      INSERT INTO gm_messages
+        (id, session_id, turn_index, role, content, extracted, created_at)
+        VALUES ('done', 's1', 1, 'user', 'done', 1, 1),
+               ('todo', 's1', 2, 'assistant', 'todo', 0, 2);
     `);
     const migration = legacy.prepare("INSERT INTO _migrations (v, at) VALUES (?, ?)");
     for (let version = 1; version <= 6; version++) migration.run(version, 1);
@@ -85,12 +89,22 @@ describe("database migrations", () => {
     expect(row.member_signature).toMatch(/^[a-f0-9]{40}$/);
     expect(
       (upgraded.prepare("SELECT MAX(v) AS version FROM _migrations").get() as any).version,
-    ).toBe(10);
+    ).toBe(11);
     const sourceColumns = upgraded.prepare("PRAGMA table_info(gm_node_sources)").all() as Array<{ name: string }>;
     expect(sourceColumns.map((column) => column.name)).toEqual([
       "node_id", "session_id", "message_id", "turn_index",
     ]);
     const messageIndexes = upgraded.prepare("PRAGMA index_list(gm_messages)").all() as Array<{ name: string }>;
     expect(messageIndexes.some((index) => index.name === "ix_gm_msg_retention")).toBe(true);
+    expect(messageIndexes.some((index) => index.name === "ix_gm_msg_extraction_queue")).toBe(true);
+    const messageColumns = upgraded.prepare("PRAGMA table_info(gm_messages)").all() as Array<{ name: string }>;
+    expect(messageColumns.map(column => column.name)).toContain("extraction_state");
+    const queueRows = upgraded.prepare(
+      "SELECT id, extraction_state FROM gm_messages ORDER BY id",
+    ).all() as Array<{ id: string; extraction_state: string }>;
+    expect(queueRows).toEqual([
+      { id: "done", extraction_state: "succeeded" },
+      { id: "todo", extraction_state: "pending" },
+    ]);
   });
 });

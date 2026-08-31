@@ -185,7 +185,7 @@ function selectCandidates(
       length(CAST(m.content AS BLOB)) AS content_bytes
     FROM gm_messages m
     ${recentJoin}
-    WHERE m.extracted=1
+    WHERE m.extracted=1 AND m.extraction_state='succeeded'
       AND NOT EXISTS (
         SELECT 1 FROM gm_node_sources source WHERE source.message_id=m.id
       )
@@ -228,7 +228,7 @@ export function runMessageRetention(
       const deleted = db.prepare(`
         DELETE FROM gm_messages
         WHERE id IN (${placeholders})
-          AND extracted=1
+          AND extracted=1 AND extraction_state='succeeded'
           AND NOT EXISTS (
             SELECT 1 FROM gm_node_sources source WHERE source.message_id=gm_messages.id
           )

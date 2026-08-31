@@ -16,8 +16,8 @@ function insertMessage(
 ) {
   db.prepare(`
     INSERT INTO gm_messages
-      (id, session_id, turn_index, role, content, extracted, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+      (id, session_id, turn_index, role, content, extracted, extraction_state, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     session,
@@ -25,6 +25,7 @@ function insertMessage(
     role,
     options.content ?? `${role}-${turn}`,
     options.extracted ?? 1,
+    (options.extracted ?? 1) === 1 ? "succeeded" : "pending",
     options.createdAt ?? 1_700_000_000_000 + turn,
   );
 }
@@ -69,6 +70,22 @@ describe("message retention policy", () => {
     expect(result.deletedRows).toBe(1);
     expect(ids(db)).toEqual(["pending", "referenced"]);
     expect(db.prepare("SELECT COUNT(*) AS count FROM gm_node_sources").get()).toEqual({ count: 1 });
+    db.close();
+  });
+
+  it("never deletes quarantined messages even if a legacy flag is inconsistent", () => {
+    const db = createTestDb();
+    insertMessage(db, "safe", "s1", 1, "user");
+    db.prepare(`
+      UPDATE gm_messages SET extraction_state='quarantined' WHERE id='safe'
+    `).run();
+
+    const result = runMessageRetention(
+      db,
+      normalizeMessageRetentionPolicy({ keep: "referenced", batchSize: 10 }),
+    );
+    expect(result.deletedRows).toBe(0);
+    expect(ids(db)).toEqual(["safe"]);
     db.close();
   });
 

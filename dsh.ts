@@ -15,13 +15,23 @@ import {
   getStats,
   getVectorStats,
   getUnextracted,
-  markExtracted,
+  getExtractionStats,
+  getPendingSessionIds,
+  markMessagesExtracted,
+  quarantineMessages,
+  recordExtractionFailure,
+  requeueQuarantined,
   saveMessageOnce,
   updateNode,
   upsertEdge,
   upsertNode,
 } from "./src/store/store.ts";
 import { Extractor, normalizeExtractionContent } from "./src/extractor/extract.ts";
+import {
+  normalizeExtractionDrainPolicy,
+  splitExtractionContent,
+  type ExtractionDrainConfig,
+} from "./src/extractor/drain-policy.ts";
 import { Recaller } from "./src/recaller/recall.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { selectDshRollingCompactionRange } from "./src/format/dsh-compaction.ts";
@@ -38,23 +48,8 @@ import {
   type MessageRetentionResult,
 } from "./src/store/retention.ts";
 
-// Extraction resilience bounds (see extractPending / drainBatch):
-// - one extraction request is capped by accumulated normalized characters,
-//   then by message count, so a burst of long tool results cannot build a
-//   request that stalls the LLM stream for the whole timeout;
-// - a stalled stream (no finish/error chunk) is hard-bounded by this timeout;
-// - a batch that still fails after retries is bisected, and a single message
-//   that keeps failing is marked extracted so the drain can never deadlock.
-const EXTRACTION_BATCH_MAX_CHARS = 8_000;
-const EXTRACTION_BATCH_MAX_MESSAGES = 15;
-const EXTRACTION_NAMES_MAX_ENTRIES = 150;
-const EXTRACTION_NAMES_MAX_CHARS = 3_000;
-const EXTRACTION_STREAM_TIMEOUT_MS = 180_000;
-const EXTRACTION_MAX_RETRIES = 2;
-const EXTRACTION_RETRY_DELAYS_MS = [5_000, 15_000];
-
 export const name = "graph-memory-dsh";
-export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "agentPresets", "sessions", "credentials"];
+export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "sessions", "credentials"];
 
 interface DshEmbeddingConfig {
   apiKeyEnv?: string;
@@ -85,9 +80,11 @@ export interface Config {
   llmModel?: string;
   llmMaxTokens?: number;
   embedding?: DshEmbeddingConfig;
-  /** Override the extraction stream hard timeout (ms). Default 180s. */
+  /** Bounded, lossless and durable extraction queue policy. */
+  extractionDrain?: ExtractionDrainConfig;
+  /** @deprecated Use extractionDrain.streamTimeoutMs. */
   extractionStreamTimeoutMs?: number;
-  /** Override extraction retry backoff delays (ms) per attempt. Default [5s, 15s]. */
+  /** @deprecated Use extractionDrain.retryDelaysMs. */
   extractionRetryDelaysMs?: number[];
 }
 
@@ -114,9 +111,10 @@ interface DshContext {
   agents?: {
     get(id: unknown): any;
   };
-  agentPresets: {
+  agentPresets?: {
     serviceFor(agent: any, key: string): any;
   };
+  get?(name: string): any;
   on(event: string, listener: (...args: any[]) => any, options?: Record<string, unknown>): () => void;
   effect(register: () => (() => void | Promise<void>), label?: string): () => void;
 }
@@ -203,6 +201,11 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     throw new TypeError(`[graph-memory] maintenanceInterval must be a positive integer, received ${maintenanceInterval}`);
   }
   const messageRetention = normalizeMessageRetentionPolicy(input.messageRetention);
+  const extractionDrain = normalizeExtractionDrainPolicy({
+    ...input.extractionDrain,
+    streamTimeoutMs: input.extractionDrain?.streamTimeoutMs ?? input.extractionStreamTimeoutMs,
+    retryDelaysMs: input.extractionDrain?.retryDelaysMs ?? input.extractionRetryDelaysMs,
+  });
   const credentialRef = input.embedding?.apiKeyEnv;
   if (credentialRef && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
     throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
@@ -236,6 +239,8 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   let embeddingState: "fts-only" | "initializing" | "vector-ready" | "degraded" =
     embeddingConfigured ? "initializing" : "fts-only";
   let closing = false;
+  let abortingExtraction = false;
+  const activeExtractionControllers = new Set<AbortController>();
   let warnedMissingCompaction = false;
   const compactionAttached = new WeakSet<object>();
   const compactionMetrics = {
@@ -284,50 +289,67 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       throw new Error("[graph-memory] DSH has not recorded a model route yet; send one normal message first or configure llmProvider/llmModel");
     }
 
-    const chunks = ctx.llm.stream({
-      provider: selectedRoute.provider,
-      model: selectedRoute.model,
-      system,
-      temperature: 0.1,
-      maxTokens: input.llmMaxTokens ?? 4096,
-      messages: [{
-        id: randomUUID(),
-        role: "user",
-        content: [{ type: "text", text: user }],
-        source: { kind: "plugin", plugin: PLUGIN },
-      }],
-    });
-
+    const controller = new AbortController();
+    activeExtractionControllers.add(controller);
     let text = "";
     let blockText = "";
-    // A streaming LLM call can stall without ever emitting a finish/error
-    // chunk (observed in the wild with long extraction batches). Bound the
-    // whole stream with a hard timeout so a hung provider cannot pin this
-    // session's extraction chain forever — previously this loop had no
-    // timeout at all, and a stall blocked every later turn's extraction.
     let streamTimer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = await Promise.race([
-      (async (): Promise<boolean> => {
-        for await (const chunk of chunks) {
+    let iterator: AsyncIterator<any> | undefined;
+    const timeoutError = new Error(
+      `[graph-memory] DSH LLM extraction stream timed out after ${extractionDrain.streamTimeoutMs / 1000}s`,
+    );
+    try {
+      const chunks = ctx.llm.stream({
+        provider: selectedRoute.provider,
+        model: selectedRoute.model,
+        system,
+        temperature: 0.1,
+        maxTokens: input.llmMaxTokens ?? 4096,
+        signal: controller.signal,
+        messages: [{
+          id: randomUUID(),
+          role: "user",
+          content: [{ type: "text", text: user }],
+          source: { kind: "plugin", plugin: PLUGIN },
+        }],
+      });
+      iterator = chunks[Symbol.asyncIterator]();
+      const consume = (async () => {
+        while (true) {
+          const current = await iterator!.next();
+          if (current.done) break;
+          const chunk = current.value;
           if (chunk?.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
           if (chunk?.type === "block-end" && chunk.block?.type === "text") blockText += chunk.block.text ?? "";
           if (chunk?.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
             throw new Error(`[graph-memory] DSH LLM ${chunk.reason.kind}: ${chunk.reason.failure?.message ?? "unknown failure"}`);
           }
         }
-        return false;
-      })(),
-      new Promise<boolean>((resolve) => {
-        streamTimer = setTimeout(() => resolve(true), input.extractionStreamTimeoutMs ?? EXTRACTION_STREAM_TIMEOUT_MS);
-      }),
-    ]);
-    if (streamTimer) clearTimeout(streamTimer);
-    if (timedOut) {
-      throw new Error(`[graph-memory] DSH LLM extraction stream timed out after ${EXTRACTION_STREAM_TIMEOUT_MS / 1000}s (no finish chunk)`);
+      })();
+      await Promise.race([
+        consume,
+        new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener("abort", () => {
+            reject(controller.signal.reason ?? new Error("[graph-memory] extraction aborted"));
+          }, { once: true });
+        }),
+        new Promise<never>((_resolve, reject) => {
+          streamTimer = setTimeout(() => {
+            controller.abort(timeoutError);
+            reject(timeoutError);
+          }, extractionDrain.streamTimeoutMs);
+        }),
+      ]);
+      const result = text || blockText;
+      if (!result.trim()) throw new Error("[graph-memory] DSH LLM returned empty extraction output");
+      return result;
+    } finally {
+      if (streamTimer) clearTimeout(streamTimer);
+      activeExtractionControllers.delete(controller);
+      if (controller.signal.aborted && iterator?.return) {
+        void Promise.resolve(iterator.return()).catch(() => undefined);
+      }
     }
-    const result = text || blockText;
-    if (!result.trim()) throw new Error("[graph-memory] DSH LLM returned empty extraction output");
-    return result;
   }
 
   function ingest(sessionId: unknown, event: any): boolean {
@@ -380,121 +402,164 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     invalidateGraphCache();
   }
 
-  // Bound the dedup/name hint list fed into extraction. Unbounded it could
-  // grow to tens of thousands of characters (every node name ever created
-  // for this session), pushing the request over the LLM context window.
+  // Existing names are only deduplication hints. Select them deterministically
+  // so the same graph produces the same bounded prompt across restarts.
   function existingNameList(sid: string): string[] {
     const names: string[] = [];
     let chars = 0;
-    for (const node of getBySession(db, sid)) {
+    const nodes = getBySession(db, sid).sort((left, right) => (
+      right.updatedAt - left.updatedAt ||
+      right.validatedCount - left.validatedCount ||
+      left.name.localeCompare(right.name)
+    ));
+    for (const node of nodes) {
       const name = typeof node.name === "string" ? node.name : "";
       if (!name) continue;
-      if (names.length >= EXTRACTION_NAMES_MAX_ENTRIES || (names.length > 0 && chars + name.length > EXTRACTION_NAMES_MAX_CHARS)) break;
+      if (names.length >= extractionDrain.existingNamesMaxEntries) break;
+      if (chars + name.length > extractionDrain.existingNamesMaxChars) continue;
       names.push(name);
       chars += name.length;
     }
     return names;
   }
 
-  // Extract one bounded batch with resilience: retry transient failures with
-  // backoff, then bisect so a single poison message cannot sink the rest, and
-  // only as a last resort mark a lone failing message extracted so the drain
-  // always makes progress. The previous behaviour stopped the whole drain on
-  // the first error and left the batch unextracted forever — every restart
-  // retried the same failing batch, pinning the backlog indefinitely.
-  async function drainBatch(sessionId: unknown, sid: string, messages: any[], attempt: number): Promise<void> {
-    if (closing) return;
-    // A single message that keeps failing would pin the drain forever. Mark
-    // it extracted (the raw message stays in gm_messages) after retries so
-    // the rest of the backlog can still be learned from.
-    if (messages.length === 1 && attempt > 0) {
-      markExtracted(db, sid, Number(messages[0].turn_index));
-      ctx.logger.warn(`[graph-memory] DSH extraction SKIP turn=${messages[0].turn_index} after ${attempt} tries for ${sid}`);
-      return;
+  const retryCancels = new Set<() => void>();
+
+  async function waitForRetry(delayMs: number): Promise<boolean> {
+    if (abortingExtraction) return false;
+    if (delayMs === 0) return true;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (value: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        retryCancels.delete(cancel);
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish(true), delayMs);
+      const cancel = () => finish(false);
+      retryCancels.add(cancel);
+    });
+  }
+
+  async function extractOnce(sessionId: unknown, sid: string, messages: any[]): Promise<void> {
+    const route = latestRoute.get(String(sessionId));
+    const extractor = new Extractor(config, (system, user) => complete(route, system, user));
+    const result = await extractor.extract({ messages, existingNames: existingNameList(sid) });
+    const names = new Map<string, string>();
+    for (const candidate of result.nodes) {
+      const { node } = upsertNode(db, candidate, sid, extractionSources(candidate, messages));
+      names.set(node.name, node.id);
+      void recaller.syncEmbed(node);
     }
-    try {
-      // Extraction follows this exact conversation's latest logged route. A
-      // shared "last model wins" closure would mix providers when sessions
-      // finish concurrently.
-      const route = latestRoute.get(String(sessionId));
-      const extractor = new Extractor(config, (system, user) => complete(route, system, user));
-      const existingNames = existingNameList(sid);
-      const result = await extractor.extract({ messages, existingNames });
-      const names = new Map<string, string>();
-      for (const candidate of result.nodes) {
-        const { node } = upsertNode(db, candidate, sid, extractionSources(candidate, messages));
-        names.set(node.name, node.id);
-        void recaller.syncEmbed(node);
+    for (const edge of result.edges) {
+      const fromId = names.get(edge.from) ?? findByName(db, edge.from)?.id;
+      const toId = names.get(edge.to) ?? findByName(db, edge.to)?.id;
+      if (!fromId || !toId) continue;
+      upsertEdge(db, {
+        fromId,
+        toId,
+        type: edge.type,
+        instruction: edge.instruction,
+        condition: edge.condition,
+        sessionId: sid,
+      });
+    }
+    if (result.nodes.length || result.edges.length) invalidateGraphCache();
+    ctx.logger.info(`[graph-memory] DSH extracted ${result.nodes.length} nodes and ${result.edges.length} edges from ${sid}`);
+  }
+
+  async function extractWithRetries(sessionId: unknown, sid: string, messages: any[]): Promise<Error | undefined> {
+    const ids = Array.from(new Set(messages.map(message => String(message.id))));
+    for (let attempt = 0; attempt <= extractionDrain.maxRetries; attempt += 1) {
+      if (abortingExtraction) return new Error("[graph-memory] extraction aborted during shutdown");
+      try {
+        await extractOnce(sessionId, sid, messages);
+        return;
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        const retrying = attempt < extractionDrain.maxRetries;
+        const delayMs = retrying ? extractionDrain.retryDelaysMs[attempt] : 0;
+        recordExtractionFailure(db, ids, error.message, retrying ? Date.now() + delayMs : null);
+        if (!retrying) return error;
+        ctx.logger.warn(`[graph-memory] DSH extraction retry ${attempt + 1}/${extractionDrain.maxRetries} in ${Math.round(delayMs / 1000)}s for ${sid}: ${error.message}`);
+        if (!await waitForRetry(delayMs)) return new Error("[graph-memory] extraction aborted during shutdown");
       }
-      for (const edge of result.edges) {
-        const fromId = names.get(edge.from) ?? findByName(db, edge.from)?.id;
-        const toId = names.get(edge.to) ?? findByName(db, edge.to)?.id;
-        if (!fromId || !toId) continue;
-        upsertEdge(db, {
-          fromId,
-          toId,
-          type: edge.type,
-          instruction: edge.instruction,
-          condition: edge.condition,
-          sessionId: sid,
-        });
-      }
-      markExtracted(db, sid, Math.max(...messages.map((message: any) => Number(message.turn_index))));
-      if (result.nodes.length || result.edges.length) invalidateGraphCache();
-      ctx.logger.info(`[graph-memory] DSH extracted ${result.nodes.length} nodes and ${result.edges.length} edges from ${sid}`);
-    } catch (error) {
-      // Back off and retry a couple of times for transient provider hiccups.
-      if (attempt < EXTRACTION_MAX_RETRIES) {
-        const retryDelays = input.extractionRetryDelaysMs ?? EXTRACTION_RETRY_DELAYS_MS;
-        const delayMs = retryDelays[attempt] ?? 15_000;
-        ctx.logger.warn(`[graph-memory] DSH extraction retry in ${Math.round(delayMs / 1000)}s for ${sid}: ${String(error)}`);
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        return drainBatch(sessionId, sid, messages, attempt + 1);
-      }
-      // Still failing: bisect so one poison message cannot sink the rest.
-      if (messages.length > 1) {
-        const mid = Math.ceil(messages.length / 2);
-        ctx.logger.warn(`[graph-memory] DSH extraction split ${messages.length} -> ${mid}+${messages.length - mid} for ${sid}: ${String(error)}`);
-        await drainBatch(sessionId, sid, messages.slice(0, mid), 0);
-        await drainBatch(sessionId, sid, messages.slice(mid), 0);
+    }
+    return new Error("[graph-memory] extraction retry loop ended unexpectedly");
+  }
+
+  async function drainBatch(sessionId: unknown, sid: string, messages: any[]): Promise<void> {
+    if (abortingExtraction || !messages.length) return;
+    if (messages.length === 1) {
+      const original = messages[0];
+      const chunks = splitExtractionContent(String(original.content ?? ""), extractionDrain.maxBatchChars);
+      if (chunks.length > 1) {
+        for (let index = 0; index < chunks.length; index += 1) {
+          const error = await extractWithRetries(sessionId, sid, [{ ...original, content: chunks[index] }]);
+          if (error) {
+            quarantineMessages(db, [String(original.id)], error.message);
+            ctx.logger.warn(`[graph-memory] DSH extraction quarantined turn=${original.turn_index}, segment=${index + 1}/${chunks.length} for ${sid}: ${error.message}`);
+            return;
+          }
+        }
+        markMessagesExtracted(db, [String(original.id)]);
+        ctx.logger.info(`[graph-memory] DSH losslessly extracted turn=${original.turn_index} in ${chunks.length} bounded segments for ${sid}`);
         return;
       }
-      markExtracted(db, sid, Number(messages[0].turn_index));
-      ctx.logger.warn(`[graph-memory] DSH extraction SKIP turn=${messages[0].turn_index} after ${EXTRACTION_MAX_RETRIES + 1} tries for ${sid}`);
     }
+
+    const error = await extractWithRetries(sessionId, sid, messages);
+    if (!error) {
+      markMessagesExtracted(db, messages.map(message => String(message.id)));
+      return;
+    }
+    if (messages.length > 1) {
+      const mid = Math.ceil(messages.length / 2);
+      ctx.logger.warn(`[graph-memory] DSH extraction split ${messages.length} -> ${mid}+${messages.length - mid} for ${sid}: ${error.message}`);
+      await drainBatch(sessionId, sid, messages.slice(0, mid));
+      await drainBatch(sessionId, sid, messages.slice(mid));
+      return;
+    }
+    quarantineMessages(db, [String(messages[0].id)], error.message);
+    ctx.logger.warn(`[graph-memory] DSH extraction quarantined turn=${messages[0].turn_index} after ${extractionDrain.maxRetries + 1} attempts for ${sid}: ${error.message}`);
   }
 
   async function extractPending(sessionId: unknown): Promise<void> {
-    if (!extractionEnabled || closing) return;
+    if (!extractionEnabled || abortingExtraction) return;
     const sid = sessionKey(sessionId);
-    while (!closing) {
-      // Take the oldest unextracted messages in order, bounded by accumulated
-      // normalized length first (a single long message always fits so the
-      // drain can make progress), then by count. Order matters: we mark
-      // extracted up to the max turn_index of the batch, so skipping a
-      // middle message would mis-mark it as extracted.
+    while (!abortingExtraction) {
       const messages: any[] = [];
       let chars = 0;
-      for (const message of getUnextracted(db, sid, EXTRACTION_BATCH_MAX_MESSAGES * 16)) {
+      for (const message of getUnextracted(db, sid, extractionDrain.maxBatchMessages * 16)) {
         const content = normalizeExtractionContent(message.content);
-        if (messages.length > 0 && chars + content.length > EXTRACTION_BATCH_MAX_CHARS) break;
+        const contentChars = Array.from(content).length;
+        if (messages.length > 0 && chars + contentChars > extractionDrain.maxBatchChars) break;
         messages.push({ ...message, content });
-        chars += content.length;
-        if (messages.length >= EXTRACTION_BATCH_MAX_MESSAGES) break;
+        chars += contentChars;
+        if (messages.length >= extractionDrain.maxBatchMessages || chars >= extractionDrain.maxBatchChars) break;
       }
       if (!messages.length) return;
-      await drainBatch(sessionId, sid, messages, 0);
+      await drainBatch(sessionId, sid, messages);
     }
   }
 
-  function scheduleExtract(sessionId: unknown): void {
+  function scheduleExtract(sessionId: unknown): Promise<void> {
+    if (!extractionEnabled || closing) return Promise.resolve();
     const key = String(sessionId);
-    const previous = extractChain.get(key) ?? Promise.resolve();
-    const next = previous.then(() => extractPending(sessionId));
+    const previous = extractChain.get(key);
+    const running = previous
+      ? previous.then(() => extractPending(sessionId))
+      : extractPending(sessionId);
+    const next = running.catch(error => {
+      ctx.logger.error(`[graph-memory] DSH extraction queue failed for ${key}: ${String(error)}`);
+    });
     extractChain.set(key, next);
-    void next.finally(() => {
+    void next.then(() => {
       if (extractChain.get(key) === next) extractChain.delete(key);
     });
+    return next;
   }
 
   function runConfiguredRetention(): MessageRetentionResult {
@@ -561,7 +626,6 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     const id = agent?.id ?? agent?.session?.id;
     if (id === undefined || !Array.isArray(agent?.session?.events)) return;
     for (const event of agent.session.events) ingest(id, event);
-    scheduleExtract(id);
   }
 
   // Graph Memory owns the rolling retention policy while DSH's public
@@ -587,7 +651,10 @@ export function apply(ctx: DshContext, input: Config = {}): void {
           // Agent preset services live in an isolated standing scope. Use
           // DSH's public roster seam instead of reaching through Cordis scope
           // internals or requiring a change in Harness itself.
-          const compaction = ctx.agentPresets.serviceFor(agent, "compaction");
+          const agentPresets = typeof ctx.get === "function"
+            ? ctx.get("agentPresets")
+            : ctx.agentPresets;
+          const compaction = agentPresets?.serviceFor?.(agent, "compaction");
           if (!compaction?.compactRegion) {
             compactionMetrics.unavailable += 1;
             if (!warnedMissingCompaction) {
@@ -636,6 +703,18 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     backfill(agent);
   });
 
+  // DSH declares this as a serial, awaited lifecycle event before turn/end is
+  // committed. It is the reliable drain boundary for one-shot Headless: LLM
+  // adapters are still registered here, unlike ordinary session/event emit
+  // observers whose returned promises are intentionally ignored.
+  ctx.on("agent/turn-stopping", async ({ agent, signal }: any) => {
+    if (signal?.aborted) return;
+    const id = agent?.id ?? agent?.session?.id;
+    if (id === undefined) return;
+    backfill(agent);
+    await scheduleExtract(id);
+  });
+
   ctx.on("session/event", (session: any, event: any) => {
     const id = session?.id;
     if (id === undefined) return;
@@ -648,7 +727,9 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     ingest(id, event);
     recordCompactionCapsule(id, event);
     if (event?.type === "turn/end") {
-      scheduleExtract(id);
+      // This is a background fallback for hosts that do not expose the Agent
+      // turn-stopping boundary. DSH itself drains synchronously above.
+      void scheduleExtract(id);
       maintain(id);
     }
   });
@@ -738,8 +819,9 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         ? ` (${input.embedding.model})`
         : "";
       const messageCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get() as any)?.count ?? 0);
+      const extraction = getExtractionStats(db);
       const retentionRevision = messageRetentionPolicyRevision(messageRetention);
-      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
+      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"} (pending=${extraction.pending}, succeeded=${extraction.succeeded}, quarantined=${extraction.quarantined})\nExtraction drain: maxChars=${extractionDrain.maxBatchChars}, maxMessages=${extractionDrain.maxBatchMessages}, retries=${extractionDrain.maxRetries}, timeoutMs=${extractionDrain.streamTimeoutMs}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
     },
   });
 
@@ -797,7 +879,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     execute: async () => {
       const stats = getStats(db);
       const messageCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get() as any)?.count ?? 0);
-      return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nMessages: ${messageCount}\nBy type: ${JSON.stringify(stats.byType)}\nRetention policy: ${JSON.stringify({ ...messageRetention, revision: messageRetentionPolicyRevision(messageRetention) })}\nRetention totals: ${JSON.stringify({ runs: retentionMetrics.runs, dryRuns: retentionMetrics.dryRuns, selectedRows: retentionMetrics.selectedRows, deletedRows: retentionMetrics.deletedRows, deletedBytes: retentionMetrics.deletedBytes })}\nLast retention receipt: ${JSON.stringify(retentionMetrics.last ?? null)}`;
+      return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nMessages: ${messageCount}\nExtraction queue: ${JSON.stringify(getExtractionStats(db))}\nBy type: ${JSON.stringify(stats.byType)}\nRetention policy: ${JSON.stringify({ ...messageRetention, revision: messageRetentionPolicyRevision(messageRetention) })}\nRetention totals: ${JSON.stringify({ runs: retentionMetrics.runs, dryRuns: retentionMetrics.dryRuns, selectedRows: retentionMetrics.selectedRows, deletedRows: retentionMetrics.deletedRows, deletedBytes: retentionMetrics.deletedBytes })}\nLast retention receipt: ${JSON.stringify(retentionMetrics.last ?? null)}`;
     },
   });
 
@@ -809,15 +891,71 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     execute: async () => JSON.stringify(runMaintenanceTick()),
   });
 
+  ctx.tools.register({
+    name: "gm_retry_extraction",
+    description: "Requeue quarantined durable messages and retry knowledge extraction without deleting source text.",
+    parameters: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "Optional DSH session id; omit to requeue every quarantined session" },
+      },
+      additionalProperties: false,
+    },
+    output: stringOutput("Graph Memory extraction retry"),
+    execute: async (args: any = {}) => {
+      const requested = typeof args.sessionId === "string" && args.sessionId.trim()
+        ? args.sessionId.trim()
+        : undefined;
+      const sid = requested
+        ? requested.startsWith(`${HOST}:`) ? requested : sessionKey(requested)
+        : undefined;
+      const requeued = requeueQuarantined(db, sid);
+      const pending = sid ? [sid] : getPendingSessionIds(db);
+      let scheduled = 0;
+      for (const pendingSid of pending) {
+        const rawId = pendingSid.startsWith(`${HOST}:`) ? pendingSid.slice(HOST.length + 1) : pendingSid;
+        if (input.llmProvider && input.llmModel || latestRoute.has(rawId)) {
+          scheduleExtract(rawId);
+          scheduled += 1;
+        }
+      }
+      return `Requeued ${requeued} quarantined messages; scheduled ${scheduled} sessions.`;
+    },
+  });
+
   ctx.effect(() => async () => {
     closing = true;
-    await Promise.allSettled([...extractChain.values()]);
+    const chains = [...extractChain.values()];
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      Promise.allSettled(chains).then(() => true),
+      new Promise<boolean>(resolve => {
+        graceTimer = setTimeout(() => resolve(false), extractionDrain.shutdownGraceMs);
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (!drained) {
+      abortingExtraction = true;
+      for (const cancel of [...retryCancels]) cancel();
+      for (const controller of activeExtractionControllers) {
+        controller.abort(new Error("[graph-memory] extraction shutdown grace elapsed"));
+      }
+      await Promise.allSettled([...extractChain.values()]);
+    }
     latestRoute.clear();
     latestPrompt.clear();
     recallCache.clear();
     turnCounts.clear();
     db.close();
   }, "graph-memory.close");
+
+  // With an explicit fallback route, recover durable pending work from prior
+  // process exits even when those sessions are not reopened in the UI.
+  if (extractionEnabled && input.llmProvider && input.llmModel) {
+    for (const sid of getPendingSessionIds(db)) {
+      scheduleExtract(sid.startsWith(`${HOST}:`) ? sid.slice(HOST.length + 1) : sid);
+    }
+  }
 
   if (messageRetention.keep !== "all") {
     const mode = messageRetention.dryRun ? "dry-run" : "deletion enabled";

@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { apply, eventMessage } from "../dsh.ts";
+import { apply, eventMessage, inject } from "../dsh.ts";
 import { DatabaseSync } from "../src/store/sqlite.ts";
+import { normalizeExtractionContent } from "../src/extractor/extract.ts";
 
 function user(seq: number) {
   return {
@@ -20,6 +21,17 @@ describe("native DSH context takeover", () => {
       dbPath: ":memory:",
       messageRetention: { keep: "recent" },
     })).toThrow(/requires recentTurns or retentionDays/);
+  });
+
+  it("validates extraction bounds before opening the configured database", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-config-"));
+    const dbPath = join(dir, "must-not-open.db");
+    expect(() => apply({} as any, {
+      dbPath,
+      extractionDrain: { maxBatchChars: 1 },
+    })).toThrow(/extractionDrain.maxBatchChars/);
+    expect(existsSync(dbPath)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("exposes the effective retention policy and bounded maintenance receipt", async () => {
@@ -305,15 +317,16 @@ function userMsg(seq: number, text: string) {
 
 const EMPTY_EXTRACTION = '{"nodes":[],"edges":[]}';
 
-function adapterContext(llmStream: () => AsyncGenerator<any>) {
+function adapterContext(llmStream: (options?: any) => AsyncGenerator<any>) {
   const listeners = new Map<string, Array<(...args: any[]) => any>>();
   const cleanups: Array<() => void | Promise<void>> = [];
+  const tools = new Map<string, any>();
   const logs: string[] = [];
   const log = (level: string) => (...args: any[]) => logs.push(`${level}:${args.join(" ")}`);
   const context: any = {
     logger: { info: log("info"), warn: log("warn"), error: log("error") },
     llm: { stream: llmStream },
-    tools: { register() { return () => {}; } },
+    tools: { register(definition: any) { tools.set(definition.name, definition); return () => {}; } },
     credentials: { async resolve() { return undefined; } },
     agentPresets: { serviceFor() { return undefined; } },
     on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
@@ -328,7 +341,7 @@ function adapterContext(llmStream: () => AsyncGenerator<any>) {
       return () => {};
     },
   };
-  return { context, listeners, cleanups, logs };
+  return { context, listeners, cleanups, logs, tools };
 }
 
 async function waitFor(check: () => boolean, timeoutMs = 8000): Promise<void> {
@@ -342,14 +355,40 @@ async function waitFor(check: () => boolean, timeoutMs = 8000): Promise<void> {
 function countPending(dbPath: string): number {
   const db = new DatabaseSync(dbPath);
   try {
-    const row = db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extracted = 0").get() as any;
+    const row = db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extraction_state = 'pending'").get() as any;
     return Number(row.c);
   } finally {
     db.close();
   }
 }
 
+function countState(dbPath: string, state: string): number {
+  const db = new DatabaseSync(dbPath);
+  try {
+    const row = db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extraction_state = ?").get(state) as any;
+    return Number(row.c);
+  } finally {
+    db.close();
+  }
+}
+
+async function startAndEndTurn(
+  listeners: Map<string, Array<(...args: any[]) => any>>,
+  agent: any,
+): Promise<void> {
+  listeners.get("agent/session-start")![0]({ agent });
+  await listeners.get("agent/turn-stopping")![0]({
+    agent,
+    signal: new AbortController().signal,
+  });
+  await listeners.get("session/event")![0]({ id: agent.id }, { type: "turn/end", seq: 99_999 });
+}
+
 describe("extraction drain resilience", () => {
+  it("does not require the UI-only agentPresets service", () => {
+    expect(inject).not.toContain("agentPresets");
+  });
+
   it("retries a transient LLM failure and then drains the backlog", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
     const dbPath = join(dir, "graph-memory.db");
@@ -369,17 +408,17 @@ describe("extraction drain resilience", () => {
       extractionRetryDelaysMs: [0, 0],
     });
     const agent = { id: "transient-test", session: { events: [userMsg(0, "alpha"), userMsg(1, "beta")] } };
-    listeners.get("agent/session-start")![0]({ agent });
+    await startAndEndTurn(listeners, agent);
 
     await waitFor(() => logs.some(l => l.includes("DSH extracted")));
-    expect(logs.some(l => l.includes("retry in 0s"))).toBe(true);
+    expect(logs.some(l => l.includes("retry 1/2 in 0s"))).toBe(true);
     expect(logs.some(l => l.includes("SKIP"))).toBe(false);
     expect(countPending(dbPath)).toBe(0);
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("never deadlocks on a permanently failing batch (retry -> bisect -> skip)", async () => {
+  it("quarantines permanently failing messages without pretending they were extracted", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
     const dbPath = join(dir, "graph-memory.db");
     const { context, listeners, cleanups, logs } = adapterContext(async function* () {
@@ -397,15 +436,14 @@ describe("extraction drain resilience", () => {
       id: "poison-test",
       session: { events: [userMsg(0, "alpha"), userMsg(1, "beta"), userMsg(2, "gamma")] },
     };
-    listeners.get("agent/session-start")![0]({ agent });
+    await startAndEndTurn(listeners, agent);
 
-    // Three messages: batch(3) fails out -> bisect -> each singleton skips.
-    await waitFor(() => logs.filter(l => l.includes("DSH extraction SKIP")).length >= 3);
-    const skipLogs = logs.filter(l => l.includes("DSH extraction SKIP"));
-    expect(skipLogs.length).toBe(3);
+    await waitFor(() => logs.filter(l => l.includes("DSH extraction quarantined")).length >= 3);
+    expect(logs.filter(l => l.includes("DSH extraction quarantined"))).toHaveLength(3);
     expect(logs.some(l => l.includes("split 3 -> 2+1"))).toBe(true);
-    // The drain still makes progress: every message is marked extracted.
     expect(countPending(dbPath)).toBe(0);
+    expect(countState(dbPath, "quarantined")).toBe(3);
+    expect(countState(dbPath, "succeeded")).toBe(0);
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
@@ -434,7 +472,7 @@ describe("extraction drain resilience", () => {
       id: "length-test",
       session: { events: [userMsg(0, long), userMsg(1, "short-a"), userMsg(2, "short-b")] },
     };
-    listeners.get("agent/session-start")![0]({ agent });
+    await startAndEndTurn(listeners, agent);
 
     await waitFor(() => logs.filter(l => l.includes("DSH extracted")).length >= 2);
     expect(users.length).toBeGreaterThanOrEqual(2);
@@ -443,7 +481,102 @@ describe("extraction drain resilience", () => {
       expect(user.length).toBeLessThan(12_000);
     }
     expect(countPending(dbPath)).toBe(0);
+    const db = new DatabaseSync(dbPath);
+    const stored = db.prepare("SELECT content FROM gm_messages WHERE turn_index=0").get() as any;
+    expect(normalizeExtractionContent(stored.content)).toBe(long);
+    db.close();
     await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("passes an AbortSignal to DSH and aborts a stalled provider on timeout", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
+    const dbPath = join(dir, "graph-memory.db");
+    let observedSignal: AbortSignal | undefined;
+    const { context, listeners, cleanups } = adapterContext(async function* (opts: any) {
+      observedSignal = opts.signal;
+      await new Promise((_resolve, reject) => {
+        opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true });
+      });
+      if (false) yield undefined;
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+      extractionDrain: { streamTimeoutMs: 20, maxRetries: 0, retryDelaysMs: [] },
+    });
+    await startAndEndTurn(listeners, {
+      id: "timeout-test", session: { events: [userMsg(0, "stall")] },
+    });
+
+    await waitFor(() => countState(dbPath, "quarantined") === 1);
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal?.aborted).toBe(true);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("requeues quarantined messages explicitly and learns them on a later healthy call", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
+    const dbPath = join(dir, "graph-memory.db");
+    let healthy = false;
+    const { context, listeners, cleanups, tools } = adapterContext(async function* () {
+      if (!healthy) throw new Error("provider unavailable");
+      yield { type: "text-delta", text: EMPTY_EXTRACTION };
+      yield { type: "finish", reason: { kind: "stop" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+      extractionDrain: { maxRetries: 0, retryDelaysMs: [] },
+    });
+    await startAndEndTurn(listeners, {
+      id: "retry-tool-test", session: { events: [userMsg(0, "remember me")] },
+    });
+    await waitFor(() => countState(dbPath, "quarantined") === 1);
+
+    healthy = true;
+    const result = await tools.get("gm_retry_extraction").execute({ sessionId: "retry-tool-test" });
+    expect(result).toContain("Requeued 1");
+    await waitFor(() => countState(dbPath, "succeeded") === 1);
+    expect(countState(dbPath, "quarantined")).toBe(0);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("gracefully drains work scheduled immediately before host shutdown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const { context, listeners, cleanups } = adapterContext(async function* () {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      yield { type: "text-delta", text: EMPTY_EXTRACTION };
+      yield { type: "finish", reason: { kind: "stop" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+      extractionDrain: { shutdownGraceMs: 1_000 },
+    });
+    const agent = { id: "shutdown-test", session: { events: [userMsg(0, "last message")] } };
+    listeners.get("agent/session-start")![0]({ agent });
+    const ending = listeners.get("agent/turn-stopping")![0]({
+      agent,
+      signal: new AbortController().signal,
+    });
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    await ending;
+    expect(countState(dbPath, "succeeded")).toBe(1);
+    expect(countPending(dbPath)).toBe(0);
     rmSync(dir, { recursive: true, force: true });
   });
 });
