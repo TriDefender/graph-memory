@@ -11,6 +11,63 @@ function user(seq: number) {
 }
 
 describe("native DSH context takeover", () => {
+  it("fails closed on an ambiguous destructive retention policy", () => {
+    expect(() => apply({} as any, {
+      dbPath: ":memory:",
+      messageRetention: { keep: "recent" },
+    })).toThrow(/requires recentTurns or retentionDays/);
+  });
+
+  it("exposes the effective retention policy and bounded maintenance receipt", async () => {
+    const tools = new Map<string, any>();
+    const cleanups: Array<() => void | Promise<void>> = [];
+    const context: any = {
+      logger: { info() {}, warn() {}, error() {} },
+      llm: { async *stream() {} },
+      tools: {
+        register(definition: any) {
+          tools.set(definition.name, definition);
+          return () => {};
+        },
+      },
+      credentials: { async resolve() { return undefined; } },
+      agentPresets: { serviceFor() { return undefined; } },
+      on() { return () => {}; },
+      effect(register: () => () => void | Promise<void>) {
+        cleanups.push(register());
+        return () => {};
+      },
+    };
+    apply(context, {
+      dbPath: ":memory:",
+      extractionEnabled: false,
+      recallEnabled: false,
+      messageRetention: {
+        keep: "referenced",
+        recentTurns: 5,
+        batchSize: 25,
+        dryRun: true,
+      },
+    });
+
+    const status = await tools.get("gm_status").execute();
+    expect(status).toContain("Message retention: keep=referenced");
+    expect(status).toContain("recentTurns=5");
+    expect(status).toContain("dryRun=true");
+
+    const receipt = JSON.parse(await tools.get("gm_maintain").execute());
+    expect(receipt.retention).toMatchObject({
+      policy: "referenced",
+      dryRun: true,
+      selectedRows: 0,
+      deletedRows: 0,
+    });
+    const stats = await tools.get("gm_stats").execute();
+    expect(stats).toContain('"dryRuns":1');
+    expect(stats).toContain("Last retention receipt:");
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+  });
+
   it("keeps immutable source events but does not duplicate derived replacements", () => {
     expect(eventMessage({
       type: "assistant/message",

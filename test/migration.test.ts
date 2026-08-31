@@ -55,6 +55,15 @@ describe("database migrations", () => {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE gm_messages (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        turn_index INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        extracted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
       INSERT INTO gm_nodes (id, community_id, status) VALUES
         ('n2', 'c1', 'active'),
         ('n1', 'c1', 'active');
@@ -76,10 +85,12 @@ describe("database migrations", () => {
     expect(row.member_signature).toMatch(/^[a-f0-9]{40}$/);
     expect(
       (upgraded.prepare("SELECT MAX(v) AS version FROM _migrations").get() as any).version,
-    ).toBe(9);
+    ).toBe(10);
     const sourceColumns = upgraded.prepare("PRAGMA table_info(gm_node_sources)").all() as Array<{ name: string }>;
     expect(sourceColumns.map((column) => column.name)).toEqual([
       "node_id", "session_id", "message_id", "turn_index",
     ]);
+    const messageIndexes = upgraded.prepare("PRAGMA index_list(gm_messages)").all() as Array<{ name: string }>;
+    expect(messageIndexes.some((index) => index.name === "ix_gm_msg_retention")).toBe(true);
   });
 });

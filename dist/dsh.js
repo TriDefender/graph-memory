@@ -17,6 +17,7 @@ import { createEmbedFn } from "./src/engine/embed.js";
 import { computeGlobalPageRank, invalidateGraphCache } from "./src/graph/pagerank.js";
 import { detectCommunities } from "./src/graph/community.js";
 import { DEFAULT_CONFIG } from "./src/types.js";
+import { messageRetentionPolicyRevision, normalizeMessageRetentionPolicy, runMessageRetention, } from "./src/store/retention.js";
 export const name = "graph-memory-dsh";
 export const inject = ["tools", "llm", "systemPrompt", "agentLoop", "agents", "agentPresets", "sessions", "credentials"];
 const HOST = "dsh";
@@ -96,6 +97,11 @@ export function apply(ctx, input = {}) {
     if (!Number.isFinite(autoRecallMinScore) || autoRecallMinScore < 0 || autoRecallMinScore > 1) {
         throw new TypeError(`[graph-memory] autoRecallMinScore must be between 0 and 1, received ${autoRecallMinScore}`);
     }
+    const maintenanceInterval = input.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount;
+    if (!Number.isInteger(maintenanceInterval) || maintenanceInterval < 1) {
+        throw new TypeError(`[graph-memory] maintenanceInterval must be a positive integer, received ${maintenanceInterval}`);
+    }
+    const messageRetention = normalizeMessageRetentionPolicy(input.messageRetention);
     const credentialRef = input.embedding?.apiKeyEnv;
     if (credentialRef && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(credentialRef)) {
         throw new TypeError(`[graph-memory] embedding.apiKeyEnv must be a credential reference, received ${JSON.stringify(credentialRef)}`);
@@ -109,7 +115,7 @@ export function apply(ctx, input = {}) {
     const config = {
         ...DEFAULT_CONFIG,
         dbPath: input.dbPath ?? "~/.dsh/graph-memory/graph-memory.db",
-        compactTurnCount: input.maintenanceInterval ?? DEFAULT_CONFIG.compactTurnCount,
+        compactTurnCount: maintenanceInterval,
         recallMaxNodes: input.recallMaxNodes ?? DEFAULT_CONFIG.recallMaxNodes,
         recallMaxDepth: input.recallMaxDepth ?? DEFAULT_CONFIG.recallMaxDepth,
         embedding,
@@ -134,6 +140,14 @@ export function apply(ctx, input = {}) {
         succeeded: 0,
         unavailable: 0,
         failed: 0,
+    };
+    const retentionMetrics = {
+        runs: 0,
+        dryRuns: 0,
+        selectedRows: 0,
+        deletedRows: 0,
+        deletedBytes: 0,
+        last: undefined,
     };
     if (embeddingConfigured) {
         void createEmbedFn(embedding).then(async (embed) => {
@@ -297,20 +311,55 @@ export function apply(ctx, input = {}) {
                 extractChain.delete(key);
         });
     }
+    function runConfiguredRetention() {
+        const result = runMessageRetention(db, messageRetention);
+        retentionMetrics.runs += 1;
+        if (result.dryRun)
+            retentionMetrics.dryRuns += 1;
+        retentionMetrics.selectedRows += result.selectedRows;
+        retentionMetrics.deletedRows += result.deletedRows;
+        retentionMetrics.deletedBytes += result.deletedBytes;
+        retentionMetrics.last = result;
+        if (result.selectedRows > 0) {
+            const action = result.dryRun ? "would prune" : "pruned";
+            ctx.logger.info(`[graph-memory] retention ${action} ${result.dryRun ? result.selectedRows : result.deletedRows} ` +
+                `unreferenced extracted messages (${result.selectedBytes} estimated bytes, more=${result.hasMore})`);
+        }
+        return result;
+    }
+    function runGraphMaintenance() {
+        invalidateGraphCache();
+        const pagerank = computeGlobalPageRank(db, config);
+        const communities = detectCommunities(db);
+        return { pagerankNodes: pagerank.scores.size, communities: communities.count };
+    }
+    function runMaintenanceTick() {
+        const result = { errors: [] };
+        try {
+            result.graph = runGraphMaintenance();
+        }
+        catch (error) {
+            const message = `graph maintenance failed: ${String(error)}`;
+            result.errors.push(message);
+            ctx.logger.warn(`[graph-memory] DSH ${message}`);
+        }
+        try {
+            result.retention = runConfiguredRetention();
+        }
+        catch (error) {
+            const message = `message retention failed: ${String(error)}`;
+            result.errors.push(message);
+            ctx.logger.warn(`[graph-memory] DSH ${message}`);
+        }
+        return result;
+    }
     function maintain(sessionId) {
         const key = String(sessionId);
         const turns = (turnCounts.get(key) ?? 0) + 1;
         turnCounts.set(key, turns);
         if (turns % config.compactTurnCount !== 0)
             return;
-        try {
-            invalidateGraphCache();
-            computeGlobalPageRank(db, config);
-            detectCommunities(db);
-        }
-        catch (error) {
-            ctx.logger.warn(`[graph-memory] DSH graph maintenance failed: ${String(error)}`);
-        }
+        runMaintenanceTick();
     }
     function backfill(agent) {
         const id = agent?.id ?? agent?.session?.id;
@@ -478,7 +527,9 @@ export function apply(ctx, input = {}) {
             const embeddingModel = embeddingConfigured && input.embedding?.model
                 ? ` (${input.embedding.model})`
                 : "";
-            return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
+            const messageCount = Number(db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get()?.count ?? 0);
+            const retentionRevision = messageRetentionPolicyRevision(messageRetention);
+            return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"}\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nRolling compaction: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, unavailable=${compactionMetrics.unavailable}, failed=${compactionMetrics.failed}`;
         },
     });
     ctx.tools.register({
@@ -528,13 +579,21 @@ export function apply(ctx, input = {}) {
     });
     ctx.tools.register({
         name: "gm_stats",
-        description: "Show Graph Memory node, edge and community counts.",
+        description: "Show Graph Memory graph, durable-message and retention statistics.",
         parameters: { type: "object", properties: {}, additionalProperties: false },
         output: stringOutput("Graph Memory statistics"),
         execute: async () => {
             const stats = getStats(db);
-            return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nBy type: ${JSON.stringify(stats.byType)}`;
+            const messageCount = Number(db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get()?.count ?? 0);
+            return `Nodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nCommunities: ${stats.communities}\nMessages: ${messageCount}\nBy type: ${JSON.stringify(stats.byType)}\nRetention policy: ${JSON.stringify({ ...messageRetention, revision: messageRetentionPolicyRevision(messageRetention) })}\nRetention totals: ${JSON.stringify({ runs: retentionMetrics.runs, dryRuns: retentionMetrics.dryRuns, selectedRows: retentionMetrics.selectedRows, deletedRows: retentionMetrics.deletedRows, deletedBytes: retentionMetrics.deletedBytes })}\nLast retention receipt: ${JSON.stringify(retentionMetrics.last ?? null)}`;
         },
+    });
+    ctx.tools.register({
+        name: "gm_maintain",
+        description: "Run one bounded Graph Memory maintenance tick using the configured retention policy.",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+        output: stringOutput("Graph Memory maintenance"),
+        execute: async () => JSON.stringify(runMaintenanceTick()),
     });
     ctx.effect(() => async () => {
         closing = true;
@@ -545,5 +604,10 @@ export function apply(ctx, input = {}) {
         turnCounts.clear();
         db.close();
     }, "graph-memory.close");
+    if (messageRetention.keep !== "all") {
+        const mode = messageRetention.dryRun ? "dry-run" : "deletion enabled";
+        ctx.logger.warn(`[graph-memory] durable message retention is ${mode} (${JSON.stringify(messageRetention)}). ` +
+            `Back up ${config.dbPath} before the first non-dry run; VACUUM remains a separate admin action.`);
+    }
     ctx.logger.info(`[graph-memory] native DSH adapter active at ${config.dbPath}`);
 }

@@ -178,7 +178,7 @@ graph-memory/
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.9`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；130 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
+当前 beta：`1.6.0-beta.10`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、有界原始消息保留策略、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；139 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -208,7 +208,7 @@ cd graph-memory
 npm install
 npm test
 npm pack
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.9.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.10.tgz
 ```
 
 安装后，在 **设置 → 插件 → 插件列表 → graph-memory/dsh** 中确认状态为“已启用”。默认数据库路径：
@@ -237,14 +237,38 @@ dsh web
   <img src="docs/images/dsh/vector-status.png" alt="Graph Memory 向量状态" width="78%">
 </p>
 
+### 原始消息保留策略（显式启用）
+
+DSH 上下文压缩与 SQLite 数据保留是两件事：压缩只限制模型表面上下文，不会自动删除 `gm_messages` 中的溯源证据。默认策略是 `keep: all`，因此升级不会删除任何现有数据。
+
+数据库较大时，可在 `graph-memory/dsh` 配置中加入 `messageRetention`。第一次必须先使用 dry-run：
+
+```yaml
+messageRetention:
+  keep: referenced
+  recentTurns: 20
+  retentionDays: 30
+  batchSize: 500
+  dryRun: true
+```
+
+- `all`：保留全部持久事件，默认值。
+- `referenced`：只清理已经抽取且没有 `gm_node_sources` 引用的消息；可叠加最近轮次/天数保护窗口。
+- `recent`：必须配置 `recentTurns` 或 `retentionDays`；仍然无条件保护来源引用和待抽取消息。
+
+`recentTurns` 按每个 Session 的真实用户轮次计算，并保留后续 assistant/tool 事件。两个窗口同时存在时，只有同时超出两个窗口的消息才有资格清理；时间戳异常的消息会保守保留。每次维护只执行一个有上限的事务，删除前再次检查来源引用，不会自动执行 `VACUUM`。
+
+启用真实删除前，请备份 `$DSH_HOME/graph-memory/graph-memory.db`，保持 `dryRun: true`，调用一次 `gm_maintain` 并检查 `gm_stats` 回执；候选范围符合预期后再改为 `false`。
+
 ### DSH 原生工具
 
 | 工具 | 作用 |
 |---|---|
-| `gm_status` | 查看插件、数据库、抽取、召回和向量状态 |
+| `gm_status` | 查看插件、数据库、抽取、召回、向量和保留策略状态 |
 | `gm_search` | 主动搜索长期知识图谱 |
 | `gm_record` | 确定性记录 TASK、SKILL 或 EVENT |
-| `gm_stats` | 查看节点、边、类型与社区统计 |
+| `gm_stats` | 查看图谱、原始消息和保留策略回执/统计 |
+| `gm_maintain` | 执行一次有界图维护与已配置的消息保留批次 |
 
 自动召回不要求模型主动调用 `gm_search`；适配器会在 Prompt Assembly 阶段检索并注入相关记忆。
 

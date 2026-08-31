@@ -1,7 +1,7 @@
 # Graph Memory × DeepSeek Harness 原生架构与 Pro 路线图
 
-> 更新：2026-08-21
-> Community 状态：`1.6.0-beta.9` 已完成 DSH rc.8 原生加载、滚动上下文接管、无安装脚本分发与真实跨项目召回验证
+> 更新：2026-08-30
+> Community 状态：`1.6.0-beta.10` 已完成 DSH 原生加载、滚动上下文接管、无安装脚本分发、可选原始消息保留策略与真实跨项目召回验证
 > Pro 状态：SQLite GraphSnapshot、DSH Host、Typed Remote 与只读 Client 已实现；2D/3D、分屏和拖拽尚未实现
 
 ## 1. 结论
@@ -12,7 +12,7 @@ Graph Memory 可以在不修改 DeepSeek Harness 核心代码的前提下，作�
 - Plugin Inventory 显示 `graph-memory/dsh` active；
 - Session 事件幂等摄取，SQLite 跨会话持久化；
 - `system-prompt/assemble` 自动注入召回结果；
-- `gm_status`、`gm_search`、`gm_record`、`gm_stats` 可用；
+- `gm_status`、`gm_search`、`gm_record`、`gm_stats`、`gm_maintain` 可用；
 - FTS5 与 OpenAI-compatible embedding 双路径；
 - DSH credentials 引用，不把 API key 放入 Cordis 配置；
 - 旧节点启动时自动补向量，显式写入等待向量完成；
@@ -86,6 +86,12 @@ graph-memory/
 
 Graph Memory 负责“何时压、保留几轮、压缩结果如何进入长期图记忆”；DSH CompactionEngine 负责安全的摘要生成、工具配对校验和 surface replacement 事务。两者是策略层与宿主执行层的组合，不是互不相干的两套系统。
 
+### 持久消息保留链路
+
+模型 surface 压缩不是删除 `gm_messages` 的授权。DSH adapter 的持久层默认 `messageRetention.keep=all`；只有用户显式选择 `referenced/recent` 才运行 GC。候选必须同时满足：已完成抽取、没有 `gm_node_sources` 引用、超出配置的用户轮次与天数窗口。候选选择和删除使用同一个 `BEGIN IMMEDIATE` 事务，DELETE 前再次检查引用，每个 tick 受 `batchSize` 限制。
+
+dry-run 与真实删除返回相同结构的回执，包括候选/删除行数、估算内容字节、角色、Session 数、时间范围、是否还有下一批和配置 revision。`gm_status/gm_stats` 暴露有效策略和累计结果；`gm_maintain` 可手动执行一个维护 tick。`VACUUM` 不属于保留保证，必须作为独立管理操作。无效配置在打开数据库前报错，默认升级路径不会删除数据。
+
 ## 5. Embedding 与凭据设计
 
 Cordis patch 只声明：
@@ -116,7 +122,7 @@ embedding:
 | 跨会话语义召回 | 不同措辞、无显式 `gm_search` 仍命中 |
 | 重启持久化 | 通过 |
 | 无 embedding 降级 | FTS5，通过 |
-| 单元/迁移/组合测试 | 127/127（含滚动压缩、溯源、预算、高精度召回和 Pro Lite） |
+| 单元/迁移/组合测试 | 139/139（含滚动压缩、溯源、消息保留、预算、高精度召回和 Pro Lite） |
 | TypeScript build | 通过 |
 | 真实模型滚动压缩 | DSH rc.8 上通过；第 6 个真实用户轮次触发最旧完整前缀替换 |
 | 真实跨项目召回 | 新项目不调用 `gm_search`，自动召回并准确回答 |
