@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { isCronSessionKey } from "../src/types.ts";
 
 const mocks = vi.hoisted(() => ({
@@ -121,9 +121,16 @@ type EngineHarness = {
   }) => Promise<{ readonly rollback: () => void }>;
 };
 
+// register() 带防重复注册守卫（模块级 activeEngine）：同一进程内未 dispose 的
+// 二次 register 会被拦截复用。本文件每个用例都注册一个带独立 pluginConfig
+// 的隔离引擎 —— 在重复注册前先 dispose 上一个，保持逐用例隔离。
+let previousEngine: { dispose?: () => Promise<void> | void } | null = null;
+
 function registerPlugin(pluginConfig: Record<string, unknown> = {}): { readonly hooks: Map<string, HookHandler>; readonly engine: EngineHarness } {
   const hooks = new Map<string, HookHandler>();
   let engine: EngineHarness | undefined;
+  previousEngine?.dispose?.();
+  previousEngine = null;
   graphMemoryProPlugin.register({
     logger: {
       debug: () => {},
@@ -140,8 +147,16 @@ function registerPlugin(pluginConfig: Record<string, unknown> = {}): { readonly 
     registerHttpRoute: () => {},
   });
   if (!engine) throw new Error("context engine was not registered");
+  previousEngine = engine;
   return { hooks, engine };
 }
+
+afterAll(async () => {
+  // 释放最后一个引擎，清掉模块级 activeEngine —— vitest singleFork 下
+  // 所有测试文件共享进程，不能把注册状态泄漏给后续文件
+  await previousEngine?.dispose?.();
+  previousEngine = null;
+});
 
 describe("session identity", () => {
   beforeEach(() => {

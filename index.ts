@@ -245,6 +245,15 @@ export function prepareAssemblyMessages(
 
 // ─── 插件对象 ─────────────────────────────────────────────────
 
+/**
+ * 当前活跃引擎（防重复注册守卫）。
+ * 某些宿主版本会在未调用 dispose 的情况下重复调用 register()（热重载、配置变更）：
+ * 重新注册全套 hook/工具/路由会让每轮工作翻倍，且新引擎实例持有自己那份
+ * per-session 提取锁，与旧实例并行时同一 session 的提取互斥被打破。
+ * 只有 dispose() 清空标记（真正的重载）后，下一次 register() 才走完整初始化。
+ */
+let activeEngine: { dispose: () => Promise<void> | void } | null = null;
+
 const graphMemoryProPlugin = {
   id: "graph-memory-pro",
   name: "Graph Memory Pro",
@@ -279,10 +288,32 @@ const graphMemoryProPlugin = {
       return;
     }
 
+    // 防重复注册：CLI 元数据仍可重复注册（幂等），但运行时只允许一份。
+    // 复用现有引擎，只重绑 ContextEngine 工厂（见 activeEngine 上的说明）。
+    if (activeEngine) {
+      api.registerContextEngine("graph-memory-pro", () => activeEngine);
+      api.logger.warn("[graph-memory-pro] duplicate register() ignored; reusing active engine");
+      return;
+    }
+
     const cfg: GmConfig = { ...DEFAULT_CONFIG, ...raw };
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
     if (raw.decay) cfg.decay = { ...DEFAULT_CONFIG.decay, ...raw.decay };
     if (raw.cron) cfg.cron = { ...DEFAULT_CONFIG.cron, ...raw.cron };
+
+    // 拼写兼容：接受小写 baseUrl（部分宿主/用户的配置习惯），统一归一到 baseURL。
+    // 显式 baseURL 优先；trim 后为空视为未配置。
+    const rawLlm = (raw.llm ?? {}) as Record<string, unknown>;
+    if (cfg.llm && !cfg.llm.baseURL && typeof rawLlm.baseUrl === "string" && rawLlm.baseUrl.trim()) {
+      cfg.llm = { ...cfg.llm, baseURL: rawLlm.baseUrl.trim() };
+    }
+    const rawEmbedding = (raw.embedding ?? {}) as Record<string, unknown>;
+    if (
+      cfg.embedding && !cfg.embedding.baseURL &&
+      typeof rawEmbedding.baseUrl === "string" && rawEmbedding.baseUrl.trim()
+    ) {
+      cfg.embedding = { ...cfg.embedding, baseURL: rawEmbedding.baseUrl.trim() };
+    }
     const cronCfg = cfg.cron ?? DEFAULT_CRON_CONFIG;
 
     const providerModel = readDefaultModel(api.config);
@@ -974,10 +1005,14 @@ const graphMemoryProPlugin = {
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
         ingestedSinceTurn.clear();
+        // 仅当释放的是当前活跃引擎时清空标记 —— 真正的重载（dispose 后重新
+        // register）才会走完整初始化路径
+        if (activeEngine === engine) activeEngine = null;
         // 不关闭 Neo4j driver — 连接池自管理生命周期，进程退出时由 OS 回收
       },
     };
 
+    activeEngine = engine;
     api.registerContextEngine("graph-memory-pro", () => engine);
 
     // ── session_end：finalize + 图维护 ──────────────────────
