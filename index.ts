@@ -39,6 +39,28 @@ export function isGraphMemoryCliInvocation(argv: readonly string[] = process.arg
   return argv.slice(2).includes("graph-memory");
 }
 
+/**
+ * Host registration modes that never serve logical turns ("readOnlyDiscovery"
+ * lifecycle in the host registry — turn resolution degrades such entries to
+ * legacy by design, and runtime entries are adopted from the composition root
+ * instead of being replaced). Running the full runtime init (second Neo4j
+ * driver, embed probe, schema DDL) in these loads is pure waste, and their
+ * registerContextEngine calls are no-ops against a runtime registry entry.
+ * Modes: cli-metadata (CLI discovery), discovery / tool-discovery (scoped
+ * loads, e.g. config hot reload inspection), setup-only (setup contract with
+ * empty pluginConfig). Undefined mode (OpenClaw < 2026.7) counts as full.
+ */
+const METADATA_ONLY_REGISTRATION_MODES = new Set([
+  "cli-metadata",
+  "discovery",
+  "tool-discovery",
+  "setup-only",
+]);
+
+export function isMetadataOnlyRegistration(mode: unknown): boolean {
+  return typeof mode === "string" && METADATA_ONLY_REGISTRATION_MODES.has(mode);
+}
+
 // ─── 从 OpenClaw config 读默认 model 名 ──────────────────────
 
 /**
@@ -283,7 +305,7 @@ const graphMemoryProPlugin = {
       );
     }
     if (
-      api.registrationMode === "cli-metadata" ||
+      isMetadataOnlyRegistration(api.registrationMode) ||
       isGraphMemoryCliInvocation()
     ) {
       return;
@@ -292,7 +314,14 @@ const graphMemoryProPlugin = {
     // 防重复注册：CLI 元数据仍可重复注册（幂等），但运行时只允许一份。
     // 复用现有引擎，只重绑 ContextEngine 工厂（见 activeEngine 上的说明）。
     if (activeEngine) {
-      api.registerContextEngine("graph-memory-pro", () => activeEngine);
+      // 工厂必须捕获引擎对象本身，绝不能写成 `() => activeEngine`：
+      // host 逐逻辑 turn 惰性调用工厂，dispose() 清空 activeEngine 之后
+      // 该闭包会返回 null —— host 按契约判定 "factory returned null" 并
+      // 逐回合降级 legacy，直到 gateway 重启（2026-09-01 事故）。返回已
+      // dispose 的引擎对象是安全的：方法仍满足 ContextEngine 契约，且
+      // per-session 状态自愈（msgSeq 经 getMaxTurnIndex 从 DB 恢复）。
+      const reusableEngine = activeEngine;
+      api.registerContextEngine("graph-memory-pro", () => reusableEngine);
       api.logger.warn("[graph-memory-pro] duplicate register() ignored; reusing active engine");
       return;
     }
