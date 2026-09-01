@@ -30,7 +30,8 @@ describe.skipIf(!ENABLED)("GmTurnCommit marker (Docker)", () => {
     driver = getDriver({
       uri: NEO4J_URI!,
       user: process.env.NEO4J_TEST_USER ?? "neo4j",
-      password: process.env.NEO4J_TEST_PASSWORD ?? "testpassword",
+      // Keep the local fallback aligned with the disposable Neo4j instance in CI.
+      password: process.env.NEO4J_TEST_PASSWORD ?? "graphmemory",
     });
     await initSchema(driver);
   });
@@ -53,7 +54,9 @@ describe.skipIf(!ENABLED)("GmTurnCommit marker (Docker)", () => {
     const session = getSession(driver);
     try {
       const res = await session.run(
-        "SHOW CONSTRAINTS WHERE type = 'UNIQUENESS' AND entitiesLabel = 'GmTurnCommit'",
+        "SHOW CONSTRAINTS YIELD type, labelsOrTypes " +
+        "WHERE type = 'UNIQUENESS' AND 'GmTurnCommit' IN labelsOrTypes " +
+        "RETURN type",
       );
       expect(res.records.length).toBeGreaterThanOrEqual(1);
     } finally {
