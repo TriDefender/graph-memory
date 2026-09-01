@@ -5,14 +5,18 @@
  * "上下文压缩改变的是模型可见面，不构成删除持久证据的授权。"
  *
  *   - 默认 keep=all：不做任何删除，本模块在维护链中零开销直返。
- *   - referenced：只删"已提取完成"的消息 —— 知识已固化进图谱节点/边，原始文本退役。
+ *   - referenced：只删"已提取完成且实际产出知识"的消息（extracted=true 且
+ *     producedKnowledge=true）—— 知识已固化进图谱节点/边，原始文本退役。
+ *     LLM 空提取（零节点零边）的轮次标记 producedKnowledge=false，原始证据
+ *     保留；重挖需手动重置 extracted 后跑 graph-memory extract。
  *   - recent：referenced 之上叠加时间窗保护（每 session 最近 N 轮真实用户发言
  *     及其后消息、最近 N 天内入库的消息），验证时要求至少配置一个窗口参数。
  *
  * 与上游的差异：v2.0 schema 没有消息级出处边（节点仅记 sourceSessions，
  * 粒度为 session），上游 "无 gm_node_sources 引用" 的前置条件在这里等价于
- * extracted=true。DELETE 仍按 extracted 重新校验，防止候选查询与删除语义
- * 未来漂移 —— 候选集不能成为删除的授权。
+ * extracted=true AND producedKnowledge=true。遗留行（producedKnowledge 属性
+ * 缺失，标记机制上线前已提取）fail-closed 不删。DELETE 前按同条件重新校验，
+ * 防止候选查询与删除语义未来漂移 —— 候选集不能成为删除的授权。
  */
 
 import { createHash } from "node:crypto";
@@ -143,7 +147,7 @@ function buildCandidateQuery(
     batchLimit: int(policy.batchSize + 1),
   };
 
-  let match = "MATCH (m:GmMessage)\nWHERE m.extracted = true\n";
+  let match = "MATCH (m:GmMessage)\nWHERE m.extracted = true AND m.producedKnowledge = true\n";
   if (policy.recentTurns > 0) {
     match =
       "MATCH (u:GmMessage {role: 'user'})\n" +
@@ -151,7 +155,7 @@ function buildCandidateQuery(
       "WITH sid, collect(u.turnIndex) AS turns\n" +
       "WITH sid, CASE WHEN size(turns) >= $recentTurns THEN turns[$recentTurns - 1] ELSE -1 END AS cutoffTurn\n" +
       "MATCH (m:GmMessage {sessionId: sid})\n" +
-      "WHERE m.extracted = true\n" +
+      "WHERE m.extracted = true AND m.producedKnowledge = true\n" +
       "  AND m.turnIndex < cutoffTurn\n";
   }
   if (policy.retentionDays > 0) {
@@ -170,7 +174,7 @@ function buildCandidateQuery(
 
 /**
  * 跑一个有界批次。候选选择与删除放在同一个写事务里冻结边界；
- * 删除前按 extracted 重新校验（候选查询不是删除的授权）。
+ * 删除前按 extracted + producedKnowledge 重新校验（候选查询不是删除的授权）。
  * size(m.content) 返回字符数（近似体积），与上游 BLOB 字节数略有差异，仅用于统计。
  */
 export async function runMessageRetention(
@@ -206,7 +210,7 @@ export async function runMessageRetention(
         const delRes = await tx.run(
           "UNWIND $ids AS mid " +
           "MATCH (m:GmMessage {id: mid}) " +
-          "WHERE m.extracted = true " +
+          "WHERE m.extracted = true AND m.producedKnowledge = true " +
           "DETACH DELETE m " +
           "RETURN count(m) AS deleted",
           { ids: rows.map((r) => r.id) },

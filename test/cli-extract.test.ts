@@ -242,8 +242,30 @@ describe("runBackfillExtraction", () => {
     expect(result.edgesCreated).toBe(1);
     expect(result.batches).toBe(1);
     expect(mocks.extract).toHaveBeenCalledTimes(1);
-    expect(mocks.markExtracted).toHaveBeenCalledWith(expect.anything(), "sid-abc-1234567890", 2);
+    // 提取产出 2 节点 → producedKnowledge=true（空提取时应为 false，证据保留）
+    expect(mocks.markExtracted).toHaveBeenCalledWith(expect.anything(), "sid-abc-1234567890", 2, true);
     expect(mocks.closeDriver).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks empty extractions as producedKnowledge=false (evidence retained)", async () => {
+    mocks.listUnextractedSessions.mockResolvedValue([SAMPLE_SESSION]);
+    mocks.getUnextracted.mockResolvedValueOnce([
+      { role: "user", content: "hello", turn_index: 1 },
+    ]).mockResolvedValueOnce([]);
+    mocks.extract.mockResolvedValueOnce({ nodes: [], edges: [] });
+    const log = vi.fn();
+
+    const result = await runBackfillExtraction({
+      cfg: makeCfg(),
+      effectiveModel: "gpt-test",
+      options: { yes: true },
+      log,
+      prompt: vi.fn(),
+    });
+
+    expect(result.sessionsProcessed).toBe(1);
+    expect(result.nodesCreated).toBe(0);
+    expect(mocks.markExtracted).toHaveBeenCalledWith(expect.anything(), "sid-abc-1234567890", 1, false);
   });
 
   it("filters sessions to the one specified by --session", async () => {

@@ -994,14 +994,29 @@ export async function listUnextractedSessions(driver: Driver): Promise<Unextract
   }
 }
 
-export async function markExtracted(driver: Driver, sid: string, upToTurn: number): Promise<void> {
+/**
+ * 标记 sid 会话内 turnIndex ≤ upToTurn 的消息为已提取。
+ *
+ * producedKnowledge：该次提取是否实际产出节点/边。LLM 成功返回零节点零边时
+ * 传 false —— 原始证据保留（retention 只删 producedKnowledge=true 的行）。
+ * 注意空提取轮次不会自动重提：重挖需手动将其 extracted 重置为 false 再跑
+ * `openclaw graph-memory extract`。
+ *
+ * 只作用于尚未提取的行（extracted=false）：producedKnowledge 在提取转换时刻
+ * 一次性写入，不会被后续更大范围的批量标记覆盖（compact 的范围标记可能横跨
+ * 早期已标记的轮次）。遗留行（无 producedKnowledge 属性）保持 null，
+ * retention 对其 fail-closed 不删。
+ */
+export async function markExtracted(
+  driver: Driver, sid: string, upToTurn: number, producedKnowledge = true,
+): Promise<void> {
   const session = getSession(driver);
   try {
     await session.run(`
       MATCH (m:GmMessage {sessionId: $sid})
-      WHERE m.turnIndex <= $upToTurn
-      SET m.extracted = true
-    `, { sid, upToTurn });
+      WHERE m.turnIndex <= $upToTurn AND m.extracted = false
+      SET m.extracted = true, m.producedKnowledge = $pk
+    `, { sid, upToTurn, pk: producedKnowledge });
   } finally {
     await session.close();
   }
@@ -1016,6 +1031,39 @@ export async function isTurnExtracted(driver: Driver, sid: string, turn: number)
       { sid, turn },
     );
     return toInt(result.records[0].get("c")) > 0;
+  } finally {
+    await session.close();
+  }
+}
+
+// ─── 轮次提交标记（OpenClaw transcript fencing 契约） ─────────
+
+/** neo4j-driver 约束冲突错误的 code 形如 Neo.ClientError.Schema.ConstraintValidationFailed */
+function isConstraintViolation(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string" && code.includes("ConstraintValidation")) return true;
+  return String(err).includes("ConstraintValidation");
+}
+
+/**
+ * 幂等提交一个 logical turn（host 只对成功接受的轮次调用，重试携带同一 advancementKey）。
+ * 唯一约束 + CREATE 保证原子幂等：首次 → "committed"；重试撞约束 → "duplicate"。
+ * 标记节点本身即"一次原子幂等写"的全部载荷 —— 消息已由 ingest/afterTurn 逐条落库，
+ * 不在标记里重复存（否则与 GmMessage 行双写、outage 缓冲路径无法对齐）。
+ */
+export async function commitTurnAdvance(
+  driver: Driver, sid: string, advancementKey: string, messageCount: number,
+): Promise<"committed" | "duplicate"> {
+  const session = getSession(driver);
+  try {
+    await session.run(
+      `CREATE (t:GmTurnCommit {advancementKey: $key, sessionId: $sid, messageCount: $count, createdAt: $now})`,
+      { key: advancementKey, sid, count: messageCount, now: Date.now() },
+    );
+    return "committed";
+  } catch (err) {
+    if (isConstraintViolation(err)) return "duplicate";
+    throw err;
   } finally {
     await session.close();
   }

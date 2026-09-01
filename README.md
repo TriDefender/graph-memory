@@ -60,7 +60,7 @@ The installer configures Neo4j to start at boot with a 3-tier no-sudo fallback:
 
 ## Manual Configuration
 
-Install the local plugin, then make it the OpenClaw context engine:
+Install the local plugin, then make it the OpenClaw context engine (**restart the gateway after changing config**: the plugin guards against duplicate `register()` — a second registration without `dispose()` reuses the active engine, so new config is never hot-reloaded):
 
 ```json
 {
@@ -154,6 +154,33 @@ All three options default to **`true`**: cron sessions behave like normal sessio
 All three sub-options are optional; omitted fields keep the default `true` (e.g. with `"cron": { "extract": false }` only extraction is disabled — recall, buffering, and end-of-session maintenance stay on).
 
 Caveat: when a cron job sets an explicit custom `sessionKey`, the host does not append the `cron` segment — such sessions cannot be detected and are treated as normal sessions.
+
+### Raw message retention (messageRetention, opt-in)
+
+Context compaction only changes what the model sees — it is **not authorization to delete persistent evidence**. The default `keep=all` never deletes any raw message (GmMessage) at zero overhead. To bound database growth, opt into bounded pruning; it runs at the tail of the graph maintenance chain and processes at most `batchSize` rows per cycle:
+
+```json
+"messageRetention": {
+  "keep": "referenced",
+  "batchSize": 500,
+  "dryRun": false
+}
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `keep` | `"all"` | `all` = keep everything (default, zero behavior change); `referenced` = delete only messages that were extracted **and** actually produced knowledge; `recent` = `referenced` plus a time-window guard (requires at least one window option). |
+| `recentTurns` | `0` | `keep=recent`: keep the newest N real user turns per session (that turn and everything after it). Sessions with no user messages are fully protected. |
+| `retentionDays` | `0` | `keep=recent`: keep messages ingested within the last N days. |
+| `batchSize` | `500` | Maximum rows processed per maintenance cycle (1–10000), keeping the chain bounded. |
+| `dryRun` | `false` | `true` reports the candidate set without deleting — **run one `dryRun` cycle to validate candidates before enabling pruning**. |
+
+Deletion semantics (fail-closed):
+
+- Only messages with `extracted=true` **and** `producedKnowledge=true` (the extraction actually produced nodes/edges) enter the candidate set.
+- Turns where the LLM returned zero nodes and zero edges are marked `producedKnowledge=false` — the raw evidence stays in the database. Such turns are never re-extracted automatically; to re-mine them with a better prompt/model, manually reset their `extracted` flag to `false` and re-run `openclaw graph-memory extract`.
+- Unextracted messages and legacy rows (extracted before this flag existed, no `producedKnowledge` property) are never deleted.
+- A failure in the retention step itself (invalid policy fails closed with zero deletions / Neo4j error) never invalidates the other maintenance steps; it retries next cycle.
 
 ### OAuth login (experimental)
 

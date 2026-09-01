@@ -119,6 +119,7 @@ type EngineHarness = {
     readonly childSessionKey: string;
     readonly parentSessionId?: string;
   }) => Promise<{ readonly rollback: () => void }>;
+  readonly dispose: () => Promise<void>;
 };
 
 // register() 带防重复注册守卫（模块级 activeEngine）：同一进程内未 dispose 的

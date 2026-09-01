@@ -44,7 +44,7 @@ bash setup-graph-memory-pro.sh --uninstall
 
 ## 手动配置
 
-安装插件后，在 `~/.openclaw/openclaw.json` 中配置：
+安装插件后，在 `~/.openclaw/openclaw.json` 中配置（**修改配置后需重启网关生效**：插件内置防重复注册守卫，宿主未 dispose 的二次 `register()` 会复用现有引擎，新配置不会热加载）：
 
 ```json
 {
@@ -136,6 +136,33 @@ OpenClaw 定时任务创建的会话可以独立配置图谱行为。host 把 cr
 三个选项**默认全部开启**：cron 会话默认使用图谱，需按需显式关闭。`enabled=false` 是总开关：即使 `extract`/`finalizeAndMaintain` 设为 `true` 也不生效。非 cron 会话不受这些选项影响。三个子项均可省略，未写的字段取默认值 `true`。
 
 注意：若 cron 任务显式设置了自定义 `sessionKey`，host 不再附加 `cron` 段，此类会话无法被识别，将按普通会话处理。
+
+### 原始消息保留（messageRetention，opt-in）
+
+上下文压缩只改变模型可见面，**不构成删除持久证据的授权**——默认 `keep=all` 永不删除任何原始消息（GmMessage），零开销。需要控制库体积时可显式开启有界清理，挂在图维护链尾部，每个维护周期最多处理 `batchSize` 行：
+
+```json
+"messageRetention": {
+  "keep": "referenced",
+  "batchSize": 500,
+  "dryRun": false
+}
+```
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `keep` | `"all"` | `all`=全部保留（默认，零行为变化）；`referenced`=只删"已提取完成且实际产出知识"的消息；`recent`=在 `referenced` 基础上叠加时间窗保护（需至少配一个窗口参数）。 |
+| `recentTurns` | `0` | `keep=recent`：每 session 保留最近 N 轮真实用户发言（该轮及其后的全部消息保留）。无 user 消息的 session 完全保护。 |
+| `retentionDays` | `0` | `keep=recent`：保留最近 N 天内入库的消息。 |
+| `batchSize` | `500` | 单个维护周期最多处理的行数（1~10000），保证维护链工作有界。 |
+| `dryRun` | `false` | `true` 时只报告候选集不删除——**启用清理前建议先跑一轮 `dryRun` 验证候选集**。 |
+
+删除语义（fail-closed）：
+
+- 只有 `extracted=true` **且** `producedKnowledge=true`（该轮 LLM 提取实际产出节点/边）的消息才会进入候选。
+- LLM 空提取（成功返回零节点零边）的轮次标记 `producedKnowledge=false`，原始证据保留在库中。此类轮次不会自动重提；如需用更好的 prompt/模型重挖，需手动将这些行的 `extracted` 重置为 `false`，再运行 `openclaw graph-memory extract` 回填。
+- 未提取消息、以及标记机制上线前的遗留行（无 `producedKnowledge` 属性）一律不删。
+- 保留步骤自身失败（非法策略 fail-closed 不删 / Neo4j 故障）不影响维护链的其他步骤，下一周期自动重试。
 
 ### OAuth 登录（实验性）
 

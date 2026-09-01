@@ -16,6 +16,8 @@ const SID_A = `retention-a-${Date.now()}`; // referenced 场景：前半提取�
 const SID_B = `retention-b-${Date.now()}`; // recentTurns 场景：全部提取
 const SID_C = `retention-c-${Date.now()}`; // retentionDays 场景：无 user 消息（recentTurns 下全保护）
 const SID_D = `retention-d-${Date.now()}`; // 无 user 消息的 session
+const SID_E = `retention-e-${Date.now()}`; // 空提取：extracted=true 但 producedKnowledge=false
+const SID_F = `retention-f-${Date.now()}`; // 遗留行：直接 SET extracted=true，无 producedKnowledge 属性
 const DAY = 86_400_000;
 
 async function seedSession(sid: string, turns: number, roles: (t: number) => string): Promise<void> {
@@ -43,6 +45,19 @@ async function setCreatedAt(sid: string, turn: number, ts: number): Promise<void
     await session.run(
       "MATCH (m:GmMessage {sessionId: $sid, turnIndex: $turn}) SET m.createdAt = $ts",
       { sid, turn, ts },
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+/** 模拟 producedKnowledge 标记机制上线前的遗留行：直接 SET extracted=true。 */
+async function setExtractedLegacy(sid: string): Promise<void> {
+  const session = getSession(driver);
+  try {
+    await session.run(
+      "MATCH (m:GmMessage {sessionId: $sid}) SET m.extracted = true",
+      { sid },
     );
   } finally {
     await session.close();
@@ -94,6 +109,12 @@ describe.skipIf(!ENABLED)("GmMessage retention (Docker)", () => {
     // D：2 条 assistant、全部提取、无 user 消息
     await seedSession(SID_D, 2, () => "assistant");
     await markExtracted(driver, SID_D, 1);
+    // E：4 条空提取 —— LLM 成功返回零节点零边：extracted=true, producedKnowledge=false
+    await seedSession(SID_E, 4, () => "assistant");
+    await markExtracted(driver, SID_E, 3, false);
+    // F：遗留行（标记机制上线前已提取）：无 producedKnowledge 属性
+    await seedSession(SID_F, 2, () => "assistant");
+    await setExtractedLegacy(SID_F);
   });
 
   afterAll(async () => {
@@ -152,7 +173,8 @@ describe.skipIf(!ENABLED)("GmMessage retention (Docker)", () => {
 
     expect(result.dryRun).toBe(true);
     expect(result.deletedRows).toBe(0);
-    // 候选 = 剩余全部已提取：B(6-9) + C(2,3) + D(0,1) = 8（A 的 6-9 未提取不算）
+    // 候选 = 剩余全部 producedKnowledge=true：B(6-9) + C(2,3) + D(0,1) = 8
+    // （E 空提取 pk=false、F 遗留行无属性 —— 均不进候选）
     expect(result.selectedRows).toBe(8);
     expect(await survivingTurns(SID_A)).toEqual([6, 7, 8, 9]);
     expect(await survivingTurns(SID_B)).toEqual([6, 7, 8, 9]);
@@ -170,6 +192,20 @@ describe.skipIf(!ENABLED)("GmMessage retention (Docker)", () => {
     expect(await survivingTurns(SID_D)).toEqual([]);
   });
 
+  it("keeps empty-extraction turns and legacy rows (producedKnowledge gate)", async () => {
+    const policy = normalizeMessageRetentionPolicy({ keep: "referenced" });
+    const result = await runMessageRetention(driver, policy);
+
+    // E：空提取（extracted=true, producedKnowledge=false）—— 原始证据保留，
+    // 日后换更好的 prompt/模型仍可回捞
+    expect(await survivingTurns(SID_E)).toEqual([0, 1, 2, 3]);
+    // F：遗留行（无 producedKnowledge 属性）—— fail-closed 不删
+    expect(await survivingTurns(SID_F)).toEqual([0, 1]);
+    // 上一测试已清空全部 producedKnowledge=true 候选，本轮零删除
+    expect(result.selectedRows).toBe(0);
+    expect(result.deletedRows).toBe(0);
+  });
+
   it("reports per-role stats and session spread", async () => {
     // 上一测试后 A 仅剩 turns 6-9（user 6/8, assistant 7/9）——再跑一轮 referenced 空转
     const policy = normalizeMessageRetentionPolicy({ keep: "referenced" });
@@ -182,7 +218,7 @@ describe.skipIf(!ENABLED)("GmMessage retention (Docker)", () => {
 
   it("batches deletion and reports hasMore when candidates exceed batchSize", async () => {
     // 专用 session：6 条全部提取、无 user 消息（referenced 下全部可候选）
-    const sid = `retention-e-${Date.now()}`;
+    const sid = `retention-batch-${Date.now()}`;
     await seedSession(sid, 6, () => "assistant");
     await markExtracted(driver, sid, 5);
 

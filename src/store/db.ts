@@ -87,6 +87,20 @@ export async function initSchema(driver: Driver, embedding?: EmbeddingConfig): P
       FOR (c:Community) ON (c.embedding)
       OPTIONS {indexConfig: {\`vector.dimensions\`: ${dimensions}, \`vector.similarity_function\`: 'cosine'}}
     `);
+
+    // Turn commit marker (OpenClaw transcript fencing contract).
+    // 放在 DDL 链末尾：升级后首启若约束尚未建好，并发重试的 CREATE 可能
+    // 已写入重复 advancementKey —— 带冲突数据的 CREATE CONSTRAINT 会失败，
+    // 先清重复行再建约束；即使这里失败也不能波及上面的向量索引。
+    // 唯一约束是幂等提交的原子性来源：重试的 CREATE 撞约束报
+    // ConstraintValidationFailed，commitTurnAdvance 据此区分 committed/duplicate。
+    await session.run(`
+      MATCH (t:GmTurnCommit)
+      WITH t.advancementKey AS key, collect(t) AS marks
+      WHERE size(marks) > 1
+      FOREACH (n IN marks[1..] | DELETE n)
+    `);
+    await session.run("CREATE CONSTRAINT gm_turn_commit_key IF NOT EXISTS FOR (t:GmTurnCommit) REQUIRE t.advancementKey IS UNIQUE");
   } finally {
     await session.close();
   }

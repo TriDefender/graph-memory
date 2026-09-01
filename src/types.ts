@@ -218,7 +218,9 @@ export type MessageRetentionMode = "all" | "referenced" | "recent";
 export interface MessageRetentionConfig {
   /**
    * all（默认）保留全部原始消息，零开销；
-   * referenced 只删"已提取完成"的消息（知识已固化进图谱，原始文本退役）；
+   * referenced 只删"已提取完成且实际产出知识"的消息（producedKnowledge=true，
+   * 知识已固化进图谱，原始文本退役；LLM 空提取的轮次保留原始证据，
+   * 重挖需手动重置 extracted 后跑 graph-memory extract）；
    * recent 在 referenced 的基础上按时间窗保护最近内容。
    */
   keep?: MessageRetentionMode;

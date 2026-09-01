@@ -339,20 +339,41 @@ export function createCompleteFn(
 
   // ── 失败冷却守卫：持久性配置错误（401/403/404）后冷却 10 分钟，快速失败 ──
   // 避免凭证失效/模型名错误时每轮照付一次完整请求 + 超时等待。成功调用即清除。
+  // OAuth 例外自愈：oauthPath 可能被外部进程重写（CLI auth login / CLI extract
+  // 刷新 token）。冷却触发时记录会话文件 mtime，后续调用发现文件已变化 =
+  // 凭证已被修复 → 立即解除冷却重试（401 的常见诱因是时钟偏移导致缓存的
+  // access token 提前过期，重登即可恢复，不应被迫等满 10 分钟）。
   const guard = new LlmFailureGuard();
+  let oauthTripMtimeMs: number | null | undefined; // undefined = 冷却非 oauth 路径触发
   return async (system: string, user: string): Promise<string> => {
     if (!guard.canRun()) {
-      const seconds = Math.max(1, Math.ceil(guard.remainingMs() / 1000));
-      throw new Error(
-        `[graph-memory] LLM paused for ${seconds}s after a previous permanent API error`,
-      );
+      if (provider === "oauth" && oauthPath && oauthTripMtimeMs !== undefined) {
+        let currentMtimeMs: number | null = null;
+        try { currentMtimeMs = (await stat(oauthPath)).mtimeMs; } catch { /* 文件暂不可达：维持冷却 */ }
+        // 仅在"确实读到不同的 mtime"或"trip 时读不到、现在读得到"时解除；
+        // 瞬时 stat 失败（null）不解除 —— 避免 AV/EBUSY 类抖动白白放行一次必败请求
+        const fileReplaced = oauthTripMtimeMs === null
+          ? currentMtimeMs !== null
+          : currentMtimeMs !== null && currentMtimeMs !== oauthTripMtimeMs;
+        if (fileReplaced) guard.reset();
+      }
+      if (!guard.canRun()) {
+        const seconds = Math.max(1, Math.ceil(guard.remainingMs() / 1000));
+        throw new Error(
+          `[graph-memory] LLM paused for ${seconds}s after a previous permanent API error` +
+          (provider === "oauth" ? " — 重新 auth login 或等待 token 文件刷新后自动解除" : ""),
+        );
+      }
     }
     try {
       const text = await complete(system, user);
       guard.reset();
       return text;
     } catch (err) {
-      guard.tripIfNeeded(err);
+      if (guard.tripIfNeeded(err) && provider === "oauth" && oauthPath) {
+        try { oauthTripMtimeMs = (await stat(oauthPath)).mtimeMs; }
+        catch { oauthTripMtimeMs = null; }
+      }
       throw err;
     }
   };

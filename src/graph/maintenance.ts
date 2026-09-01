@@ -24,8 +24,9 @@ export interface MaintenanceResult {
   pagerank: GlobalPageRankResult;
   community: CommunityResult;
   communitySummaries: number;
-  /** 原始消息保留（opt-in）；未配置 messageRetention 或 keep=all 时为 undefined。 */
-  retention?: MessageRetentionResult;
+  /** 原始消息保留（opt-in）；未配置 messageRetention 或 keep=all 时为 undefined，
+   *  执行失败时为 { error }（fail-soft，不否定整轮维护）。 */
+  retention?: MessageRetentionResult | { error: string };
   durationMs: number;
 }
 
@@ -55,12 +56,18 @@ export async function runMaintenance(
   }
 
   // 5. 原始消息保留（opt-in；keep=all 零开销直返）。
-  // 非法策略 fail closed：抛错终止维护、不删任何东西，由调用方记录。
-  let retention: MessageRetentionResult | undefined;
+  // fail-soft：链尾清理失败（非法策略 fail-closed 不删 / Neo4j 故障）不应否定
+  // 已完成的 decay/dedup/PageRank/社区步骤 —— 前面步骤成功说明连接健康，
+  // 也不计入 Neo4j 熔断。错误记入结果，由调用方记日志，下一周期重试。
+  let retention: MessageRetentionResult | { error: string } | undefined;
   if (cfg.messageRetention) {
-    const policy = normalizeMessageRetentionPolicy(cfg.messageRetention);
-    if (policy.keep !== "all") {
-      retention = await runMessageRetention(driver, policy);
+    try {
+      const policy = normalizeMessageRetentionPolicy(cfg.messageRetention);
+      if (policy.keep !== "all") {
+        retention = await runMessageRetention(driver, policy);
+      }
+    } catch (err) {
+      retention = { error: String(err) };
     }
   }
 

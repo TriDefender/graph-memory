@@ -11,7 +11,7 @@ import { getDriver, initSchema, getSession } from "./src/store/db.ts";
 import { Neo4jGate } from "./src/store/gate.ts";
 import {
   saveMessage, getUnextracted, getMaxTurnIndex,
-  markExtracted, isTurnExtracted,
+  markExtracted, isTurnExtracted, commitTurnAdvance,
   upsertNode, upsertEdge, findByName, updateNode,
   deleteNode, deprecateNodeAndDisconnect,
   getBySession, edgesTouching,
@@ -455,8 +455,11 @@ const graphMemoryProPlugin = {
         });
 
         if (!result.nodes.length && !result.edges.length) {
-          await markExtracted(driver, sessionId, turnNum);
-          api.logger.info(`[graph-memory-pro] turn ${turnNum}: no knowledge extracted (marked extracted)`);
+          // 空提取也要标记 extracted（防止重复提取），但 producedKnowledge=false：
+          // 该轮没有知识固化进图谱，原始证据保留（retention 不删；
+          // 重挖需手动重置 extracted 后跑 graph-memory extract）
+          await markExtracted(driver, sessionId, turnNum, false);
+          api.logger.info(`[graph-memory-pro] turn ${turnNum}: no knowledge extracted (marked extracted, evidence retained)`);
           return;
         }
 
@@ -685,8 +688,10 @@ const graphMemoryProPlugin = {
               `dedup=${result.dedup.merged}, communities=${result.community.count}, ` +
               `summaries=${result.communitySummaries}, ` +
               (result.retention
-                ? `retention=${result.retention.dryRun ? "dryRun:" : ""}` +
-                  `${result.retention.deletedRows}/${result.retention.selectedRows} msgs, `
+                ? ("error" in result.retention
+                    ? `retention=failed: ${result.retention.error.slice(0, 120)}, `
+                    : `retention=${result.retention.dryRun ? "dryRun:" : ""}` +
+                      `${result.retention.deletedRows}/${result.retention.selectedRows} msgs, `)
                 : "") +
               `top_pr=${result.pagerank.topK.slice(0, 3).map(n => `${n.name}(${n.score.toFixed(3)})`).join(",")}`,
             );
@@ -768,6 +773,14 @@ const graphMemoryProPlugin = {
         id: "graph-memory-pro",
         name: "Graph Memory Pro",
         ownsCompaction: true,
+        // OpenClaw 2026.3.7+ transcript fencing 契约。未声明时 host 会把引擎
+        // 逐回合降级到 legacy（"current-turn transcript fencing is not declared"）。
+        // 两项承诺：轮前读取只看到 admitted user entry 之前的精确前缀；
+        // 轮推进经 commitTurn 以 advancementKey 原子幂等落盘。
+        transcriptSemantics: {
+          currentTurnFence: "before-current-turn-entry-v1",
+          turnAdvancementIdempotency: "atomic-idempotent-v1",
+        },
       },
 
       async bootstrap({ sessionId, sessionKey }: { sessionId: string; sessionKey?: string }) {
@@ -923,7 +936,10 @@ const graphMemoryProPlugin = {
             }
 
             const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-            await markExtracted(driver, sessionId, maxTurn);
+            await markExtracted(
+              driver, sessionId, maxTurn,
+              result.nodes.length > 0 || result.edges.length > 0,
+            );
 
             return {
               ok: true, compacted: true,
@@ -989,6 +1005,69 @@ const graphMemoryProPlugin = {
         extractTurnKnowledge(sessionId, turnNum, newMessages).catch(err => {
           api.logger.error(`[graph-memory-pro] extract failed: ${err}`);
         });
+      },
+
+      /**
+       * OpenClaw 2026.3.7+ transcript fencing 契约的轮推进点（见 info.transcriptSemantics）。
+       * host 只对成功接受的轮次调用；重试携带同一 advancementKey。
+       * 义务 = 一次以 advancementKey 为键的原子幂等写（GmTurnCommit 唯一约束 + CREATE）：
+       * 首次 → committed；重试撞约束 → duplicate，副作用不再重放。
+       *
+       * 消息持久化仍归 ingest/afterTurn（契约保证 fenced 路径下 ingest 照常逐条触发；
+       * afterTurn 的 backfill 依赖 ingestedSinceTurn 计数器，commitTurn 若也回填，
+       * 两生命周期点并存时会以新 seq 重写整轮消息 → GmMessage 重复行）。
+       * 此处只做：标记落盘 + 触发本轮提取 —— 提取与 afterTurn 共用同一条幂等管线
+       * （withExtractLock + isTurnExtracted 双守卫），两点并存时后进入者自动空转。
+       */
+      async commitTurn({ sessionId, sessionKey, advancementKey, messages, isHeartbeat }: {
+        sessionId?: string; sessionKey?: string; advancementKey?: string; messages?: any[]; isHeartbeat?: boolean;
+      }) {
+        if (isHeartbeat || !advancementKey) return { status: "committed" as const };
+        if (sessionId) bindSessionIdentity(sessionId, sessionKey);
+        const sid = sessionId ?? (sessionKey ? sessionIdsByKey.get(sessionKey) : undefined);
+
+        // 宿主只传 advancementKey 且 sessionKey 无历史绑定（缺 bootstrap/ingest）
+        // 时无法归属会话：标记与提取都不可用。明确告警而非静默 no-op ——
+        // 返回 committed 只是"不阻塞回合"的降级，不代表已落盘。
+        if (!sid) {
+          api.logger.warn(`[graph-memory-pro] commitTurn: cannot resolve session for advancementKey=${advancementKey.slice(0, 12)}…, marker + extraction skipped`);
+          return { status: "committed" as const };
+        }
+
+        // cron session 关闭图谱功能：整个提交按 no-op 处理（不写标记、不提取）
+        if (isCronSessionKey(sessionKey) && !cronCfg.enabled) return { status: "committed" as const };
+
+        let advance: "committed" | "duplicate" = "committed";
+        if (neo4jGate.isAvailable()) {
+          try {
+            advance = await commitTurnAdvance(driver, sid, advancementKey, messages?.length ?? 0);
+            neo4jGate.recordSuccess();
+          } catch (err) {
+            // 标记写失败不向 host 抛错：提取副作用自带幂等守卫，host 重试
+            // 最多多跑一次空检查；沿用 ingest/assemble 的"降级不炸回合"哲学
+            neo4jGate.recordFailure();
+            api.logger.warn(`[graph-memory-pro] commitTurn marker write failed (side effects remain idempotent): ${err}`);
+          }
+        }
+        // duplicate 短路：若首次提交的提取本身失败过（LLM 错误只记日志），
+        // 这里也不会重放 —— 恢复路径是 compact() / `graph-memory extract` 回填
+        if (advance === "duplicate") return { status: "duplicate" as const };
+
+        if (messages?.length) {
+          if (isCronSessionKey(sessionKey) && !cronCfg.extract) {
+            api.logger.info("[graph-memory-pro] cron session: extraction skipped (cron.extract=false)");
+          } else {
+            // 读 turn 编号前先等掉线缓冲落库（与 afterTurn 的 backfill-then-read
+            // 对齐）：flush 会给缓冲消息分配新 seq，预读的旧值会让 markExtracted
+            // 只覆盖旧前缀 → 本轮消息保持未提取 → compact 重复提取
+            if (messageBuffer.length) await flushMessageBuffer();
+            const turnNum = msgSeq.get(sid) ?? 0;
+            extractTurnKnowledge(sid, turnNum, messages).catch(err => {
+              api.logger.error(`[graph-memory-pro] extract failed: ${err}`);
+            });
+          }
+        }
+        return { status: "committed" as const };
       },
 
       async prepareSubagentSpawn({ parentSessionKey, childSessionKey, parentSessionId }: {

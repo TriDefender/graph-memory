@@ -267,7 +267,10 @@ async function extractSessionLoop(
     await Promise.allSettled(pendingEmbeds);
 
     const maxTurn = msgs.reduce((m, msg) => Math.max(m, msg.turn_index ?? 0), 0);
-    await markExtracted(driver, sessionId, maxTurn);
+    await markExtracted(
+      driver, sessionId, maxTurn,
+      extraction.nodes.length > 0 || extraction.edges.length > 0,
+    );
     log(`  batch ${stats.batches}: ${msgs.length} 消息 -> ${extraction.nodes.length} 节点 / ${extraction.edges.length} 边（累计 ${stats.nodes}/${stats.edges}）`);
 
     if (msgs.length < batchLimit) break;

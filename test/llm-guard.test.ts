@@ -52,6 +52,23 @@ describe("LlmFailureGuard", () => {
     expect(extractLlmStatus(new Error("[graph-memory] OAuth LLM API 404: model not found"))).toBe(404);
   });
 
+  it("pauses when the OAuth refresh token is rejected (persistent credential failure)", () => {
+    // token 端点的 400 = invalid_grant（refresh token 被吊销/过期）—— 持久性故障
+    const guard = new LlmFailureGuard(60_000, () => 1_000);
+    expect(guard.tripIfNeeded(new Error("OAuth refresh failed (400): invalid_grant"))).toBe(true);
+    expect(guard.tripIfNeeded(new Error("OAuth refresh failed (401): unauthorized"))).toBe(true);
+    expect(guard.canRun()).toBe(false);
+  });
+
+  it("does not pause for transient OAuth refresh failures", () => {
+    const guard = new LlmFailureGuard(60_000, () => 1_000);
+    expect(guard.tripIfNeeded(new Error("OAuth refresh failed (429): slow down"))).toBe(false);
+    expect(guard.tripIfNeeded(new Error("OAuth refresh failed (500): upstream error"))).toBe(false);
+    expect(guard.tripIfNeeded(new Error("OAuth refresh returned no access token"))).toBe(false);
+    expect(guard.tripIfNeeded(new Error("OAuth session from /x is expired and has no refresh token"))).toBe(false);
+    expect(guard.canRun()).toBe(true);
+  });
+
   it("pauses Anthropic authentication failures", () => {
     const guard = new LlmFailureGuard(60_000, () => 1_000);
 

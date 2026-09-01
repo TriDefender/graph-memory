@@ -1,5 +1,81 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+// ── 模块隔离：register() 的完整初始化路径绝不能触碰真实 Neo4j ──
+// 不 mock 的话 getDriver() 会连 bolt://localhost:7687，initSchema 还会执行
+// 真实 DDL —— 任何 7687 端口有真实库的机器上裸跑 `npm test` 都有写风险。
+vi.mock("../src/store/db.ts", () => ({
+  getDriver: () => ({}),
+  initSchema: async () => {},
+  getSession: () => ({ close: async () => {} }),
+  closeDriver: async () => {},
+}));
+
+vi.mock("../src/store/store.ts", () => ({
+  saveMessage: async () => {},
+  getUnextracted: async () => [],
+  getMaxTurnIndex: async () => 0,
+  markExtracted: async () => {},
+  isTurnExtracted: async () => false,
+  upsertNode: async () => ({ node: {}, isNew: false }),
+  upsertEdge: async () => {},
+  findByName: async () => null,
+  updateNode: async () => null,
+  deleteNode: async () => {},
+  deprecateNodeAndDisconnect: async () => {},
+  getBySession: async () => [],
+  edgesFrom: async () => [],
+  edgesTo: async () => [],
+  edgesTouching: async () => [],
+  deleteEdges: async () => {},
+  mergeNodes: async () => {},
+  deprecate: async () => {},
+  getStats: async () => ({}),
+}));
+
+// resolveProvider 必须是真实实现：baseUrl 归一化的用例断言的就是它的推断告警。
+// 只替换 createCompleteFn（真实实现会发起 HTTP / 触发 OAuth 文件读取）。
+vi.mock("../src/engine/llm.ts", async (importActual) => {
+  const actual = await importActual<typeof import("../src/engine/llm.ts")>();
+  return {
+    ...actual,
+    createCompleteFn: () => async () => "",
+  };
+});
+
+vi.mock("../src/engine/embed.ts", () => ({
+  createEmbedFn: async () => null,
+}));
+
+vi.mock("../src/recaller/recall.ts", () => ({
+  Recaller: class {
+    setEmbedFn(): void {}
+    hasEmbedFn(): boolean { return false; }
+    get embedFn() { return null; }
+    async recall() { return { nodes: [], edges: [], tokenEstimate: 0 }; }
+    async syncEmbed(): Promise<void> {}
+  },
+  parseTimeRange: () => null,
+}));
+
+vi.mock("../src/extractor/extract.ts", () => ({
+  Extractor: class {
+    async extract() { return { nodes: [], edges: [] }; }
+    async finalize() { return { promotedSkills: [], newEdges: [], invalidations: [] }; }
+  },
+}));
+
+vi.mock("../src/format/assemble.ts", () => ({
+  assembleContext: async () => ({ xml: "", systemPrompt: "", tokens: 0 }),
+}));
+
+vi.mock("../src/graph/maintenance.ts", () => ({
+  runMaintenance: async () => ({ durationMs: 0 }),
+}));
+
+vi.mock("../src/routes/crud.ts", () => ({
+  registerCrudRoutes: () => {},
+}));
+
 import graphMemoryProPlugin from "../index.ts";
 import { closeDriver } from "../src/store/db.ts";
 
