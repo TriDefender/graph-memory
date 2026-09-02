@@ -43,7 +43,7 @@ export type ReasoningEffort = "low" | "medium" | "high";
 
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = "medium";
 
-export interface LlmConfig {
+interface LlmConfig {
   /** 显式 provider 切换。未设时按 baseURL 是否存在推断（向后兼容，仅产生 openai/anthropic）。 */
   provider?: LlmProvider;
   apiKey?: string;

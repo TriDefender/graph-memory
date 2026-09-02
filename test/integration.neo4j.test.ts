@@ -8,7 +8,7 @@ import {
   saveMessage, getUnextracted, markExtracted, isTurnExtracted,
   deprecate, getStats, mergeNodes, searchNodes, topNodes,
   getBySession, saveVector, vectorSearchWithScore, getVectorHash,
-  updateCommunities, updatePageranks,
+  updateCommunities,
   deleteNode, deprecateNodeAndDisconnect,
   deleteEdges,
 } from "../src/store/store.ts";
@@ -520,11 +520,16 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(hits.length).toBeGreaterThanOrEqual(2);
     expect(hits.every(n => n.name.includes("kubernetes") || n.description.includes("k8s") || n.content.includes("kubectl"))).toBe(true);
 
-    // topNodes：先 updatePageranks，再查 top
+    // topNodes：直接用 Cypher 写 pagerank（生产由 gds.pageRank.write 写入），再查 top
     const { node: top } = await upsertNode(driver, {
       type: "TASK", name: "Top Ranked Task", description: "high", content: "important",
     }, TEST_SID);
-    await updatePageranks(driver, new Map([[top.id, 999]]));
+    const w = driver.session();
+    try {
+      await w.run("MATCH (n:Task|Skill|Event {id: $id}) SET n.pagerank = 999", { id: top.id });
+    } finally {
+      await w.close();
+    }
     const topHits = await topNodes(driver, 3);
     expect(topHits.length).toBeGreaterThanOrEqual(1);
     expect(topHits[0].id).toBe(top.id);

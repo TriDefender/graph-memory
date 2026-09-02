@@ -25,9 +25,9 @@ export function buildNodeEmbeddingText(
 
 // ─── 时间筛选 ───────────────────────────────────────────────
 
-export type RecallTimeField = "createdAt" | "updatedAt";
+type RecallTimeField = "createdAt" | "updatedAt";
 
-export interface RecallOptions {
+interface RecallOptions {
   /** ISO 8601 字符串；只返回 timeField 对应时刻 >= after 的节点 */
   after?: string;
   /** ISO 8601 字符串；只返回 timeField 对应时刻 <= before 的节点 */
