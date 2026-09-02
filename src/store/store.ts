@@ -415,22 +415,6 @@ export async function mergeNodes(driver: Driver, keepId: string, mergeId: string
   }
 }
 
-/** 批量更新 PageRank 分数 */
-export async function updatePageranks(driver: Driver, scores: Map<string, number>): Promise<void> {
-  if (scores.size === 0) return;
-  const session = getSession(driver);
-  try {
-    const entries = Array.from(scores.entries()).map(([id, score]) => ({ id, score }));
-    await session.run(`
-      UNWIND $entries AS entry
-      MATCH (n:Task|Skill|Event {id: entry.id})
-      SET n.pagerank = entry.score
-    `, { entries });
-  } finally {
-    await session.close();
-  }
-}
-
 /** 批量更新社区 ID */
 export async function updateCommunities(driver: Driver, labels: Map<string, string>): Promise<void> {
   if (labels.size === 0) return;
@@ -664,7 +648,7 @@ export async function topNodes(driver: Driver, limit = 6): Promise<GmNode[]> {
 
 // ─── 向量搜索 ───────────────────────────────────────────────
 
-export type ScoredNode = { node: GmNode; score: number };
+type ScoredNode = { node: GmNode; score: number };
 
 export async function vectorSearchWithScore(
   driver: Driver, queryVec: number[], limit: number, minScore = 0.35,
@@ -688,15 +672,8 @@ export async function vectorSearchWithScore(
   }
 }
 
-export async function vectorSearch(
-  driver: Driver, queryVec: number[], limit: number, minScore = 0.35,
-): Promise<GmNode[]> {
-  const scored = await vectorSearchWithScore(driver, queryVec, limit, minScore);
-  return scored.map(s => s.node);
-}
-
 /** 社区向量搜索 */
-export type ScoredCommunity = { id: string; summary: string; score: number; nodeCount: number };
+type ScoredCommunity = { id: string; summary: string; score: number; nodeCount: number };
 
 export async function communityVectorSearch(
   driver: Driver, queryVec: number[], minScore = 0.15,
@@ -745,24 +722,6 @@ export async function getVectorHash(driver: Driver, nodeId: string): Promise<str
       { nodeId },
     );
     return result.records[0]?.get("hash") ?? null;
-  } finally {
-    await session.close();
-  }
-}
-
-/** 获取所有有向量的活跃节点（供去重用） */
-export async function getAllVectors(driver: Driver): Promise<Array<{ nodeId: string; embedding: number[] }>> {
-  const session = getSession(driver);
-  try {
-    const result = await session.run(`
-      MATCH (n:Task|Skill|Event {status: 'active'})
-      WHERE n.embedding IS NOT NULL
-      RETURN n.id AS nodeId, n.embedding AS embedding
-    `);
-    return result.records.map(r => ({
-      nodeId: r.get("nodeId"),
-      embedding: r.get("embedding"),
-    }));
   } finally {
     await session.close();
   }
@@ -1208,28 +1167,6 @@ export async function getCommunitySummaryBySignature(
       createdAt: toInt(c.createdAt),
       updatedAt: toInt(c.updatedAt),
     };
-  } finally {
-    await session.close();
-  }
-}
-
-export async function getAllCommunitySummaries(driver: Driver): Promise<CommunitySummary[]> {
-  const session = getSession(driver);
-  try {
-    const result = await session.run(
-      "MATCH (c:Community) RETURN c ORDER BY c.nodeCount DESC"
-    );
-    return result.records.map(r => {
-      const c = r.get("c").properties;
-      return {
-        id: c.id,
-        summary: c.summary,
-        nodeCount: toInt(c.nodeCount),
-        memberSignature: c.memberSignature ?? null,
-        createdAt: toInt(c.createdAt),
-        updatedAt: toInt(c.updatedAt),
-      };
-    });
   } finally {
     await session.close();
   }
