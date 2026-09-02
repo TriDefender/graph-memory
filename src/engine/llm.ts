@@ -35,6 +35,7 @@ import {
   extractOutputTextFromSse,
 } from "./oauth.ts";
 import type { OAuthSession } from "./oauth.ts";
+import { fetchRetry } from "./http.ts";
 
 export type LlmProvider = "openai" | "anthropic" | "oauth";
 
@@ -82,41 +83,6 @@ export function resolveProvider(cfg: LlmConfig | undefined): {
   // 向后兼容：未显式设 provider 时按 baseURL 推断（仅 openai/anthropic）
   const inferred = cfg?.baseURL ? "openai" : "anthropic";
   return { provider: inferred, inferred: true };
-}
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number,
-): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } catch (err: any) {
-    if (err?.name === "AbortError") {
-      throw new Error(`[graph-memory] LLM request timed out after ${timeoutMs}ms`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-const RETRYABLE = new Set([429, 500, 502, 503, 529]);
-
-async function fetchRetry(
-  url: string,
-  init: RequestInit,
-  retries: number,
-  timeoutMs: number,
-): Promise<Response> {
-  for (let i = 0; i <= retries; i++) {
-    const res = await fetchWithTimeout(url, init, timeoutMs);
-    if (res.ok || i >= retries || !RETRYABLE.has(res.status)) return res;
-    await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, i)));
-  }
-  throw new Error("[graph-memory] fetch failed after retries");
 }
 
 /**
@@ -220,7 +186,7 @@ export function createCompleteFn(
           stream: false,
           text: { format: { type: "text" } },
         }),
-      }, 3, timeoutMs);
+      }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
@@ -274,7 +240,7 @@ export function createCompleteFn(
           system,
           messages: [{ role: "user", content: user }],
         }),
-      }, 3, timeoutMs);
+      }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         throw new Error(`[graph-memory] Anthropic API ${res.status}: ${errText.slice(0, 200)}`);
@@ -319,7 +285,7 @@ export function createCompleteFn(
         max_tokens: maxTokens,
         temperature: 0.1,
       }),
-    }, 3, timeoutMs);
+    }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
       throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, 200)}`);

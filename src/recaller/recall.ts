@@ -143,7 +143,7 @@ export class Recaller {
       seeds = await searchNodes(this.driver, query, limit);
     }
 
-    if (!seeds.length) return { nodes: [], edges: [], tokenEstimate: 0 };
+    if (!seeds.length) return { nodes: [], edges: [] };
 
     const seedIds = seeds.map(n => n.id);
 
@@ -161,7 +161,7 @@ export class Recaller {
       this.cfg.recallMaxDepth,
     );
 
-    if (!nodes.length) return { nodes: [], edges: [], tokenEstimate: 0 };
+    if (!nodes.length) return { nodes: [], edges: [] };
 
     // PPR 排序
     const candidateIds = nodes.map(n => n.id);
@@ -182,7 +182,6 @@ export class Recaller {
     return {
       nodes: filtered,
       edges: edges.filter(e => ids.has(e.fromId) && ids.has(e.toId)),
-      tokenEstimate: this.estimateTokens(filtered),
     };
   }
 
@@ -213,11 +212,11 @@ export class Recaller {
       seeds = await communityRepresentatives(this.driver, 2);
     }
 
-    if (!seeds.length) return { nodes: [], edges: [], tokenEstimate: 0 };
+    if (!seeds.length) return { nodes: [], edges: [] };
 
     const seedIds = seeds.map(n => n.id);
     const { nodes, edges } = await graphWalk(this.driver, seedIds, 1);
-    if (!nodes.length) return { nodes: [], edges: [], tokenEstimate: 0 };
+    if (!nodes.length) return { nodes: [], edges: [] };
 
     const candidateIds = nodes.map(n => n.id);
     const { scores: pprScores } = await personalizedPageRank(
@@ -237,7 +236,6 @@ export class Recaller {
     return {
       nodes: filtered,
       edges: edges.filter(e => ids.has(e.fromId) && ids.has(e.toId)),
-      tokenEstimate: this.estimateTokens(filtered),
     };
   }
 
@@ -261,12 +259,9 @@ export class Recaller {
 
     const nodes = Array.from(nodeMap.values());
     const edges = Array.from(edgeMap.values());
-    return { nodes, edges, tokenEstimate: this.estimateTokens(nodes) };
+    return { nodes, edges };
   }
 
-  private estimateTokens(nodes: GmNode[]): number {
-    return Math.ceil(nodes.reduce((s, n) => s + n.content.length + n.description.length, 0) / 3);
-  }
 
   async syncEmbed(node: GmNode): Promise<void> {
     if (!this.embed) return;

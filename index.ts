@@ -20,6 +20,7 @@ import {
 } from "./src/store/store.ts";
 import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
+import { estimateTokens } from "./src/tokens.ts";
 import { Recaller, parseTimeRange } from "./src/recaller/recall.ts";
 import { Extractor } from "./src/extractor/extract.ts";
 import { assembleContext } from "./src/format/assemble.ts";
@@ -158,17 +159,21 @@ function estimateMsgTokens(msg: any): number {
   const text = typeof msg.content === "string"
     ? msg.content
     : JSON.stringify(msg.content ?? "");
-  return Math.ceil(text.length / 3);
+  return estimateTokens(text.length);
+}
+
+/** 从 content blocks 数组抽取纯文本（text block 拼接） */
+function textFromBlocks(blocks: any[]): string {
+  return blocks
+    .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text)
+    .join("\n");
 }
 
 export function extractAssistantText(msg: any): string {
   if (typeof msg.content === "string") return msg.content;
   if (!Array.isArray(msg.content)) return "";
-  return msg.content
-    .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-    .map((b: any) => b.text)
-    .join("\n")
-    .trim();
+  return textFromBlocks(msg.content).trim();
 }
 
 export function extractUserText(msg: any): string {
@@ -178,11 +183,7 @@ export function extractUserText(msg: any): string {
   } else if (!Array.isArray(msg.content)) {
     raw = String(msg.content ?? "");
   } else {
-    raw = msg.content
-      .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
-      .map((b: any) => b.text)
-      .join("\n")
-      .trim();
+    raw = textFromBlocks(msg.content).trim();
   }
   // 去掉 OpenClaw metadata（Sender JSON block、命令前缀、时间戳）
   const fenceEnd = raw.lastIndexOf("```");

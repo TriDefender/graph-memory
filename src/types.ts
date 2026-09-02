@@ -138,7 +138,6 @@ export interface FinalizeResult {
 export interface RecallResult {
   nodes: GmNode[];
   edges: GmEdge[];
-  tokenEstimate: number;
 }
 
 // ─── Embedding 配置 ──────────────────────────────────────────

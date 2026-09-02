@@ -8,8 +8,7 @@
 import type { Driver } from "neo4j-driver";
 import type { GmNode, GmEdge } from "../types.ts";
 import { getCommunitySummary, type CommunitySummary } from "../store/store.ts";
-
-const CHARS_PER_TOKEN = 3;
+import { CHARS_PER_TOKEN, estimateTokens } from "../tokens.ts";
 
 export function buildSystemPromptAddition(params: {
   selectedNodes: Array<{ type: string; src: "active" | "recalled" }>;
@@ -180,7 +179,7 @@ export async function assembleContext(
   });
 
   const fullContent = systemPrompt + "\n\n" + xml;
-  return { xml, systemPrompt, tokens: Math.ceil(fullContent.length / CHARS_PER_TOKEN) };
+  return { xml, systemPrompt, tokens: estimateTokens(fullContent.length) };
 }
 
 function escapeXml(s: string): string {

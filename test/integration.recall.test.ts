@@ -63,13 +63,8 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
     // 结构验证（不依赖具体节点返回 —— PPR 排序受共享 Neo4j 现有数据影响）
     expect(result).toHaveProperty("nodes");
     expect(result).toHaveProperty("edges");
-    expect(result).toHaveProperty("tokenEstimate");
     expect(Array.isArray(result.nodes)).toBe(true);
     expect(Array.isArray(result.edges)).toBe(true);
-    // 如果有节点返回，tokenEstimate 应 > 0
-    if (result.nodes.length > 0) {
-      expect(result.tokenEstimate).toBeGreaterThan(0);
-    }
   });
 
   it("recall 带 mock embedFn：走向量搜索路径，不抛错", async () => {
@@ -86,7 +81,6 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
     const result = await recaller.recall("docker");
     expect(result).toHaveProperty("nodes");
     expect(result).toHaveProperty("edges");
-    expect(result).toHaveProperty("tokenEstimate");
   });
 
   it("recall 空查询：降级到 topNodes，返回合法结构", async () => {
@@ -94,7 +88,6 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
     const result = await recaller.recall("   ");
     expect(result).toHaveProperty("nodes");
     expect(result).toHaveProperty("edges");
-    expect(result).toHaveProperty("tokenEstimate");
     expect(result.nodes.length).toBeGreaterThanOrEqual(0);
   });
 

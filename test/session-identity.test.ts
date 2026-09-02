@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => ({
   recall: vi.fn(async () => ({
     nodes: [{ id: "recalled-node" }],
     edges: [],
-    tokenEstimate: 1,
   })),
   assembleContext: vi.fn(async () => ({ xml: "", systemPrompt: "", tokens: 0 })),
   runMaintenance: vi.fn(async () => ({
