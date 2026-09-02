@@ -45,7 +45,7 @@ vi.mock("../src/recaller/recall.ts", () => ({
     setEmbedFn(): void {}
     hasEmbedFn(): boolean { return false; }
     get embedFn() { return null; }
-    async recall() { return { nodes: [], edges: [], tokenEstimate: 0 }; }
+    async recall() { return { nodes: [], edges: [] }; }
     async syncEmbed(): Promise<void> {}
   },
   parseTimeRange: () => null,

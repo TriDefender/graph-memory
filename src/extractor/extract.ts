@@ -8,6 +8,7 @@
 import type { ExtractionResult, FinalizeResult } from "../types.ts";
 import { EDGE_TYPES, isValidEdgeDirection } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
+import { normalizeName } from "../store/store.ts";
 
 // ─── 节点/边合法值 ──────────────────────────────────────────────
 
@@ -158,16 +159,6 @@ ${JSON.stringify(nodes.map(n => ({
 
 <Graph Summary>
 ${summary}`;
-
-// ─── 名称标准化（与 store.ts 一致）────────────────────────────
-
-export function normalizeName(name: string): string {
-  return name.trim().toLowerCase()
-    .replace(/[\s_]+/g, "-")
-    .replace(/[^a-z0-9\u4e00-\u9fff\-]/g, "")
-    .replace(/-{2,}/g, "-")
-    .replace(/^-|-$/g, "");
-}
 
 // ─── 边类型自动修正 ─────────────────────────────────────────────
 

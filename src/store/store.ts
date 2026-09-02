@@ -7,7 +7,7 @@
 
 import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { GmNode, GmEdge, EdgeType, NodeType, NodeTier } from "../types.ts";
 import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_TYPES } from "../types.ts";
 import { getSession } from "./db.ts";
@@ -20,7 +20,7 @@ function nint(v: number): any {
 // ─── 工具 ─────────────────────────────────────────────────────
 
 function uid(p: string): string {
-  return `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  return `${p}-${randomUUID()}`;
 }
 
 function toNode(r: any): GmNode {

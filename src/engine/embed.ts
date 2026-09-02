@@ -15,31 +15,10 @@
  */
 
 import type { EmbeddingConfig } from "../types.ts";
+import { fetchRetry } from "./http.ts";
 
 export type EmbedMode = "db" | "query";
 export type EmbedFn = (text: string, mode?: EmbedMode) => Promise<number[]>;
-
-// ─── 带重试 + 超时的 fetch ─────────────────────────────────────
-
-const RETRYABLE = new Set([429, 500, 502, 503, 529]);
-
-async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 10_000): Promise<Response> {
-  for (let i = 0; i <= retries; i++) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, { ...init, signal: ctrl.signal });
-      clearTimeout(t);
-      if (res.ok || i >= retries || !RETRYABLE.has(res.status)) return res;
-      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
-    } catch (err: any) {
-      clearTimeout(t);
-      if (i >= retries) throw err;
-      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
-    }
-  }
-  throw new Error("[graph-memory-pro] embed fetch failed after retries");
-}
 
 // ─── Provider 识别 ───────────────────────────────────────────
 
@@ -105,7 +84,7 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
         ...(apiKey ? { "Authorization": `Bearer ${apiKey}` } : {}),
       },
       body: JSON.stringify(buildBody(input, mode)),
-    });
+    }, { timeoutMs: 10_000, label: "[graph-memory-pro] Embedding", retryOnTimeout: true });
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
