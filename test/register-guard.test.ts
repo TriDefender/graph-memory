@@ -124,6 +124,41 @@ describe("duplicate register() guard", () => {
     );
   });
 
+  // 2026-09-01 事故回归：host 逐逻辑 turn 惰性调用工厂。守卫曾把工厂重绑为
+  // `() => activeEngine`（可变模块变量），dispose() 清空标记后工厂返回 null，
+  // host 按契约判定 "factory returned null" 并逐回合降级 legacy 直到重启。
+  it("rebound factory still returns the engine after dispose clears the module flag", async () => {
+    const api1 = fullApi();
+    graphMemoryProPlugin.register(api1);
+    const engineA = api1.registerContextEngine.mock.calls[0][1]();
+    createdEngine = engineA;
+
+    const api2 = fullApi();
+    graphMemoryProPlugin.register(api2); // 守卫路径重绑工厂
+    const reboundFactory = api2.registerContextEngine.mock.calls[0][1];
+
+    await engineA.dispose(); // activeEngine → null
+
+    expect(reboundFactory()).toBe(engineA);
+    expect(reboundFactory()).not.toBeNull();
+  });
+
+  it("skips runtime init for discovery-mode loads (readOnlyDiscovery never serves turns)", () => {
+    const api1 = fullApi();
+    graphMemoryProPlugin.register(api1);
+    createdEngine = api1.registerContextEngine.mock.calls[0][1]();
+
+    // 配置热重载的 discovery 加载：只重注册 CLI 元数据，不碰运行时，
+    // 也不与活跃引擎守卫交互（mode 检查在守卫之前）
+    const api2 = fullApi();
+    api2.registrationMode = "discovery";
+    graphMemoryProPlugin.register(api2);
+    expect(api2.registerCli).toHaveBeenCalledOnce();
+    expect(api2.registerContextEngine).not.toHaveBeenCalled();
+    expect(api2.registerTool).not.toHaveBeenCalled();
+    expect(api2.on).not.toHaveBeenCalled();
+  });
+
   it("creates a fresh engine after dispose() (genuine reload)", async () => {
     const api1 = fullApi();
     graphMemoryProPlugin.register(api1);
