@@ -164,6 +164,22 @@ OpenClaw 定时任务创建的会话可以独立配置图谱行为。host 把 cr
 - 未提取消息、以及标记机制上线前的遗留行（无 `producedKnowledge` 属性）一律不删。
 - 保留步骤自身失败（非法策略 fail-closed 不删 / Neo4j 故障）不影响维护链的其他步骤，下一周期自动重试。
 
+### 更换 embedding 模型后的重嵌入
+
+embedding 向量与模型绑定——旧模型产出的向量与新模型不可比（维度不同时去重与向量搜索直接失效），
+且向量只写不删、没有自动迁移。更改 `embedding.model` / `embedding.dimensions` 后请执行：
+
+```bash
+openclaw graph-memory reembed --dry-run   # 只报告维度对照与向量覆盖情况，不写入
+openclaw graph-memory reembed             # 清空全部向量并按批重建
+```
+
+该命令清空所有 `MemoryNode.embedding`（连同 `contentHash`，避免运行时 `syncEmbed`
+被旧文本 hash 短路），然后用当前模型按批重建全部活跃节点与社区摘要向量（`--batch <n>`，
+默认 32；批失败自动退化为逐条请求）。若向量索引维度与当前模型不符，命令会中止——加
+`--recreate-index` 删除并按新维度重建 `gm_node_embedding` / `gm_community_embedding`。
+失败条目保持无向量，修复端点后重跑本命令即可增量补齐。
+
 ### OAuth 登录（实验性）
 
 ```bash

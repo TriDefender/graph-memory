@@ -26,6 +26,7 @@ import {
 } from "./engine/oauth.ts";
 import type { ReasoningEffort } from "./engine/llm.ts";
 import { runBackfillExtraction } from "./cli-extract.ts";
+import { runReembed } from "./cli-reembed.ts";
 import { DEFAULT_CONFIG, type GmConfig } from "./types.ts";
 
 // ─── 最小 Commander 鸭子类型（避免引入 commander 依赖） ───────────
@@ -428,6 +429,57 @@ export function createGraphMemoryCli(deps: GraphMemoryCliDeps) {
           const message = error instanceof Error ? error.message : String(error);
           console.error("[graph-memory-pro] extract 失败：", message);
           throw new Error(`[graph-memory-pro] extract failed: ${message}`);
+        }
+      });
+
+    root
+      .command("reembed")
+      .description(
+        "清除现有向量并用当前 embedding 模型批量重建（换 embedding 模型后必须执行，否则旧向量静默失效）",
+      )
+      .option("--yes", "跳过确认提示，直接执行", false)
+      .option("--dry-run", "只报告向量覆盖情况与维度对照，不写入", false)
+      .option("--batch <n>", "每次 embedding 请求携带的文本条数（默认 32，上限 256）", undefined)
+      .option(
+        "--recreate-index",
+        "向量索引维度与当前模型输出不符时，删除索引并按 embedding.dimensions 重建",
+        false,
+      )
+      .action(async (options: Record<string, unknown>) => {
+        try {
+          const rawCfg = isPlainObject(deps.pluginConfig)
+            ? (deps.pluginConfig as Record<string, unknown>)
+            : {};
+          const cfg: GmConfig = {
+            ...DEFAULT_CONFIG,
+            ...(rawCfg as Partial<GmConfig>),
+          };
+          if (isPlainObject(rawCfg.neo4j)) {
+            cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...(rawCfg.neo4j as any) };
+          }
+          if (isPlainObject(rawCfg.embedding)) {
+            cfg.embedding = { ...(rawCfg.embedding as any) };
+          }
+
+          const batchFlag = typeof options.batch === "string"
+            ? Number.parseInt(options.batch, 10)
+            : (typeof options.batch === "number" ? options.batch : undefined);
+
+          await runReembed({
+            cfg,
+            options: {
+              yes: options.yes === true,
+              dryRun: options.dryRun === true,
+              recreateIndex: options.recreateIndex === true,
+              batch: batchFlag !== undefined && Number.isFinite(batchFlag) && batchFlag > 0
+                ? Math.floor(batchFlag)
+                : undefined,
+            },
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error("[graph-memory-pro] reembed 失败：", message);
+          throw new Error(`[graph-memory-pro] reembed failed: ${message}`);
         }
       });
   };

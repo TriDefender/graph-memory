@@ -182,6 +182,25 @@ Deletion semantics (fail-closed):
 - Unextracted messages and legacy rows (extracted before this flag existed, no `producedKnowledge` property) are never deleted.
 - A failure in the retention step itself (invalid policy fails closed with zero deletions / Neo4j error) never invalidates the other maintenance steps; it retries next cycle.
 
+### Re-embedding after switching embedding models
+
+Embedding vectors are model-specific — vectors produced by the old model are not comparable
+(different dimensions break dedup and vector search outright), and vectors are write-once with
+no automatic migration. After changing `embedding.model` / `embedding.dimensions`, run:
+
+```bash
+openclaw graph-memory reembed --dry-run   # report dimension match + vector coverage, no writes
+openclaw graph-memory reembed             # void all vectors and rebuild them in batches
+```
+
+The command voids every `MemoryNode.embedding` (and its `contentHash`, so the runtime
+`syncEmbed` hash guard cannot short-circuit), then re-embeds all active nodes and community
+summaries with the current model using batched requests (`--batch <n>`, default 32; failed
+batches automatically fall back to per-item requests). If the vector index dimensions no longer
+match the configured model, the run aborts — add `--recreate-index` to drop and recreate
+`gm_node_embedding` / `gm_community_embedding` with the new dimensions. Items that fail stay
+vectorless and are picked up by a re-run.
+
 ### OAuth login (experimental)
 
 ```bash

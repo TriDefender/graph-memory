@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
 import graphMemoryProPlugin from "../index.ts";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
+import { buildNodeEmbeddingText } from "../src/recaller/recall.ts";
 import {
   upsertNode, findByName, findById, updateNode,
   upsertEdge, edgesFrom, edgesTo, graphWalk,
@@ -11,6 +12,8 @@ import {
   updateCommunities,
   deleteNode, deprecateNodeAndDisconnect,
   deleteEdges,
+  clearAllEmbeddings, listNodeEmbeddingTargets, listCommunityEmbeddingTargets,
+  saveCommunityEmbedding, getVectorIndexDimensions,
 } from "../src/store/store.ts";
 
 // 仅在 NEO4J_INTEGRATION=1 时运行，避免污染默认 npm test（需要 Docker Neo4j）
@@ -539,5 +542,71 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
   it("searchNodes 空查询降级到 topNodes", async () => {
     const hits = await searchNodes(driver, "   ", 3);
     expect(hits.length).toBeLessThanOrEqual(3);
+  });
+
+  it("重嵌入管线：clearAllEmbeddings + listNodeEmbeddingTargets 游标分页 + saveVector 回填", async () => {
+    const { node } = await upsertNode(driver, {
+      type: "SKILL", name: "Reembed Pipeline Skill", description: "re", content: "reembed me",
+    }, TEST_SID);
+
+    // 先有向量 → 清空后节点必须重新出现在待嵌入列表
+    const vec = new Array(1024).fill(0).map((_, i) => (i % 10) / 10);
+    await saveVector(driver, node.id, "reembed me", vec);
+    let targets = await listNodeEmbeddingTargets(driver, "", 10);
+    expect(targets.some(t => t.id === node.id)).toBe(false);
+
+    const cleared = await clearAllEmbeddings(driver);
+    expect(cleared.nodes).toBeGreaterThanOrEqual(1);
+
+    targets = await listNodeEmbeddingTargets(driver, "", 10);
+    const target = targets.find(t => t.id === node.id);
+    expect(target).toBeDefined();
+    expect(target!.name).toBe("reembed-pipeline-skill"); // upsertNode 按规范化名入库
+
+    // 游标分页：以该节点 id 为游标，它不再出现在下一页
+    const next = await listNodeEmbeddingTargets(driver, node.id, 10);
+    expect(next.some(t => t.id === node.id)).toBe(false);
+
+    // 回填后再次从待嵌入列表消失（hash 一并恢复，syncEmbed 短路语义成立）
+    const text = buildNodeEmbeddingText(target!);
+    await saveVector(driver, node.id, text, vec);
+    const hash = await getVectorHash(driver, node.id);
+    expect(hash).toMatch(/^[a-f0-9]{32}$/);
+    targets = await listNodeEmbeddingTargets(driver, "", 10);
+    expect(targets.some(t => t.id === node.id)).toBe(false);
+  });
+
+  it("重嵌入管线：社区向量清空/回填 + getVectorIndexDimensions", async () => {
+    const session = getSession(driver);
+    try {
+      // 测试社区带 TEST_SID 以便 afterAll 清理扫到
+      await session.run(`
+        CREATE (c:Community {id: $id, summary: $summary, nodeCount: 1, sourceSessions: [$sid]})
+      `, { id: `c-reembed-${TEST_SID}`, summary: "reembed community summary", sid: TEST_SID });
+
+      const dimRes = await getVectorIndexDimensions(driver);
+      expect(Object.keys(dimRes)).toContain("gm_node_embedding");
+      expect(Object.keys(dimRes)).toContain("gm_community_embedding");
+      // 两个索引要么都报维度，要么都不存在（initSchema 成对创建）
+      if (dimRes.gm_node_embedding !== null && dimRes.gm_community_embedding !== null) {
+        expect(dimRes.gm_node_embedding).toBe(dimRes.gm_community_embedding);
+      }
+
+      let targets = await listCommunityEmbeddingTargets(driver, "", 10);
+      const target = targets.find(t => t.id === `c-reembed-${TEST_SID}`);
+      expect(target).toBeDefined();
+      expect(target!.summary).toBe("reembed community summary");
+
+      const commVec = new Array(dimRes.gm_community_embedding ?? 1024).fill(0.5);
+      await saveCommunityEmbedding(driver, target!.id, commVec);
+      targets = await listCommunityEmbeddingTargets(driver, "", 10);
+      expect(targets.some(t => t.id === `c-reembed-${TEST_SID}`)).toBe(false);
+
+      await clearAllEmbeddings(driver);
+      targets = await listCommunityEmbeddingTargets(driver, "", 10);
+      expect(targets.some(t => t.id === `c-reembed-${TEST_SID}`)).toBe(true);
+    } finally {
+      await session.close();
+    }
   });
 });

@@ -727,6 +727,182 @@ export async function getVectorHash(driver: Driver, nodeId: string): Promise<str
   }
 }
 
+// ─── 重嵌入（换 embedding 模型后的批量重建，graph-memory reembed） ───
+
+export interface EmbeddingStats {
+  nodesTotal: number;
+  nodesEmbedded: number;
+  communitiesTotal: number;
+  communitiesEmbedded: number;
+}
+
+/** 向量覆盖情况统计（reembed 报告 + dry-run 用） */
+export async function getEmbeddingStats(driver: Driver): Promise<EmbeddingStats> {
+  const session = getSession(driver);
+  try {
+    const nodeRes = await session.run(`
+      MATCH (n:MemoryNode {status: 'active'})
+      RETURN count(n) AS total, count(n.embedding) AS embedded
+    `);
+    const commRes = await session.run(`
+      MATCH (c:Community)
+      RETURN count(c) AS total, count(c.embedding) AS embedded
+    `);
+    const nodeRec = nodeRes.records[0];
+    const commRec = commRes.records[0];
+    return {
+      nodesTotal: nodeRec ? toInt(nodeRec.get("total")) : 0,
+      nodesEmbedded: nodeRec ? toInt(nodeRec.get("embedded")) : 0,
+      communitiesTotal: commRec ? toInt(commRec.get("total")) : 0,
+      communitiesEmbedded: commRec ? toInt(commRec.get("embedded")) : 0,
+    };
+  } finally {
+    await session.close();
+  }
+}
+
+/**
+ * 清空（void）全部向量。contentHash 必须与 embedding 一同清除：
+ * syncEmbed 以"文本 hash 未变"短路，只清 embedding 会让重嵌入被旧 hash 跳过。
+ */
+export async function clearAllEmbeddings(
+  driver: Driver,
+): Promise<{ nodes: number; communities: number }> {
+  const session = getSession(driver);
+  try {
+    const nodeRes = await session.run(`
+      MATCH (n:MemoryNode)
+      WHERE n.embedding IS NOT NULL OR n.contentHash IS NOT NULL
+      REMOVE n.embedding, n.contentHash
+      RETURN count(n) AS cleared
+    `);
+    const commRes = await session.run(`
+      MATCH (c:Community)
+      WHERE c.embedding IS NOT NULL
+      REMOVE c.embedding
+      RETURN count(c) AS cleared
+    `);
+    return {
+      nodes: nodeRes.records[0] ? toInt(nodeRes.records[0].get("cleared")) : 0,
+      communities: commRes.records[0] ? toInt(commRes.records[0].get("cleared")) : 0,
+    };
+  } finally {
+    await session.close();
+  }
+}
+
+/** 待重嵌入节点（游标分页 —— 重建过程会让集合收缩，SKIP 分页会跳号） */
+export interface NodeEmbeddingTarget {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+}
+
+export async function listNodeEmbeddingTargets(
+  driver: Driver,
+  afterId: string,
+  limit: number,
+): Promise<NodeEmbeddingTarget[]> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      MATCH (n:MemoryNode {status: 'active'})
+      WHERE n.embedding IS NULL AND n.id > $afterId
+      RETURN n.id AS id, n.name AS name, n.description AS description, n.content AS content
+      ORDER BY n.id
+      LIMIT toInteger($limit)
+    `, { afterId, limit: nint(limit) });
+    return result.records.map(r => ({
+      id: r.get("id") ?? "",
+      name: r.get("name") ?? "",
+      description: r.get("description") ?? "",
+      content: r.get("content") ?? "",
+    }));
+  } finally {
+    await session.close();
+  }
+}
+
+/** 待重嵌入社区（摘要非空才可嵌入） */
+export interface CommunityEmbeddingTarget {
+  id: string;
+  summary: string;
+}
+
+export async function listCommunityEmbeddingTargets(
+  driver: Driver,
+  afterId: string,
+  limit: number,
+): Promise<CommunityEmbeddingTarget[]> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      MATCH (c:Community)
+      WHERE c.embedding IS NULL AND c.summary IS NOT NULL AND trim(c.summary) <> ''
+      RETURN c.id AS id, c.summary AS summary
+      ORDER BY c.id
+      LIMIT toInteger($limit)
+    `, { afterId, limit: nint(limit) });
+    return result.records.map(r => ({
+      id: r.get("id") ?? "",
+      summary: r.get("summary") ?? "",
+    }));
+  } finally {
+    await session.close();
+  }
+}
+
+export async function saveCommunityEmbedding(driver: Driver, id: string, vec: number[]): Promise<void> {
+  const session = getSession(driver);
+  try {
+    await session.run(
+      "MATCH (c:Community {id: $id}) SET c.embedding = $vec",
+      { id, vec },
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+/** 读取两个向量索引的维度（索引不存在时为 null —— 全新库场景） */
+export async function getVectorIndexDimensions(driver: Driver): Promise<Record<string, number | null>> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      SHOW INDEXES YIELD name, options
+      WHERE name IN ['gm_node_embedding', 'gm_community_embedding']
+      RETURN name, options.indexConfig AS indexConfig
+    `);
+    const out: Record<string, number | null> = {
+      gm_node_embedding: null,
+      gm_community_embedding: null,
+    };
+    for (const r of result.records) {
+      const name = r.get("name");
+      const indexConfig = r.get("indexConfig") as any;
+      const dim = indexConfig?.["vector.dimensions"];
+      if (typeof name === "string" && name in out && typeof dim === "number") {
+        out[name] = dim;
+      }
+    }
+    return out;
+  } finally {
+    await session.close();
+  }
+}
+
+/** 删除两个向量索引（--recreate-index 重建路径；initSchema 会按配置重新创建） */
+export async function dropVectorIndexes(driver: Driver): Promise<void> {
+  const session = getSession(driver);
+  try {
+    await session.run("DROP INDEX gm_node_embedding IF EXISTS");
+    await session.run("DROP INDEX gm_community_embedding IF EXISTS");
+  } finally {
+    await session.close();
+  }
+}
+
 // ─── 图遍历 ────────────────────────────────────────────────
 
 export async function graphWalk(
