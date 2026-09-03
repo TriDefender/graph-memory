@@ -659,6 +659,33 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(p!.description).toBe("[DEPRECATED] 已有前缀");
   });
 
+  it("autoDeprecateNodes 状态守卫：窗口内已被手动弃用的节点不被覆盖为 decay", async () => {
+    const { node: manual } = await upsertNode(driver, {
+      type: "SKILL", name: "AutoDeprecate Guard Manual", description: "手动弃用", content: "c",
+    }, TEST_SID);
+    const { node: active } = await upsertNode(driver, {
+      type: "SKILL", name: "AutoDeprecate Guard Active", description: "仍活跃", content: "c",
+    }, TEST_SID);
+
+    // 模拟评分快照之后、批量写入之前落入窗口的手动弃用
+    const manualAt = Date.now() - 1_000;
+    await deprecateNodeAndDisconnectById(driver, manual.id, manualAt);
+
+    const now = Date.now();
+    // 只统计仍为 active 的节点：manual 已弃用不计入
+    expect(await autoDeprecateNodes(driver, [manual.id, active.id], now)).toBe(1);
+
+    const m = await findById(driver, manual.id);
+    expect(m!.status).toBe("deprecated");
+    expect(m!.deprecatedBy).toBe("manual");
+    expect(m!.deprecatedAt).toBe(manualAt); // 溯源与 purge 时钟均不被 decay 覆盖
+
+    const a = await findById(driver, active.id);
+    expect(a!.status).toBe("deprecated");
+    expect(a!.deprecatedBy).toBe("decay");
+    expect(a!.deprecatedAt).toBe(now);
+  });
+
   it("purgeDeprecatedNodes：过期 deprecated 硬删、未过期保留、active 不动、存量按 updatedAt 兜底", async () => {
     const { node: fresh } = await upsertNode(driver, {
       type: "SKILL", name: "Purge Fresh", description: "fresh", content: "c",
@@ -704,6 +731,41 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(await findById(driver, legacy.id)).toBeNull();
     expect(await findById(driver, fresh.id)).not.toBeNull();
     expect((await findById(driver, keeper.id))!.status).toBe("active");
+  });
+
+  it("initSchema 存量迁移：为缺 deprecatedAt 的 deprecated 节点补写时钟（防 updatedAt 漂移无限续命）", async () => {
+    const { node: legacy } = await upsertNode(driver, {
+      type: "SKILL", name: "Backfill Legacy Deprecated", description: "存量弃用", content: "c",
+    }, TEST_SID);
+    const old = Date.now() - 90 * 86_400_000;
+    const session = getSession(driver);
+    try {
+      // 模拟存量数据：deprecated 但无 deprecatedAt（按 manual 处理，不复活）
+      await session.run(
+        "MATCH (n {id: $id}) SET n.status='deprecated', n.updatedAt=$old REMOVE n.deprecatedAt, n.deprecatedBy",
+        { id: legacy.id, old },
+      );
+    } finally {
+      await session.close();
+    }
+
+    await initSchema(driver);
+    expect((await findById(driver, legacy.id))!.deprecatedAt).toBe(old);
+
+    // 补写后 manual 弃用节点被重新提取命中：upsertNode bump updatedAt（不复活），
+    // 但 purge 时钟已钉死在 deprecatedAt，不再被推后（修复前：回退 updatedAt → 无限续命）
+    const hit = await upsertNode(driver, {
+      type: "SKILL", name: "Backfill Legacy Deprecated", description: "重新提取", content: "更长的内容触发更新路径",
+    }, TEST_SID);
+    expect(hit.isNew).toBe(false);
+    expect(hit.node.status).toBe("deprecated");
+    const refetched = await findById(driver, legacy.id);
+    expect(refetched!.updatedAt!).toBeGreaterThan(old);
+    expect(refetched!.deprecatedAt).toBe(old);
+
+    // 幂等：重复 initSchema 不改写已存在的 deprecatedAt
+    await initSchema(driver);
+    expect((await findById(driver, legacy.id))!.deprecatedAt).toBe(old);
   });
 
   it("复活：decay 弃用节点被 upsertNode/updateNode 命中后回 active；manual 弃用不复活", async () => {

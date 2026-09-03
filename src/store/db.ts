@@ -77,6 +77,19 @@ export async function initSchema(driver: Driver, embedding?: EmbeddingConfig): P
 
     // The search code queries one index across all knowledge labels.
     await session.run("MATCH (n:Task|Skill|Event) SET n:MemoryNode");
+
+    // 存量 deprecated 节点补写 deprecatedAt（幂等，等效一次性迁移）：purge 时钟基准是
+    // deprecatedAt、缺失时回退 updatedAt——但 upsertNode 对 manual/merge 弃用节点只 bump
+    // updatedAt（不复活），存量无 deprecatedAt 的节点每次被重新提取命中都会把 purge 期限
+    // 往后推（无限续命、永远删不掉）。启动时把时钟一次性钉死为当时的
+    // coalesce(updatedAt, createdAt) 快照，此后 purge 不再受 updatedAt 漂移影响。
+    // 全新弃用路径（manual/merge/decay）都已显式写 deprecatedAt，故首次运行后恒零命中。
+    await session.run(`
+      MATCH (n:Task|Skill|Event {status: 'deprecated'})
+      WHERE n.deprecatedAt IS NULL
+      SET n.deprecatedAt = coalesce(n.updatedAt, n.createdAt)
+    `);
+
     await session.run(`
       CREATE VECTOR INDEX gm_node_embedding IF NOT EXISTS
       FOR (n:MemoryNode) ON (n.embedding)

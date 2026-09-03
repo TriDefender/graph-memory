@@ -367,7 +367,9 @@ export async function deprecateNodeAndDisconnect(
  * 遗忘曲线自动弃用（两阶段生命周期·阶段一）：批量 status='deprecated' + deprecatedBy='decay'
  * + 描述幂等加 [DEPRECATED] 前缀 + 切断所有边。与 deprecateNodeAndDisconnect 的区别：
  * 按 id 批量、来源标记 decay（重新提取/编辑命中时可被 upsertNode/updateNode 复活）。
- * 返回实际弃用的节点数。
+ * MATCH 带状态守卫：ids 来自 applyDecay 的 active 扫描快照，评分与批量写入之间存在
+ * 时间窗——窗口内刚被手动弃用的节点不得被覆盖为 decay（既改变复活语义又重置 purge 时钟），
+ * 因此只弃用仍为 active 的节点。返回实际弃用的节点数。
  */
 export async function autoDeprecateNodes(
   driver: Driver,
@@ -379,7 +381,7 @@ export async function autoDeprecateNodes(
   try {
     const result = await session.run(`
       UNWIND $ids AS nid
-      MATCH (n:Task|Skill|Event {id: nid})
+      MATCH (n:Task|Skill|Event {id: nid, status: 'active'})
       SET n.status = 'deprecated',
           n.deprecatedAt = $now,
           n.deprecatedBy = 'decay',
@@ -402,7 +404,9 @@ export async function autoDeprecateNodes(
 
 /**
  * 两阶段生命周期·阶段二：硬删过期 deprecated 节点（DETACH DELETE，embedding/contentHash
- * 向量属性随节点一并移除，释放存储）。时钟基准 deprecatedAt，存量节点缺省回退 updatedAt。
+ * 向量属性随节点一并移除，释放存储）。时钟基准 deprecatedAt；coalesce 回退 updatedAt 仅是
+ * 防御性兜底——initSchema 启动时已为存量 deprecated 节点一次性补写 deprecatedAt（否则
+ * upsertNode 对 manual/merge 弃用节点的 updatedAt bump 会无限推迟 purge）。
  * 适用于所有 deprecated 节点（decay/manual/merge）；purgeAfterMs<=0 时为 no-op。返回删除数。
  */
 export async function purgeDeprecatedNodes(

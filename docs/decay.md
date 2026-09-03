@@ -108,8 +108,8 @@ active ──遗忘曲线──▶ peripheral（仍可搜索）
 - **阶段一判定**（`shouldAutoDeprecate`，三条件同时满足）：`tier=peripheral`（本轮 tier 转换后的层级，刚降到 peripheral 的老节点即刻参与）**AND** `composite < peripheralCompositeThreshold`（高 intrinsic 价值节点受保护）**AND** 距最近访问（`lastAccessedAt` → `updatedAt` → `createdAt` 回退链）≥ `autoDeprecateAfterDays`。`autoDeprecate: false` 或 `enabled: false` 时整体停用。
 - **手动弃用 = 一次性断联**：所有人工路径（`gm_update mode=deprecate`、finalize invalidations、REST `DELETE /nodes/:id`）统一走 `deprecateNodeAndDisconnectById`——切断所有边 + `[DEPRECATED]` 前缀 + `deprecatedBy='manual'`。由于所有召回路径都过滤 `status='active'` 且边已切断，手动弃用等效删除（不存在独立的 `gm_update mode=delete`，也没有 status-only 的轻量弃用路径）。
 - **复活**：`deprecatedBy='decay'` 的节点被同名知识重新提取（`upsertNode`）或手动编辑（`updateNode`）命中时，自动恢复 `active`、剥离 `[DEPRECATED]` 前缀、清除 `deprecatedAt`/`deprecatedBy`。手动弃用（`deprecatedBy='manual'`）与 merge 败者（`deprecatedBy='merge'`）**不复活**——人工/合并语义判定优先于遗忘曲线。
-- **阶段二硬删**：所有 `deprecated` 节点（含 manual/merge/存量数据），自 `deprecatedAt`（缺省回退 `updatedAt`）起超过 `purgeAfterDays` 天后 `DETACH DELETE`。`embedding`/`contentHash` 向量属性随节点一并移除，向量索引项同步消失。`purgeAfterDays: 0` 表示永不硬删。此步不受 `enabled` 总开关约束（手动弃用的节点也需要到期清理）。
-- **存量兼容**：升级前已 deprecated 的节点没有 `deprecatedBy`，一律按 `manual` 处理（不参与复活）；硬删只看 `coalesce(deprecatedAt, updatedAt)`，存量节点的弃用时间由 `updatedAt` 兜底。
+- **阶段二硬删**：所有 `deprecated` 节点（含 manual/merge/存量数据），自 `deprecatedAt` 起超过 `purgeAfterDays` 天后 `DETACH DELETE`（`coalesce(n.deprecatedAt, n.updatedAt)` 中的 updatedAt 回退仅是防御性兜底）。`embedding`/`contentHash` 向量属性随节点一并移除，向量索引项同步消失。`purgeAfterDays: 0` 表示永不硬删。此步不受 `enabled` 总开关约束（手动弃用的节点也需要到期清理）。
+- **存量兼容**：升级前已 deprecated 的节点没有 `deprecatedBy`，一律按 `manual` 处理（不参与复活）。启动时（`initSchema`）幂等补写：为缺 `deprecatedAt` 的 deprecated 节点一次性钉死 `deprecatedAt = coalesce(updatedAt, createdAt)` 快照——否则 manual/merge 弃用节点被重新提取命中时 `upsertNode` 会 bump `updatedAt`（不复活但刷新时间戳），purge 期限被无限推后（永远删不掉）。
 
 ---
 
