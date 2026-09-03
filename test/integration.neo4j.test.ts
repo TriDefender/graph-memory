@@ -539,16 +539,29 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
       type: "SKILL", name: "Reembed Pipeline Skill", description: "re", content: "reembed me",
     }, TEST_SID);
 
+    // 前面用例在同库累积的活动节点已超过单页 limit——断言必须像 reembed CLI 一样
+    // 按游标翻完整页（SKIP 分页在收缩集合上会跳号，游标翻页是实现的正确用法）
+    const collectAllTargets = async () => {
+      const all: Awaited<ReturnType<typeof listNodeEmbeddingTargets>> = [];
+      let cursor = "";
+      for (let i = 0; i < 100; i++) {
+        const page = await listNodeEmbeddingTargets(driver, cursor, 10);
+        if (!page.length) break;
+        all.push(...page);
+        cursor = page[page.length - 1].id;
+      }
+      return all;
+    };
+
     // 先有向量 → 清空后节点必须重新出现在待嵌入列表
     const vec = new Array(1024).fill(0).map((_, i) => (i % 10) / 10);
     await saveVector(driver, node.id, "reembed me", vec);
-    let targets = await listNodeEmbeddingTargets(driver, "", 10);
-    expect(targets.some(t => t.id === node.id)).toBe(false);
+    expect((await collectAllTargets()).some(t => t.id === node.id)).toBe(false);
 
     const cleared = await clearAllEmbeddings(driver);
     expect(cleared.nodes).toBeGreaterThanOrEqual(1);
 
-    targets = await listNodeEmbeddingTargets(driver, "", 10);
+    const targets = await collectAllTargets();
     const target = targets.find(t => t.id === node.id);
     expect(target).toBeDefined();
     expect(target!.name).toBe("reembed-pipeline-skill"); // upsertNode 按规范化名入库
@@ -562,8 +575,7 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     await saveVector(driver, node.id, text, vec);
     const hash = await getVectorHash(driver, node.id);
     expect(hash).toMatch(/^[a-f0-9]{32}$/);
-    targets = await listNodeEmbeddingTargets(driver, "", 10);
-    expect(targets.some(t => t.id === node.id)).toBe(false);
+    expect((await collectAllTargets()).some(t => t.id === node.id)).toBe(false);
   });
 
   it("重嵌入管线：社区向量清空/回填 + getVectorIndexDimensions", async () => {
