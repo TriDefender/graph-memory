@@ -5,13 +5,15 @@
  * 评分 / tier 决策 / applyDecay 的入口均在本文件。
  *
  * 调用时机：runMaintenance 的第 0 步（去重/PageRank/社区之前）。
- * decay 不动 status，只动 tier。
+ * decay 调整 tier；另承担两阶段生命周期的阶段一（autoDeprecate，见 shouldAutoDeprecate）：
+ * 长期未被访问的 peripheral 低分节点被自动断联 + deprecated（deprecatedBy='decay'），
+ * 阶段二（purge 到期硬删）在 maintenance.ts 里调用 store.purgeDeprecatedNodes。
  */
 
 import type { Driver } from "neo4j-driver";
 import type { GmConfig, DecayConfig, GmNode, NodeTier } from "../types.ts";
 import { getSession } from "../store/db.ts";
-import { allActiveNodes } from "../store/store.ts";
+import { allActiveNodes, autoDeprecateNodes } from "../store/store.ts";
 
 const MS_PER_DAY = 86_400_000;
 
@@ -33,6 +35,10 @@ export interface DecayResult {
   enabled: boolean;
   scanned: number;
   tierTransitions: TierTransition;
+  /** 本次维护中被遗忘曲线自动弃用（断联 + deprecated）的节点数。 */
+  autoDeprecated: number;
+  /** 自动弃用批量写失败时的错误（fail-soft，不否定评分/tier 步骤）。 */
+  autoDeprecateError?: string;
   durationMs: number;
 }
 
@@ -187,6 +193,30 @@ export function decideTierTransition(
   return null;
 }
 
+// ─── 遗忘曲线自动弃用决策（纯函数，两阶段生命周期·阶段一） ───
+
+/**
+ * 判断节点是否应被自动弃用（断联 + status='deprecated'，deprecatedBy='decay'）。
+ * 三个条件同时满足（复用遗忘曲线判定，tier 转换先行）：
+ * 1. 已降至 peripheral 层（遗忘曲线认为不再活跃）；
+ * 2. composite 仍低于 peripheralCompositeThreshold（高价值节点受 intrinsic 保护）；
+ * 3. 距最近访问（lastAccessedAt → updatedAt → createdAt 回退链）≥ autoDeprecateAfterDays。
+ * autoDeprecate=false 时恒 false。硬删（阶段二）不在此判定，见 store.purgeDeprecatedNodes。
+ */
+export function shouldAutoDeprecate(
+  node: Pick<GmNode, "tier" | "lastAccessedAt" | "updatedAt" | "createdAt">,
+  score: CompositeScore,
+  cfg: DecayConfig,
+  now: number = Date.now(),
+): boolean {
+  if (!cfg.autoDeprecate) return false;
+  if ((node.tier ?? "working") !== "peripheral") return false;
+  if (score.composite >= cfg.peripheralCompositeThreshold) return false;
+  const lastActive = pickLastActive(node);
+  const daysSince = Math.max(0, (now - lastActive) / MS_PER_DAY);
+  return daysSince >= cfg.autoDeprecateAfterDays;
+}
+
 // ─── 应用层：扫描 + 评分 + 转换 ──────────────────────────────
 
 const EMPTY_TRANSITIONS: TierTransition = {
@@ -204,25 +234,27 @@ function bumpTransition(transitions: TierTransition, from: NodeTier, to: NodeTie
 }
 
 /**
- * 扫描所有 active 节点：评分 + tier 转换 + 写回 decayScore / tier。
- * 不动 status（status=deprecated 仅由手动弃用触发）。
+ * 扫描所有 active 节点：评分 + tier 转换 + 写回 decayScore / tier；
+ * autoDeprecate 开启时，对同时满足 shouldAutoDeprecate 的节点执行阶段一自动弃用
+ * （断联 + deprecated，deprecatedBy='decay'，可被重新提取/编辑复活）。
  */
 export async function applyDecay(driver: Driver, cfg: Pick<GmConfig, "decay">): Promise<DecayResult> {
   const start = Date.now();
   const d = cfg.decay;
   if (!d?.enabled) {
-    return { enabled: false, scanned: 0, tierTransitions: { ...EMPTY_TRANSITIONS }, durationMs: 0 };
+    return { enabled: false, scanned: 0, tierTransitions: { ...EMPTY_TRANSITIONS }, autoDeprecated: 0, durationMs: 0 };
   }
 
   const nodes = await allActiveNodes(driver);
   if (nodes.length === 0) {
-    return { enabled: true, scanned: 0, tierTransitions: { ...EMPTY_TRANSITIONS }, durationMs: 0 };
+    return { enabled: true, scanned: 0, tierTransitions: { ...EMPTY_TRANSITIONS }, autoDeprecated: 0, durationMs: 0 };
   }
 
   // reduce 而非 Math.max(...map)：spread 在超大节点集（>10 万）会爆调用栈
   const maxPagerank = nodes.reduce((m, n) => Math.max(m, n.pagerank), 0.0001);
 
   const updates: Array<{ id: string; tier: NodeTier; composite: number; tierChanged: boolean }> = [];
+  const autoDeprecateIds: string[] = [];
   const transitions: TierTransition = { ...EMPTY_TRANSITIONS };
 
   for (const node of nodes) {
@@ -234,6 +266,11 @@ export async function applyDecay(driver: Driver, cfg: Pick<GmConfig, "decay">): 
     const tierChanged = nextTier !== null;
 
     if (tierChanged) bumpTransition(transitions, currentTier, finalTier);
+
+    // 用 tier 转换后的层级判定：本轮刚降到 peripheral 的老节点即刻参与阶段一
+    if (shouldAutoDeprecate({ ...node, tier: finalTier }, score, d, start)) {
+      autoDeprecateIds.push(node.id);
+    }
 
     updates.push({
       id: node.id,
@@ -260,10 +297,24 @@ export async function applyDecay(driver: Driver, cfg: Pick<GmConfig, "decay">): 
     }
   }
 
+  // 阶段一自动弃用：断联 + deprecated + [DEPRECATED] 前缀。
+  // fail-soft：错误记入结果由调用方记日志，不阻塞维护链其余步骤，下一周期重试。
+  let autoDeprecated = 0;
+  let autoDeprecateError: string | undefined;
+  if (autoDeprecateIds.length > 0) {
+    try {
+      autoDeprecated = await autoDeprecateNodes(driver, autoDeprecateIds, start);
+    } catch (err) {
+      autoDeprecateError = String(err);
+    }
+  }
+
   return {
     enabled: true,
     scanned: nodes.length,
     tierTransitions: transitions,
+    autoDeprecated,
+    ...(autoDeprecateError ? { autoDeprecateError } : {}),
     durationMs: Date.now() - start,
   };
 }

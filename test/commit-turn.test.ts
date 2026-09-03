@@ -21,13 +21,12 @@ vi.mock("../src/store/store.ts", () => ({
   upsertEdge: async () => {},
   findByName: async () => null,
   updateNode: async () => null,
-  deleteNode: async () => {},
   deprecateNodeAndDisconnect: async () => {},
+  deprecateNodeAndDisconnectById: async () => {},
   getBySession: async () => [],
   edgesTouching: async () => [],
   deleteEdges: async () => {},
   mergeNodes: async () => {},
-  deprecate: async () => {},
   getStats: async () => ({}),
 }));
 

@@ -94,7 +94,7 @@ Anthropic 直连（Claude）——去掉 `baseURL`，切换 `provider`：
 
 ### 记忆衰减（遗忘曲线）
 
-每个维护周期对全部 active 节点做三因子加权评分（recency + frequency + intrinsic），并在三个 tier 之间双向转换：`core` / `working` / `peripheral`。衰减不会把节点置为 `status=deprecated`——只有手动弃用 / 合并才会。decay 只调整 `tier`，所有 active 节点始终保持可搜索。
+每个维护周期对全部 active 节点做三因子加权评分（recency + frequency + intrinsic），并在三个 tier 之间双向转换：`core` / `working` / `peripheral`。遗忘曲线之上还有两段生命周期（默认开启，可通过 `decay` 配置）：**自动弃用**——`peripheral` 层且 composite 持续低于 `peripheralCompositeThreshold`、超过 `autoDeprecateAfterDays`（30）天未访问的节点会被切断所有边并标记 `deprecated`；若同名知识之后被重新提取或编辑，节点自动复活回 `active`。**到期清理**——所有 `deprecated` 节点（含手动弃用与合并产物）自弃用起超过 `purgeAfterDays`（60）天后硬删（`DETACH DELETE`，向量随节点移除）以释放存储。
 
 完整公式、字段映射、默认值依据与调参指南见 **[`docs/decay.md`](docs/decay.md)**。
 
@@ -228,7 +228,7 @@ openclaw gateway --verbose
 | --- | --- |
 | `gm_search` | 按查询召回图谱知识 |
 | `gm_record` | 手动记录知识节点 |
-| `gm_update` | 按精确节点名称更新 / 删除 / 弃用已有节点（不存在则报错）。`mode=update`（默认）refine description/content；`mode=delete` 硬删除节点及其所有关系；`mode=deprecate` 标记 `[DEPRECATED]` 并删除所有关系（节点本身保留但被隔离） |
+| `gm_update` | 按精确节点名称更新 / 弃用已有节点（不存在则报错）。`mode=update`（默认）refine description/content；`mode=deprecate` 标记 `[DEPRECATED]` 并切断所有关系，节点不再可被召回（等效删除；维护链在 `purgeAfterDays` 天后物理清理）。`mode=delete` 已移除，由 deprecate 取代 |
 | `gm_link` | 手动在两个已存在节点之间建立或细化关系边（按白名单校验类型+方向；from+to+type 已存在时仅更新 instruction） |
 | `gm_unlink` | 按名称删除两节点之间的关系边；可选 type 过滤，不传则删除 from→to 之间所有边 |
 | `gm_merge` | 合并两个同类型重复节点：keep 吸收 content/validatedCount/sessions + 去重边迁移；merge 节点被软删除（deprecated） |

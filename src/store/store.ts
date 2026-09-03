@@ -8,7 +8,7 @@
 import type { Driver } from "neo4j-driver";
 import neo4j from "neo4j-driver";
 import { createHash, randomUUID } from "crypto";
-import type { GmNode, GmEdge, EdgeType, NodeType, NodeTier } from "../types.ts";
+import type { GmNode, GmEdge, EdgeType, NodeType, NodeTier, DeprecatedBy } from "../types.ts";
 import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_TYPES } from "../types.ts";
 import { getSession } from "./db.ts";
 
@@ -45,6 +45,8 @@ function toNode(r: any): GmNode {
     lastAccessedAt: toInt(n.lastAccessedAt ?? n.last_accessed_at ?? n.updatedAt ?? n.updated_at ?? n.createdAt ?? 0),
     decayScore: typeof n.decayScore === "number" ? n.decayScore : undefined,
     decayComputedAt: n.decayComputedAt ? toInt(n.decayComputedAt) : undefined,
+    deprecatedAt: n.deprecatedAt != null ? toInt(n.deprecatedAt) : undefined,
+    deprecatedBy: n.deprecatedBy != null ? (n.deprecatedBy as DeprecatedBy) : undefined,
   };
 }
 
@@ -158,10 +160,24 @@ export async function upsertNode(
   const session = getSession(driver);
   /** 按 name 更新已存在节点（find 命中与撞约束回退两条路径共用） */
   const updateExisting = async (): Promise<{ node: GmNode; isNew: boolean }> => {
+    // revived：decay 自动弃用的节点被重新提取命中时自动复活（manual/merge 弃用不复活）。
+    // revived 分支剥掉 [DEPRECATED] 前缀并忽略本次 description（语义与 stripDeprecateMarker 一致：
+    // 仅匹配 "[DEPRECATED] " 前缀或裸 "[DEPRECATED]" 整串，避免误伤恰以该子串开头的原文）。
+    // REMOVE 只对 revived 行执行——manual/merge 节点必须保留 deprecatedAt/By，
+    // 否则既丢弃用溯源，purge 时钟又会回退到本查询刚写入的 updatedAt（无限续命）。
     await session.run(`
       MATCH (n:Task|Skill|Event {name: $name})
+      WITH n, (n.status = 'deprecated' AND coalesce(n.deprecatedBy, 'manual') = 'decay') AS revived
       SET n.content = CASE WHEN size($content) > size(n.content) THEN $content ELSE n.content END,
-          n.description = CASE WHEN size($description) > size(n.description) THEN $description ELSE n.description END,
+          n.description = CASE
+            WHEN revived AND n.description STARTS WITH '[DEPRECATED] '
+              THEN substring(n.description, size('[DEPRECATED] '))
+            WHEN revived AND n.description = '[DEPRECATED]'
+              THEN ''
+            WHEN size($description) > size(n.description) THEN $description
+            ELSE n.description
+          END,
+          n.status = CASE WHEN revived THEN 'active' ELSE n.status END,
           n.validatedCount = n.validatedCount + 1,
           n.sourceSessions = CASE
             WHEN NOT $sessionId IN n.sourceSessions
@@ -170,6 +186,8 @@ export async function upsertNode(
           END,
           n.lastAccessedAt = $now,
           n.updatedAt = $now
+      FOREACH (_ IN CASE WHEN revived THEN [1] ELSE [] END
+        | REMOVE n.deprecatedAt, n.deprecatedBy)
       RETURN n
     `, { name, content: c.content, description: c.description, sessionId, now: Date.now() });
 
@@ -247,19 +265,32 @@ export async function updateNode(
   if (!ex) return null;
   const now = Date.now();
   const { description, content } = applyNodePatch(ex, patch);
+  // decay 自动弃用的节点被手动编辑命中 → 顺手复活（manual/merge 弃用不复活）。
+  // REMOVE 仅在复活时执行：非复活节点保留 deprecatedAt/By（溯源 + purge 时钟不被重置）。
+  const revived = ex.status === "deprecated" && (ex.deprecatedBy ?? "manual") === "decay";
+  const finalDescription = revived ? stripDeprecateMarker(description) : description;
   const session = getSession(driver);
   try {
     await session.run(
       `MATCH (n:Task|Skill|Event {id: $id})
        SET n.description = $description,
            n.content = $content,
-           n.updatedAt = $now`,
-      { id: ex.id, description, content, now },
+           n.status = $status,
+           n.updatedAt = $now
+       ${revived ? "REMOVE n.deprecatedAt, n.deprecatedBy" : ""}`,
+      { id: ex.id, description: finalDescription, content, status: revived ? "active" : ex.status, now },
     );
   } finally {
     await session.close();
   }
-  return { ...ex, description, content, updatedAt: now };
+  return {
+    ...ex,
+    description: finalDescription,
+    content,
+    updatedAt: now,
+    status: revived ? "active" : ex.status,
+    ...(revived ? { deprecatedAt: undefined, deprecatedBy: undefined } : {}),
+  };
 }
 
 /**
@@ -274,62 +305,121 @@ export function applyDeprecateMarker(description: string): string {
 }
 
 /**
- * 按 name 硬删除节点：DETACH DELETE —— 节点 + 所有关系一并删除。
- * 找不到返回 null（调用方决定报错语义）。
+ * 剥掉 [DEPRECATED] 前缀（applyDeprecateMarker 的逆操作）——
+ * decay 自动弃用的节点复活时还原描述。无前缀则原样返回。
  */
-export async function deleteNode(driver: Driver, name: string): Promise<GmNode | null> {
-  const ex = await findByName(driver, name);
-  if (!ex) return null;
-  const session = getSession(driver);
-  try {
-    await session.run(
-      "MATCH (n:Task|Skill|Event {id: $id}) DETACH DELETE n",
-      { id: ex.id },
-    );
-  } finally {
-    await session.close();
-  }
-  return ex;
+export function stripDeprecateMarker(description: string): string {
+  const prefix = "[DEPRECATED]";
+  if (description === prefix) return "";
+  if (description.startsWith(`${prefix} `)) return description.slice(prefix.length + 1);
+  return description;
 }
 
 /**
- * 按 name deprecate 并切断：status='deprecated' + 描述加 [DEPRECATED] 前缀 + 删除所有边。
- * 节点本身保留（不硬删），但完全从知识图谱中隔离。
- * 找不到返回 null。
+ * 手动弃用（一次性断联，按 id 定位）：status='deprecated' + deprecatedAt/deprecatedBy='manual'
+ * + 描述加 [DEPRECATED] 前缀 + 删除所有边。所有人工路径（gm_update mode=deprecate、
+ * finalize invalidations、REST DELETE）统一走这里。
+ * deprecated 节点对所有召回路径不可见且无边可走，效果等同删除；仅保留 purgeAfterDays
+ * （默认 60 天）反悔窗口，到期由 maintenance 硬删。找不到返回 null。
  */
-export async function deprecateNodeAndDisconnect(
+export async function deprecateNodeAndDisconnectById(
   driver: Driver,
-  name: string,
+  id: string,
+  now: number = Date.now(),
 ): Promise<GmNode | null> {
-  const ex = await findByName(driver, name);
+  const ex = await findById(driver, id);
   if (!ex) return null;
-  const now = Date.now();
+  // 已弃用节点再次被弃用时保留原 deprecatedAt——否则每次重新提取触发的
+  // finalize invalidations / REST 重试都会重置 60 天 purge 时钟（无限续命）。
+  const deprecatedAt = ex.status === "deprecated" && ex.deprecatedAt ? ex.deprecatedAt : now;
   const description = applyDeprecateMarker(ex.description);
   const session = getSession(driver);
   try {
     await session.run(
       `MATCH (n:Task|Skill|Event {id: $id})
        SET n.status = 'deprecated',
+           n.deprecatedAt = $deprecatedAt,
+           n.deprecatedBy = 'manual',
            n.description = $description,
            n.updatedAt = $now
        WITH n
        OPTIONAL MATCH (n)-[r]-()
        DELETE r`,
-      { id: ex.id, description, now },
+      { id, deprecatedAt, description, now },
     );
   } finally {
     await session.close();
   }
-  return { ...ex, status: "deprecated", description, updatedAt: now };
+  return { ...ex, status: "deprecated", deprecatedAt, deprecatedBy: "manual", description, updatedAt: now };
 }
 
-export async function deprecate(driver: Driver, nodeId: string): Promise<void> {
+/** 按 name 弃用并切断（gm_update mode=deprecate 用）；找不到返回 null。 */
+export async function deprecateNodeAndDisconnect(
+  driver: Driver,
+  name: string,
+): Promise<GmNode | null> {
+  const ex = await findByName(driver, name);
+  if (!ex) return null;
+  return deprecateNodeAndDisconnectById(driver, ex.id, Date.now());
+}
+
+/**
+ * 遗忘曲线自动弃用（两阶段生命周期·阶段一）：批量 status='deprecated' + deprecatedBy='decay'
+ * + 描述幂等加 [DEPRECATED] 前缀 + 切断所有边。与 deprecateNodeAndDisconnect 的区别：
+ * 按 id 批量、来源标记 decay（重新提取/编辑命中时可被 upsertNode/updateNode 复活）。
+ * 返回实际弃用的节点数。
+ */
+export async function autoDeprecateNodes(
+  driver: Driver,
+  ids: string[],
+  now: number = Date.now(),
+): Promise<number> {
+  if (!ids.length) return 0;
   const session = getSession(driver);
   try {
-    await session.run(
-      "MATCH (n:Task|Skill|Event {id: $id}) SET n.status = 'deprecated', n.updatedAt = $now",
-      { id: nodeId, now: Date.now() },
-    );
+    const result = await session.run(`
+      UNWIND $ids AS nid
+      MATCH (n:Task|Skill|Event {id: nid})
+      SET n.status = 'deprecated',
+          n.deprecatedAt = $now,
+          n.deprecatedBy = 'decay',
+          n.description = CASE
+            WHEN n.description STARTS WITH '[DEPRECATED]' THEN n.description
+            WHEN n.description IS NULL OR size(n.description) = 0 THEN '[DEPRECATED]'
+            ELSE '[DEPRECATED] ' + n.description
+          END,
+          n.updatedAt = $now
+      WITH n
+      OPTIONAL MATCH (n)-[r]-()
+      DELETE r
+      RETURN count(DISTINCT n) AS c
+    `, { ids, now });
+    return toInt(result.records[0]?.get("c") ?? 0);
+  } finally {
+    await session.close();
+  }
+}
+
+/**
+ * 两阶段生命周期·阶段二：硬删过期 deprecated 节点（DETACH DELETE，embedding/contentHash
+ * 向量属性随节点一并移除，释放存储）。时钟基准 deprecatedAt，存量节点缺省回退 updatedAt。
+ * 适用于所有 deprecated 节点（decay/manual/merge）；purgeAfterMs<=0 时为 no-op。返回删除数。
+ */
+export async function purgeDeprecatedNodes(
+  driver: Driver,
+  purgeAfterMs: number,
+  now: number = Date.now(),
+): Promise<number> {
+  if (!(purgeAfterMs > 0)) return 0;
+  const session = getSession(driver);
+  try {
+    const result = await session.run(`
+      MATCH (n:Task|Skill|Event {status: 'deprecated'})
+      WHERE coalesce(n.deprecatedAt, n.updatedAt) < $cutoff
+      DETACH DELETE n
+      RETURN count(n) AS c
+    `, { cutoff: now - purgeAfterMs });
+    return toInt(result.records[0]?.get("c") ?? 0);
   } finally {
     await session.close();
   }
@@ -404,9 +494,13 @@ export async function mergeNodes(driver: Driver, keepId: string, mergeId: string
         DELETE r
       `, { keepId });
 
-      // 标记 deprecated
+      // 标记 deprecated（deprecatedBy='merge'：不参与 decay 复活；参与 purge 到期硬删）
       await tx.run(
-        "MATCH (n:Task|Skill|Event {id: $mergeId}) SET n.status = 'deprecated', n.updatedAt = $now",
+        `MATCH (n:Task|Skill|Event {id: $mergeId})
+         SET n.status = 'deprecated',
+             n.deprecatedAt = $now,
+             n.deprecatedBy = 'merge',
+             n.updatedAt = $now`,
         { mergeId, now: Date.now() },
       );
     });

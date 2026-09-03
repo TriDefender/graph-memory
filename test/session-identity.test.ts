@@ -44,7 +44,7 @@ vi.mock("../src/store/store.ts", () => ({
   edgesFrom: async () => [],
   edgesTo: async () => [],
   edgesTouching: async () => [],
-  deprecate: async () => {},
+  deprecateNodeAndDisconnectById: async () => {},
   getStats: async () => ({}),
 }));
 

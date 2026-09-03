@@ -12,7 +12,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { Driver } from "neo4j-driver";
 import { getDriver, initSchema, closeDriver, getSession } from "../src/store/db.ts";
 import {
-  upsertNode, upsertEdge, saveVector, findById, deprecate, getCommunitySummary,
+  upsertNode, upsertEdge, saveVector, findById, deprecateNodeAndDisconnectById, getCommunitySummary,
 } from "../src/store/store.ts";
 import {
   personalizedPageRank, computeGlobalPageRank,
@@ -146,7 +146,7 @@ describe.skipIf(!ENABLED)("graph layer integration (GDS, Docker)", () => {
       type: "SKILL", name: "Deprecated Pagerank Sentinel",
       description: "deprecated", content: "deprecated",
     }, TEST_SID);
-    await deprecate(driver, node.id);
+    await deprecateNodeAndDisconnectById(driver, node.id);
     const session = getSession(driver);
     try {
       await session.run(

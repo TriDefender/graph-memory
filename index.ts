@@ -13,10 +13,10 @@ import {
   saveMessage, getUnextracted, getMaxTurnIndex,
   markExtracted, isTurnExtracted, commitTurnAdvance,
   upsertNode, upsertEdge, findByName, updateNode,
-  deleteNode, deprecateNodeAndDisconnect,
+  deprecateNodeAndDisconnect, deprecateNodeAndDisconnectById,
   getBySession, edgesTouching,
   deleteEdges, mergeNodes,
-  deprecate, getStats,
+  getStats,
 } from "./src/store/store.ts";
 import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
@@ -717,6 +717,7 @@ const graphMemoryProPlugin = {
               `[graph-memory-pro] maintenance: ${result.durationMs}ms, ` +
               `dedup=${result.dedup.merged}, communities=${result.community.count}, ` +
               `summaries=${result.communitySummaries}, ` +
+              `autoDeprecate=${result.decay.autoDeprecated}, purged=${result.purged}, ` +
               (result.retention
                 ? ("error" in result.retention
                     ? `retention=failed: ${result.retention.error.slice(0, 120)}, `
@@ -1216,7 +1217,7 @@ const graphMemoryProPlugin = {
                 });
               }
             }
-            for (const id of fin.invalidations) await deprecate(driver, id);
+            for (const id of fin.invalidations) await deprecateNodeAndDisconnectById(driver, id);
           });
         }
 
@@ -1348,16 +1349,15 @@ const graphMemoryProPlugin = {
         label: "Update Graph Memory Node",
         description:
           "更新知识图谱中已存在的节点。必须提供精确的节点名称（不存在会报错）。" +
-          "三种模式：(1) 默认 update —— refine description/content；" +
-          "(2) delete —— 硬删除节点及其所有关系；" +
-          "(3) deprecate —— 标记 [DEPRECATED] 并切断所有关系（节点本身保留但被隔离）。",
+          "两种模式：(1) 默认 update —— refine description/content；" +
+          "(2) deprecate —— 标记 [DEPRECATED] 并切断所有关系（等效删除：deprecated 节点不可被召回，" +
+          "维护链会在 purgeAfterDays 天后物理清理）。",
         parameters: Type.Object({
           name: Type.String({ description: "目标节点名称（必须精确匹配已有节点；名称会被标准化：全小写、空格/下划线转连字符）" }),
           mode: Type.Optional(Type.Union([
             Type.Literal("update"),
-            Type.Literal("delete"),
             Type.Literal("deprecate"),
-          ], { description: "操作模式：update（默认，更新 description/content）、delete（硬删除节点+所有关系）、deprecate（标记 [DEPRECATED] 并删除所有关系，节点保留）" })),
+          ], { description: "操作模式：update（默认，更新 description/content）、deprecate（断联+标记弃用，等效删除）" })),
           description: Type.Optional(
             Type.String({ description: "新的一句话说明（one-line summary）。仅 update 模式生效，不传则保留原值" }),
           ),
@@ -1369,7 +1369,7 @@ const graphMemoryProPlugin = {
           _toolCallId: string,
           p: {
             name: string;
-            mode?: "update" | "delete" | "deprecate";
+            mode?: "update" | "deprecate";
             description?: string;
             content?: string;
           },
@@ -1380,16 +1380,12 @@ const graphMemoryProPlugin = {
             `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
             `或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。`;
 
-          if (mode === "delete") {
-            const deleted = await deleteNode(driver, p.name);
-            if (!deleted) throw new Error(notFoundHint);
-            return {
-              content: [{
-                type: "text",
-                text: `已删除：${deleted.name} (${deleted.type}) —— 节点及其所有关系已从图谱中移除`,
-              }],
-              details: { mode, name: deleted.name, type: deleted.type, id: deleted.id },
-            };
+          // mode=delete 已移除（断联弃用等效删除）——为旧调用方保留明确报错而非静默降级为 update
+          if ((mode as string) === "delete") {
+            throw new Error(
+              "[graph-memory-pro] mode=delete 已移除：请改用 mode=deprecate（切断所有关系并标记 [DEPRECATED]，" +
+              "deprecated 节点不可被召回，等效删除；维护链将在 purgeAfterDays 天后自动物理清理）",
+            );
           }
 
           if (mode === "deprecate") {
@@ -1416,7 +1412,7 @@ const graphMemoryProPlugin = {
           if (p.description === undefined && p.content === undefined) {
             throw new Error(
               "[graph-memory-pro] gm_update mode=update 至少需要提供 description 或 content 中的一个" +
-              "（如需删除节点请用 mode=delete，如需弃用请用 mode=deprecate）",
+              "（如需移除节点请用 mode=deprecate —— 断联+标记弃用，等效删除）",
             );
           }
           const updated = await updateNode(driver, p.name, {
@@ -1666,8 +1662,15 @@ const graphMemoryProPlugin = {
               ? `衰减：扫描 ${result.decay.scanned} 个节点，tier 转换 ${totalTransitions} 次` +
                 (totalTransitions > 0
                   ? `（core→working ${t.coreToWorking}，working→peripheral ${t.workingToPeripheral}，peripheral→working ${t.peripheralToWorking}，working→core ${t.workingToCore}）`
+                  : "") +
+                (result.decay.autoDeprecated > 0
+                  ? `\n自动弃用：${result.decay.autoDeprecated} 个长期未用的 peripheral 节点已断联并标记 [DEPRECATED]` +
+                    (result.decay.autoDeprecateError ? `（失败：${result.decay.autoDeprecateError.slice(0, 120)}）` : "")
                   : "")
               : `衰减：已禁用`,
+            result.purged > 0
+              ? `过期清理：硬删 ${result.purged} 个弃用超期的节点`
+              : "",
             `去重：${result.dedup.pairs.length} 对相似，合并 ${result.dedup.merged} 对`,
             ...(result.dedup.pairs.length > 0
               ? result.dedup.pairs.slice(0, 5).map(p => `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
@@ -1676,8 +1679,8 @@ const graphMemoryProPlugin = {
             `社区描述：${result.communitySummaries} 个`,
             `PageRank Top 5：`,
             ...result.pagerank.topK.slice(0, 5).map((n, i) => `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
-          ].join("\n");
-          return { content: [{ type: "text", text }], details: { durationMs: result.durationMs, decayTransitions: totalTransitions, dedupMerged: result.dedup.merged, communities: result.community.count } };
+          ].filter(Boolean).join("\n");
+          return { content: [{ type: "text", text }], details: { durationMs: result.durationMs, decayTransitions: totalTransitions, autoDeprecated: result.decay.autoDeprecated, purged: result.purged, dedupMerged: result.dedup.merged, communities: result.community.count } };
         },
       }),
       { name: "gm_maintain" },

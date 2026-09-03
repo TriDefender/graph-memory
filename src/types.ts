@@ -13,9 +13,21 @@ export type NodeStatus = "active" | "deprecated";
 /**
  * 记忆分层 tier（与 NodeStatus 正交）。
  * decay 评分模型据此双向转换：core↔working↔peripheral。
- * 节点仍保持 status=active，仅 tier 变化；status=deprecated 只由手动弃用触发。
+ * 节点通常保持 status=active，仅 tier 变化；status=deprecated 由手动弃用、
+ * merge 或 decay 自动弃用（autoDeprecate，见 DecayConfig）触发。
  */
 export type NodeTier = "core" | "working" | "peripheral";
+
+/**
+ * 弃用来源标记（节点属性 deprecatedBy）：
+ * - decay：遗忘曲线自动弃用（tier=peripheral + 低 composite + 超期未访问）；
+ *   重新提取/编辑命中时可自动复活回 active。
+ * - manual：gm_update mode=deprecate / finalize invalidations / REST DELETE；
+ *   人工语义判定，不自动复活。
+ * - merge：dedup 或手动合并的败者节点，不自动复活。
+ * 缺省（存量数据）按 manual 处理——不复活；硬删判定只看 deprecatedAt/updatedAt。
+ */
+export type DeprecatedBy = "decay" | "manual" | "merge";
 
 /** Neo4j label 映射：TASK->Task, SKILL->Skill, EVENT->Event */
 export const NODE_TYPE_TO_LABEL: Record<NodeType, string> = {
@@ -51,6 +63,10 @@ export interface GmNode {
   decayScore?: number;
   /** decayScore 的计算时间戳（epoch ms）。 */
   decayComputedAt?: number;
+  /** 被标记 deprecated 的时刻（epoch ms）。硬删倒计时（purgeAfterDays）的基准。 */
+  deprecatedAt?: number;
+  /** 弃用来源（见 DeprecatedBy）；缺省按 manual 处理。 */
+  deprecatedBy?: DeprecatedBy;
 }
 
 // ─── 边 ───────────────────────────────────────────────────────
@@ -179,6 +195,21 @@ export interface DecayConfig {
   peripheralAgeDays: number;
   workingAccessThreshold: number;
   workingCompositeThreshold: number;
+  /**
+   * 遗忘曲线自动弃用开关（两阶段生命周期的第一阶段）：
+   * tier=peripheral 且 composite < peripheralCompositeThreshold 且
+   * lastAccessedAt 距今 ≥ autoDeprecateAfterDays 的节点在维护时被断联 + deprecated。
+   * 受 enabled 总开关约束（enabled=false 时整体跳过）。
+   */
+  autoDeprecate: boolean;
+  /** 自动弃用的未访问天数门槛（距 lastAccessedAt）。 */
+  autoDeprecateAfterDays: number;
+  /**
+   * 两阶段生命周期的第二阶段：deprecated 节点自 deprecatedAt（缺省回退 updatedAt）
+   * 起超过该天数后硬删（DETACH DELETE，向量随节点一并移除）。
+   * 0 = 永不硬删。适用于所有 deprecated 节点（含 manual/merge）。
+   */
+  purgeAfterDays: number;
 }
 
 // ─── cron 会话（定时任务）的图谱行为配置 ─────────────────────
@@ -297,6 +328,9 @@ export const DEFAULT_CONFIG: GmConfig = {
     peripheralAgeDays: 60,
     workingAccessThreshold: 3,
     workingCompositeThreshold: 0.4,
+    autoDeprecate: true,
+    autoDeprecateAfterDays: 30,
+    purgeAfterDays: 60,
   },
   cron: DEFAULT_CRON_CONFIG,
 };

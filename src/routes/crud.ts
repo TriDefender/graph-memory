@@ -19,7 +19,7 @@ import type { NodeType, EdgeType } from "../types.ts";
 import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_DIRECTION_RULES, EDGE_TYPES } from "../types.ts";
 import {
   upsertNode, findById, findByName, allActiveNodes, allEdges,
-  upsertEdge, edgesFrom, edgesTo, deprecate, mergeNodes,
+  upsertEdge, edgesFrom, edgesTo, deprecateNodeAndDisconnectById, mergeNodes,
   searchNodes, getStats, normalizeName,
 } from "../store/store.ts";
 import { getSession } from "../store/db.ts";
@@ -347,7 +347,8 @@ async function handleUpdateNode(
 
 /**
  * DELETE /nodes?id=xxx
- * 标记节点为 deprecated（软删除）
+ * 标记节点为 deprecated（断联弃用：切边 + [DEPRECATED] 前缀，等效删除；
+ * 维护链在 purgeAfterDays 天后物理清理）
  */
 async function handleDeleteNode(
   res: ServerResponse,
@@ -360,17 +361,13 @@ async function handleDeleteNode(
     return true;
   }
 
-  const existing = await findById(driver, id);
+  const existing = await deprecateNodeAndDisconnectById(driver, id);
   if (!existing) {
     json(res, 404, { error: `Node not found: ${id}` });
     return true;
   }
 
-  await deprecate(driver, id);
-
-  // 向量不需要删除 — deprecated 节点的向量搜索时会被 status='active' 过滤掉
-
-  json(res, 200, { success: true, id, name: existing.name });
+  json(res, 200, { success: true, id, name: existing.name, status: existing.status });
   return true;
 }
 

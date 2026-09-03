@@ -8,6 +8,7 @@ import {
   scoreIntrinsic,
   scoreNode,
   decideTierTransition,
+  shouldAutoDeprecate,
 } from "../src/graph/decay.ts";
 import { DEFAULT_CONFIG, type DecayConfig, type GmNode } from "../src/types.ts";
 
@@ -274,5 +275,70 @@ describe("decideTierTransition", () => {
   it("tier undefined 按 working 处理", () => {
     const node = makeNode({ tier: undefined as unknown as GmNode["tier"], validatedCount: 1 });
     expect(decideTierTransition(node, scoreLow, 0, cfg, NOW)).toBe("peripheral");
+  });
+});
+
+describe("shouldAutoDeprecate", () => {
+  // peripheralCompositeThreshold=0.15：低分 0.1 / 达标 0.5
+  const scoreLow = { composite: 0.1, recency: 0, frequency: 0, intrinsic: 0 };
+  const scoreHigh = { composite: 0.5, recency: 0.5, frequency: 0.5, intrinsic: 0.5 };
+
+  it("peripheral + 低分 + 超期未访问 → true（三条件齐备）", () => {
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - 40 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(true);
+  });
+
+  it("working 层 → false（遗忘曲线 tier 转换先行）", () => {
+    const node = makeNode({ tier: "working", lastAccessedAt: NOW - 40 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(false);
+  });
+
+  it("core 层 → false", () => {
+    const node = makeNode({ tier: "core", lastAccessedAt: NOW - 40 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(false);
+  });
+
+  it("composite 达标 → false（高 intrinsic 价值节点受保护）", () => {
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - 40 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreHigh, cfg, NOW)).toBe(false);
+  });
+
+  it("composite 恰等于阈值 → false（边界取保留）", () => {
+    const scoreAtThreshold = { composite: cfg.peripheralCompositeThreshold, recency: 0, frequency: 0, intrinsic: 0 };
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - 40 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreAtThreshold, cfg, NOW)).toBe(false);
+  });
+
+  it("未超 autoDeprecateAfterDays → false", () => {
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - 10 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(false);
+  });
+
+  it("恰好达到天数门槛 → true（>= 含端点）", () => {
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - cfg.autoDeprecateAfterDays * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(true);
+  });
+
+  it("autoDeprecate=false 恒 false（功能开关）", () => {
+    const offCfg: DecayConfig = { ...cfg, autoDeprecate: false };
+    const node = makeNode({ tier: "peripheral", lastAccessedAt: NOW - 400 * MS_PER_DAY });
+    expect(shouldAutoDeprecate(node, scoreLow, offCfg, NOW)).toBe(false);
+  });
+
+  it("lastAccessedAt 缺失时回退 updatedAt（与 decay 计时基准一致）", () => {
+    const viaFallback = makeNode({
+      tier: "peripheral",
+      lastAccessedAt: 0,
+      updatedAt: NOW - (cfg.autoDeprecateAfterDays + 5) * MS_PER_DAY,
+    });
+    expect(shouldAutoDeprecate(viaFallback, scoreLow, cfg, NOW)).toBe(true);
+  });
+
+  it("tier undefined 按 working 处理 → false", () => {
+    const node = makeNode({
+      tier: undefined as unknown as GmNode["tier"],
+      lastAccessedAt: NOW - 400 * MS_PER_DAY,
+    });
+    expect(shouldAutoDeprecate(node, scoreLow, cfg, NOW)).toBe(false);
   });
 });

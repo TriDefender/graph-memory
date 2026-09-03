@@ -110,7 +110,7 @@ Anthropic direct (Claude) — drop `baseURL`, switch `provider`:
 
 ### Memory decay (forgetting curve)
 
-Each maintenance cycle scores every active node with a three-factor weighted model (recency + frequency + intrinsic) and bidirectionally transitions nodes across three tiers: `core` / `working` / `peripheral`. Nodes never get `status=deprecated` from decay — only manual deprecate / merge does that. Decay only adjusts `tier`, so all active nodes remain searchable.
+Each maintenance cycle scores every active node with a three-factor weighted model (recency + frequency + intrinsic) and bidirectionally transitions nodes across three tiers: `core` / `working` / `peripheral`. Two lifecycle stages sit on top of the forgetting curve (both on by default, configurable via `decay`): **auto-deprecation** — a `peripheral` node whose composite stays below `peripheralCompositeThreshold` and which has not been accessed for `autoDeprecateAfterDays` (30) days gets its edges severed and is marked `deprecated`; if the same knowledge is extracted or edited again, the node automatically revives to `active`. **purge** — any `deprecated` node (manual deprecation and merge losers included) is hard-deleted (`DETACH DELETE`, vectors included) after `purgeAfterDays` (60) days to reclaim storage.
 
 The full formula, field mapping from the reference implementation, default-value rationale, and tuning guide live in **[`docs/decay.md`](docs/decay.md)**.
 
@@ -251,7 +251,7 @@ Inspect the graph with the bundled Cypher shell:
 | --- | --- |
 | `gm_search` | Recall graph knowledge for a query |
 | `gm_record` | Add a knowledge node manually |
-| `gm_update` | Update, delete, or deprecate an existing node by exact name. `mode=update` (default) refines description/content; `mode=delete` hard-deletes the node and all its relationships; `mode=deprecate` marks `[DEPRECATED]` and removes all relationships while keeping the node (throws if not found) |
+| `gm_update` | Update or deprecate an existing node by exact name. `mode=update` (default) refines description/content; `mode=deprecate` marks `[DEPRECATED]`, removes all relationships, and makes the node unreachable from recall (equivalent to deletion; physically purged by maintenance after `purgeAfterDays`). `mode=delete` was removed — deprecate replaces it (throws if not found) |
 | `gm_link` | Manually create or refine an edge between two existing nodes (validates type + direction against the whitelist; idempotent on from+to+type) |
 | `gm_unlink` | Remove edges between two nodes by name; optional `type` filter, otherwise all from→to edges |
 | `gm_merge` | Merge two same-type duplicate nodes: keep absorbs content/validatedCount/sessions + dedup-aware edge migration; merge is soft-deleted |

@@ -7,14 +7,17 @@ import {
   upsertNode, findByName, findById, updateNode,
   upsertEdge, edgesFrom, edgesTo, graphWalk,
   saveMessage, getUnextracted, markExtracted, isTurnExtracted,
-  deprecate, getStats, mergeNodes, searchNodes, topNodes,
+  getStats, mergeNodes, searchNodes, topNodes,
   getBySession, saveVector, vectorSearchWithScore, getVectorHash,
   updateCommunities,
-  deleteNode, deprecateNodeAndDisconnect,
+  deprecateNodeAndDisconnect, deprecateNodeAndDisconnectById,
   deleteEdges,
   clearAllEmbeddings, listNodeEmbeddingTargets, listCommunityEmbeddingTargets,
   saveCommunityEmbedding, getVectorIndexDimensions,
+  autoDeprecateNodes, purgeDeprecatedNodes,
 } from "../src/store/store.ts";
+import { applyDecay } from "../src/graph/decay.ts";
+import { DEFAULT_CONFIG } from "../src/types.ts";
 
 // 仅在 NEO4J_INTEGRATION=1 时运行，避免污染默认 npm test（需要 Docker Neo4j）
 const ENABLED = !!process.env.NEO4J_INTEGRATION;
@@ -181,7 +184,7 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(edges.some(e => e.type === "USED_SKILL")).toBe(true);
   });
 
-  it("graphWalk 不穿过 deprecated 中间节点连接两个 active 节点", async () => {
+  it("graphWalk 不穿过 deprecated 中间节点（弃用同时断联）", async () => {
     const { node: start } = await upsertNode(driver, {
       type: "SKILL", name: "Active Walk Start", description: "start", content: "start",
     }, TEST_SID);
@@ -199,7 +202,10 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
       fromId: deprecatedBridge.id, toId: unreachable.id, type: "REQUIRES",
       instruction: "second hop", sessionId: TEST_SID,
     });
-    await deprecate(driver, deprecatedBridge.id);
+    // 手动弃用（按 id）——同时切断两侧边
+    await deprecateNodeAndDisconnectById(driver, deprecatedBridge.id);
+    expect(await edgesTo(driver, deprecatedBridge.id)).toHaveLength(0);
+    expect(await edgesFrom(driver, deprecatedBridge.id)).toHaveLength(0);
 
     const { nodes } = await graphWalk(driver, [start.id], 2);
 
@@ -284,42 +290,26 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     expect(stats.byType.SKILL).toBeGreaterThanOrEqual(1);
   });
 
-  it("deprecate 软删除（status=deprecated，节点仍存在）", async () => {
+  it("deprecateNodeAndDisconnectById 手动弃用：断联 + 前缀 + manual 标记（finalize invalidations / REST DELETE 路径）", async () => {
     const { node } = await upsertNode(driver, {
       type: "EVENT", name: "Temp Event", description: "d", content: "c",
     }, TEST_SID);
-    await deprecate(driver, node.id);
+    const result = await deprecateNodeAndDisconnectById(driver, node.id);
+    expect(result).not.toBeNull();
+    expect(result!.status).toBe("deprecated");
+    expect(result!.deprecatedBy).toBe("manual");
+    expect(result!.description).toBe("[DEPRECATED] d");
+
     const refetch = await findById(driver, node.id);
     expect(refetch).not.toBeNull();
     expect(refetch!.status).toBe("deprecated");
-  });
+    expect(await deprecateNodeAndDisconnectById(driver, "ghost-node-deprecate-id-xyz")).toBeNull();
 
-  it("deleteNode 硬删除：节点 + 所有关系一并消失（gm_update mode=delete）", async () => {
-    const { node: task } = await upsertNode(driver, {
-      type: "TASK", name: "HardDelete Task", description: "victim", content: "victim",
-    }, TEST_SID);
-    const { node: skill } = await upsertNode(driver, {
-      type: "SKILL", name: "HardDelete Skill", description: "neighbor", content: "neighbor",
-    }, TEST_SID);
-    await upsertEdge(driver, {
-      fromId: task.id, toId: skill.id, type: "USED_SKILL",
-      instruction: "uses", sessionId: TEST_SID,
-    });
-
-    const deleted = await deleteNode(driver, task.name);
-    expect(deleted).not.toBeNull();
-    expect(deleted!.id).toBe(task.id);
-
-    expect(await findById(driver, task.id)).toBeNull();
-
-    const remainingOut = await edgesFrom(driver, skill.id);
-    expect(remainingOut.filter(e => e.id === task.id)).toHaveLength(0);
-    const remainingIn = await edgesTo(driver, skill.id);
-    expect(remainingIn.filter(e => e.fromId === task.id)).toHaveLength(0);
-  });
-
-  it("deleteNode 未知 name 返回 null", async () => {
-    expect(await deleteNode(driver, "ghost-node-delete-xyz")).toBeNull();
+    // 重复弃用保留原 deprecatedAt（不重置 purge 时钟）
+    const firstAt = refetch!.deprecatedAt!;
+    const again = await deprecateNodeAndDisconnectById(driver, node.id, firstAt + 86_400_000);
+    expect(again!.deprecatedAt).toBe(firstAt);
+    expect((await findById(driver, node.id))!.deprecatedAt).toBe(firstAt);
   });
 
   it("deprecateNodeAndDisconnect 标记 [DEPRECATED] + 切边（节点保留，gm_update mode=deprecate）", async () => {
@@ -608,5 +598,175 @@ describe.skipIf(!ENABLED)("Neo4j integration (Docker)", () => {
     } finally {
       await session.close();
     }
+  });
+
+  // ── 两阶段生命周期：遗忘曲线自动弃用 → 到期硬删（复活见 upsertNode/updateNode） ──
+  // 隔离性注意：purge 与 applyDecay 用例作用于整个数据库（不限于 TEST_SID——
+  // purge 的 MATCH 不带 sourceSessions 过滤，applyDecay 扫描全部 active 节点），
+  // 依赖 AGENTS.md 约定「NEO4J_INTEGRATION=1 指向一次性 Neo4j」保证数据正确性。
+
+  it("autoDeprecateNodes 批量标记 decay 弃用 + 切边 + 属性 + 前缀幂等", async () => {
+    const { node: victim } = await upsertNode(driver, {
+      type: "SKILL", name: "AutoDeprecate Target", description: "原描述", content: "content",
+    }, TEST_SID);
+    const { node: a } = await upsertNode(driver, {
+      type: "TASK", name: "AutoDeprecate Neighbor A", description: "n", content: "n",
+    }, TEST_SID);
+    const { node: b } = await upsertNode(driver, {
+      type: "SKILL", name: "AutoDeprecate Neighbor B", description: "n", content: "n",
+    }, TEST_SID);
+    await upsertEdge(driver, {
+      fromId: a.id, toId: victim.id, type: "USED_SKILL",
+      instruction: "uses", sessionId: TEST_SID,
+    });
+    await upsertEdge(driver, {
+      fromId: victim.id, toId: b.id, type: "REQUIRES",
+      instruction: "needs", sessionId: TEST_SID,
+    });
+    // 已带前缀的节点验证幂等（不双写）
+    const { node: prefixed } = await upsertNode(driver, {
+      type: "SKILL", name: "AutoDeprecate Prefixed", description: "[DEPRECATED] 已有前缀", content: "c",
+    }, TEST_SID);
+
+    const now = Date.now();
+    expect(await autoDeprecateNodes(driver, [], now)).toBe(0);
+    expect(await autoDeprecateNodes(driver, [victim.id, prefixed.id], now)).toBe(2);
+
+    const v = await findById(driver, victim.id);
+    expect(v!.status).toBe("deprecated");
+    expect(v!.deprecatedBy).toBe("decay");
+    expect(v!.deprecatedAt).toBe(now);
+    expect(v!.description).toBe("[DEPRECATED] 原描述");
+    expect(await edgesTo(driver, victim.id)).toHaveLength(0);
+    expect(await edgesFrom(driver, victim.id)).toHaveLength(0);
+    expect((await findById(driver, a.id))!.status).toBe("active");
+    expect((await findById(driver, b.id))!.status).toBe("active");
+
+    const p = await findById(driver, prefixed.id);
+    expect(p!.deprecatedBy).toBe("decay");
+    expect(p!.description).toBe("[DEPRECATED] 已有前缀");
+  });
+
+  it("purgeDeprecatedNodes：过期 deprecated 硬删、未过期保留、active 不动、存量按 updatedAt 兜底", async () => {
+    const { node: fresh } = await upsertNode(driver, {
+      type: "SKILL", name: "Purge Fresh", description: "fresh", content: "c",
+    }, TEST_SID);
+    const { node: stale } = await upsertNode(driver, {
+      type: "SKILL", name: "Purge Stale", description: "stale", content: "c",
+    }, TEST_SID);
+    const { node: legacy } = await upsertNode(driver, {
+      type: "SKILL", name: "Purge Legacy", description: "legacy", content: "c",
+    }, TEST_SID);
+    const { node: keeper } = await upsertNode(driver, {
+      type: "SKILL", name: "Purge Active Keeper", description: "active", content: "c",
+    }, TEST_SID);
+
+    const now = Date.now();
+    const session = getSession(driver);
+    try {
+      // fresh：刚弃用（deprecatedAt = now），未到期
+      await session.run(
+        "MATCH (n {id: $id}) SET n.status='deprecated', n.deprecatedAt=$now, n.deprecatedBy='decay'",
+        { id: fresh.id, now },
+      );
+      // stale：decay 弃用已超 60 天
+      await session.run(
+        "MATCH (n {id: $id}) SET n.status='deprecated', n.deprecatedAt=$old, n.deprecatedBy='decay'",
+        { id: stale.id, old: now - 61 * 86_400_000 },
+      );
+      // legacy：无 deprecatedAt/deprecatedBy 的存量 deprecated —— 回退 updatedAt 基准，同样到期
+      await session.run(
+        "MATCH (n {id: $id}) SET n.status='deprecated', n.deprecatedAt=null, n.updatedAt=$old REMOVE n.deprecatedBy",
+        { id: legacy.id, old: now - 61 * 86_400_000 },
+      );
+    } finally {
+      await session.close();
+    }
+
+    // purgeAfterMs=0 显式关闭
+    expect(await purgeDeprecatedNodes(driver, 0, now)).toBe(0);
+
+    // 共享 DB 上可能存在其他遗留的过期 deprecated 节点，断言下界
+    expect(await purgeDeprecatedNodes(driver, 60 * 86_400_000, now)).toBeGreaterThanOrEqual(2);
+    expect(await findById(driver, stale.id)).toBeNull();
+    expect(await findById(driver, legacy.id)).toBeNull();
+    expect(await findById(driver, fresh.id)).not.toBeNull();
+    expect((await findById(driver, keeper.id))!.status).toBe("active");
+  });
+
+  it("复活：decay 弃用节点被 upsertNode/updateNode 命中后回 active；manual 弃用不复活", async () => {
+    // decay 弃用 → 重新提取 → 复活
+    const { node: revivable } = await upsertNode(driver, {
+      type: "SKILL", name: "Revive Target", description: "原描述", content: "c",
+    }, TEST_SID);
+    await autoDeprecateNodes(driver, [revivable.id], Date.now());
+    expect((await findById(driver, revivable.id))!.status).toBe("deprecated");
+
+    const revived = await upsertNode(driver, {
+      type: "SKILL", name: "Revive Target", description: "再次提取的描述", content: "更长的内容触发更新路径",
+    }, TEST_SID);
+    expect(revived.isNew).toBe(false);
+    expect(revived.node.status).toBe("active");
+    expect(revived.node.description).toBe("原描述");
+    expect(revived.node.deprecatedAt).toBeUndefined();
+    expect(revived.node.deprecatedBy).toBeUndefined();
+
+    const refetched = await findById(driver, revivable.id);
+    expect(refetched!.status).toBe("active");
+    expect(refetched!.description).toBe("原描述");
+    expect(refetched!.deprecatedAt).toBeUndefined();
+
+    // decay 弃用 → 手动编辑 → 复活（updateNode 路径）
+    const { node: editable } = await upsertNode(driver, {
+      type: "SKILL", name: "Revive Edit Target", description: "编辑前", content: "c",
+    }, TEST_SID);
+    await autoDeprecateNodes(driver, [editable.id], Date.now());
+    const edited = await updateNode(driver, "Revive Edit Target", { content: "编辑后内容" });
+    expect(edited!.status).toBe("active");
+    expect(edited!.description).toBe("编辑前");
+
+    // manual 弃用（deprecateNodeAndDisconnect）→ 重新提取不复活，前缀与弃用标记保留
+    //（deprecatedAt/By 保留 = purge 时钟不被重新提取重置）
+    await deprecateNodeAndDisconnect(driver, "Revive Target");
+    const afterManual = await upsertNode(driver, {
+      type: "SKILL", name: "Revive Target", description: "第三次提取", content: "更长的内容 2",
+    }, TEST_SID);
+    expect(afterManual.node.status).toBe("deprecated");
+    expect(afterManual.node.description).toBe("[DEPRECATED] 原描述");
+    expect(afterManual.node.deprecatedBy).toBe("manual");
+    expect(afterManual.node.deprecatedAt).toBeGreaterThan(0);
+  });
+
+  it("applyDecay E2E：peripheral + 低分 + 超期未访问的节点被自动弃用", async () => {
+    const { node: target } = await upsertNode(driver, {
+      type: "SKILL", name: "Decay E2E Forgotten", description: "被遗忘的知识", content: "c",
+    }, TEST_SID);
+    // 构造遗忘终态：peripheral 层 + 400 天未访问 + 无 PageRank/访问加持
+    const session = getSession(driver);
+    try {
+      await session.run(
+        `MATCH (n {id: $id})
+         SET n.tier='peripheral',
+             n.createdAt=$old, n.updatedAt=$old, n.lastAccessedAt=$old,
+             n.pagerank=0.0, n.validatedCount=1`,
+        { id: target.id, old: Date.now() - 400 * 86_400_000 },
+      );
+    } finally {
+      await session.close();
+    }
+
+    const result = await applyDecay(driver, { decay: { ...DEFAULT_CONFIG.decay!, autoDeprecate: true } });
+    expect(result.enabled).toBe(true);
+    expect(result.autoDeprecated).toBeGreaterThanOrEqual(1);
+
+    const after = await findById(driver, target.id);
+    expect(after!.status).toBe("deprecated");
+    expect(after!.deprecatedBy).toBe("decay");
+    expect(after!.description).toBe("[DEPRECATED] 被遗忘的知识");
+
+    // 关闭开关后不再自动弃用（autoDeprecate=false 时 shouldAutoDeprecate 恒 false）
+    const off = await applyDecay(driver, { decay: { ...DEFAULT_CONFIG.decay!, autoDeprecate: false } });
+    expect(off.enabled).toBe(true);
+    expect(off.autoDeprecated).toBe(0);
   });
 });

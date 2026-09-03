@@ -31,9 +31,9 @@
       "pagerankIterations": { "type": "number", "default": 20 },
       "decay": {
         "type": "object",
-        "description": "柔性衰减：三因子加权评分（recency+frequency+intrinsic）+ tier 双向转换（core/working/peripheral）。完整公式与调参指南见 docs/decay.md。recencyWeight + frequencyWeight + intrinsicWeight 推荐和为 1（运行时会自动归一化）。",
+        "description": "柔性衰减：三因子加权评分（recency+frequency+intrinsic）+ tier 双向转换（core/working/peripheral），以及两阶段生命周期（长期未用的 peripheral 低分节点自动断联弃用；弃用超期的节点硬删释放存储）。完整公式与调参指南见 docs/decay.md。recencyWeight + frequencyWeight + intrinsicWeight 推荐和为 1（运行时会自动归一化）。",
         "properties": {
-          "enabled": { "type": "boolean", "default": true, "description": "是否启用自动衰减。关闭后 tier 永久保持初始 working 状态。" },
+          "enabled": { "type": "boolean", "default": true, "description": "是否启用自动衰减。关闭后 tier 永久保持初始 working 状态，且自动弃用（autoDeprecate）一并停用。" },
           "recencyHalfLifeDays": { "type": "number", "default": 30, "description": "Recency 半衰期（天）。effectiveHL = halfLife * exp(importanceModulation * importance)。" },
           "recencyWeight": { "type": "number", "default": 0.4, "description": "Recency 在 composite 中的权重。三个权重推荐和为 1。" },
           "importanceModulation": { "type": "number", "default": 1.5, "description": "半衰期调制系数；越大则高 importance 节点衰减越慢。" },
@@ -48,7 +48,10 @@
           "peripheralCompositeThreshold": { "type": "number", "default": 0.15, "description": "composite 低于此值触发 demote（core→working 或 working→peripheral）。" },
           "peripheralAgeDays": { "type": "number", "default": 60, "description": "working→peripheral 的年龄阈值（同时 validatedCount < workingAccessThreshold 才触发）。" },
           "workingAccessThreshold": { "type": "number", "default": 3, "description": "demote（count 不足时）/ promote（count 充足时）的 access 次数分界。" },
-          "workingCompositeThreshold": { "type": "number", "default": 0.4, "description": "peripheral→working 所需的最低 composite 分数。" }
+          "workingCompositeThreshold": { "type": "number", "default": 0.4, "description": "peripheral→working 所需的最低 composite 分数。" },
+          "autoDeprecate": { "type": "boolean", "default": true, "description": "遗忘曲线自动弃用（两阶段生命周期·阶段一）：tier=peripheral 且 composite 低于 peripheralCompositeThreshold 且超过 autoDeprecateAfterDays 天未访问的节点，维护时自动切断所有边并标记 deprecated。受 enabled 总开关约束。被重新提取/编辑命中时自动复活。" },
+          "autoDeprecateAfterDays": { "type": "number", "default": 30, "description": "自动弃用的未访问天数门槛（距 lastAccessedAt）。" },
+          "purgeAfterDays": { "type": "number", "default": 60, "description": "两阶段生命周期·阶段二：deprecated 节点自弃用起超过该天数后硬删（DETACH DELETE，向量随节点移除）。0 = 永不硬删。适用于所有 deprecated 节点（含手动弃用与合并产物）。" }
         }
       },
       "cron": {
