@@ -149,6 +149,28 @@ export function buildCommunityMemberSignature(memberIds: string[]): string {
   return createHash("sha1").update([...memberIds].sort().join(",")).digest("hex");
 }
 
+/**
+ * top-k 稳定签名（LLM 成本控制）：取 validatedCount 最高的 k 个成员计算签名，
+ * 而非全量成员集合。社区边界抖动（每次微增/减一个低频成员）不再触发 LLM 重摘要——
+ * 摘要语义本就由高价值成员主导。成员数 ≤ k 时退化为全量签名（与旧格式一致）。
+ * 并列的 validatedCount 用 id 字典序决胜负，保证确定性。
+ */
+export const COMMUNITY_SIGNATURE_TOP_K = 8;
+
+export function buildTopKMemberSignature(
+  members: Array<{ id: string; validatedCount: number }>,
+  k: number = COMMUNITY_SIGNATURE_TOP_K,
+): string {
+  const top = [...members]
+    .sort((a, b) =>
+      b.validatedCount - a.validatedCount ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    .slice(0, Math.max(1, k))
+    .map((m) => m.id)
+    .sort();
+  return createHash("sha1").update(top.join(",")).digest("hex");
+}
+
 export async function summarizeCommunities(
   driver: Driver,
   communities: Map<string, string[]>,
@@ -160,7 +182,25 @@ export async function summarizeCommunities(
   for (const [communityId, memberIds] of communities) {
     if (memberIds.length === 0) continue;
 
-    const memberSignature = buildCommunityMemberSignature(memberIds);
+    // 轻量元数据查询（id + validatedCount）：top-k 签号的输入
+    const metaSession = getSession(driver);
+    let memberMeta: Array<{ id: string; validatedCount: number }>;
+    try {
+      const metaResult = await metaSession.run(`
+        MATCH (n:Task|Skill|Event {status: 'active'})
+        WHERE n.id IN $memberIds
+        RETURN n.id AS id, n.validatedCount AS vc
+      `, { memberIds });
+      memberMeta = metaResult.records.map(r => ({
+        id: r.get("id"),
+        validatedCount: typeof r.get("vc") === "number" ? r.get("vc") : (r.get("vc")?.toNumber?.() ?? 0),
+      }));
+    } finally {
+      await metaSession.close();
+    }
+    if (memberMeta.length === 0) continue;
+
+    const memberSignature = buildTopKMemberSignature(memberMeta);
 
     const current = await getCommunitySummary(driver, communityId);
     if (current?.memberSignature === memberSignature && current.summary.trim()) {

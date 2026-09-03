@@ -174,4 +174,63 @@ describe.skipIf(!ENABLED)("Recaller integration", () => {
     await recaller.syncEmbed({ ...node, description: "new description" });
     expect(embeddedText).toContain("new description");
   });
+
+  it("syncEmbedBatch：批量一次往返 + contentHash 短路 + 分块 + 单发回退", async () => {
+    // 40 个节点 > SYNC_EMBED_BATCH(32) → 应拆 2 块
+    const nodes = [];
+    for (let i = 0; i < 40; i++) {
+      const { node } = await upsertNode(driver, {
+        type: "SKILL", name: `syncembed-batch-target-${i}`,
+        description: `batch ${i}`, content: `content ${i}`,
+      }, TEST_SID);
+      nodes.push(node);
+    }
+
+    let batchCalls = 0;
+    let singleCalls = 0;
+    let totalTexts = 0;
+    const recaller = new Recaller(driver, cfg);
+    recaller.setEmbedFn(async () => {
+      singleCalls++;
+      return new Array(1024).fill(0.1);
+    });
+    recaller.setEmbedBatchFn(async (texts) => {
+      batchCalls++;
+      totalTexts += texts.length;
+      return texts.map(() => new Array(1024).fill(0.2));
+    });
+
+    await recaller.syncEmbedBatch(nodes);
+    expect(batchCalls).toBe(2);      // 32 + 8 两块
+    expect(totalTexts).toBe(40);
+    expect(singleCalls).toBe(0);     // 有批量能力时不走单发
+
+    // contentHash 短路：内容未变 → 零新调用
+    await recaller.syncEmbedBatch(nodes);
+    expect(batchCalls).toBe(2);
+    expect(totalTexts).toBe(40);
+
+    // 单节点内容变化 → 只有该节点重嵌入（1 块 1 条文本）
+    await recaller.syncEmbedBatch([{ ...nodes[0], content: "changed content after batch" }]);
+    expect(batchCalls).toBe(3);
+    expect(totalTexts).toBe(41);
+
+    // 旧接线（仅 setEmbedFn）回退到逐节点单发
+    const recaller2 = new Recaller(driver, cfg);
+    let single2 = 0;
+    recaller2.setEmbedFn(async () => {
+      single2++;
+      return new Array(1024).fill(0.3);
+    });
+    const { node: fb } = await upsertNode(driver, {
+      type: "SKILL", name: "syncembed-batch-fallback",
+      description: "f", content: "fallback content",
+    }, TEST_SID);
+    await recaller2.syncEmbedBatch([fb]);
+    expect(single2).toBe(1);
+
+    // 空输入 no-op
+    await recaller.syncEmbedBatch([]);
+    expect(batchCalls).toBe(3);
+  });
 });

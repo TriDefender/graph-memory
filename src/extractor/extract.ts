@@ -7,6 +7,7 @@
 
 import type { ExtractionResult, FinalizeResult } from "../types.ts";
 import { EDGE_TYPES, isValidEdgeDirection } from "../types.ts";
+import type { GmNode } from "../types.ts";
 import type { CompleteFn } from "../engine/llm.ts";
 import { normalizeName } from "../store/store.ts";
 
@@ -204,6 +205,16 @@ export function correctEdgeType(
 }
 
 // ─── Extractor ────────────────────────────────────────────────
+
+/**
+ * finalize 阶梯触发（LLM 成本控制）：
+ * finalize 的核心产出是 EVENT→SKILL 提升与跨会话建边/失效判定——
+ * 会话规模 ≤ 2 或没有任何 EVENT 节点时，这次 LLM 调用几乎必然空转，直接跳过。
+ */
+export function shouldRunFinalize(sessionNodes: Array<Pick<GmNode, "type">>): boolean {
+  if (sessionNodes.length <= 2) return false;
+  return sessionNodes.some((n) => n.type === "EVENT");
+}
 
 export class Extractor {
   constructor(private llm: CompleteFn) {}

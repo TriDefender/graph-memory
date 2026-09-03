@@ -264,6 +264,27 @@ export interface MessageRetentionConfig {
   dryRun?: boolean;
 }
 
+// ─── 知识提取配置（LLM 成本控制）─────────────────────────────
+
+export interface ExtractConfig {
+  /**
+   * 提取模式：
+   * - per-turn（默认）：每轮 afterTurn/commitTurn 即时 LLM 提取（知识实时入库）；
+   * - batched：攒批提取——trivial 轮本地标记跳过，未提取消息累计到
+   *   compactTurnCount*3 条时批量提取一次，session_end 冲洗尾批。
+   *   LLM 调用次数降为 per-turn 的 ~1/N，代价是会话中途召回不到本会话最新知识。
+   */
+  mode?: "per-turn" | "batched";
+  /**
+   * 本地预筛阈值：用户输入清洗（去空白/标点）后长度 ≤ 该值且不含技术词
+   * （连续 ≥3 位字母数字，如 pnpm/jwt）时，跳过 LLM 提取直接标记。
+   * 保守默认 5（中文 5 字以内基本不可能承载可提取知识）。
+   */
+  trivialMaxChars?: number;
+  /** 额外无意义词表（与内置表合并，清洗后小写精确匹配，如 "继续"、"resume"）。 */
+  trivialPrompts?: string[];
+}
+
 // ─── 插件配置 ─────────────────────────────────────────────────
 
 export interface GmConfig {
@@ -293,6 +314,8 @@ export interface GmConfig {
   pagerankIterations: number;
   /** 遗忘曲线衰减配置；未提供时使用 DEFAULT_CONFIG.decay。 */
   decay?: DecayConfig;
+  /** 知识提取配置（模式 + trivial 预筛）；未提供时 per-turn + 默认预筛。 */
+  extract?: ExtractConfig;
   cron?: CronConfig;
   /** 原始消息保留策略；未提供时等价 keep=all（永不删除）。 */
   messageRetention?: MessageRetentionConfig;
@@ -333,4 +356,8 @@ export const DEFAULT_CONFIG: GmConfig = {
     purgeAfterDays: 60,
   },
   cron: DEFAULT_CRON_CONFIG,
+  extract: {
+    mode: "per-turn",
+    trivialMaxChars: 5,
+  },
 };

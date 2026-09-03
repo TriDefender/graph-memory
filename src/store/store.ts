@@ -825,6 +825,52 @@ export async function getVectorHash(driver: Driver, nodeId: string): Promise<str
   }
 }
 
+/**
+ * 批量读取 contentHash（syncEmbedBatch 用）：一次往返替代逐节点 getVectorHash 的 N 次。
+ * 返回 Map<nodeId, hash|null>；不存在的节点映射为 null（视为需要嵌入）。
+ */
+export async function getVectorHashes(driver: Driver, nodeIds: string[]): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (!nodeIds.length) return out;
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      `UNWIND $ids AS id
+       MATCH (n:Task|Skill|Event {id: id})
+       RETURN n.id AS id, n.contentHash AS hash`,
+      { ids: nodeIds },
+    );
+    for (const r of result.records) out.set(r.get("id"), r.get("hash") ?? null);
+  } finally {
+    await session.close();
+  }
+  for (const id of nodeIds) if (!out.has(id)) out.set(id, null);
+  return out;
+}
+
+export interface BatchVectorEntry {
+  nodeId: string;
+  content: string;
+  vec: number[];
+  hash: string;
+}
+
+/** 批量写向量 + contentHash（syncEmbedBatch 用）：一次 UNWIND 写入替代 N 次 saveVector。 */
+export async function saveVectors(driver: Driver, entries: BatchVectorEntry[]): Promise<void> {
+  if (!entries.length) return;
+  const session = getSession(driver);
+  try {
+    await session.run(
+      `UNWIND $entries AS e
+       MATCH (n:Task|Skill|Event {id: e.nodeId})
+       SET n.embedding = e.vec, n.contentHash = e.hash`,
+      { entries: entries.map(e => ({ nodeId: e.nodeId, vec: e.vec, hash: e.hash })) },
+    );
+  } finally {
+    await session.close();
+  }
+}
+
 // ─── 重嵌入（换 embedding 模型后的批量重建，graph-memory reembed） ───
 
 export interface EmbeddingStats {
@@ -1191,6 +1237,20 @@ export async function getUnextracted(driver: Driver, sid: string, limit: number)
         turn_index: toInt(m.turnIndex),
       };
     });
+  } finally {
+    await session.close();
+  }
+}
+
+/** 未提取消息计数（batched 提取模式的攒批触发判定）。 */
+export async function countUnextracted(driver: Driver, sid: string): Promise<number> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      "MATCH (m:GmMessage {sessionId: $sid, extracted: false}) RETURN count(m) AS c",
+      { sid },
+    );
+    return toInt(result.records[0].get("c"));
   } finally {
     await session.close();
   }

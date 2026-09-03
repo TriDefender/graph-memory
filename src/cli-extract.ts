@@ -13,7 +13,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import type { Driver } from "neo4j-driver";
-import type { GmConfig } from "./types.ts";
+import type { GmConfig, GmNode } from "./types.ts";
 import { getDriver, initSchema, closeDriver } from "./store/db.ts";
 import {
   listUnextractedSessions,
@@ -26,7 +26,7 @@ import {
   type UnextractedSessionInfo,
 } from "./store/store.ts";
 import { createCompleteFn, resolveProvider } from "./engine/llm.ts";
-import { createEmbedFn } from "./engine/embed.ts";
+import { createEmbedder } from "./engine/embed.ts";
 import { Recaller } from "./recaller/recall.ts";
 import { Extractor } from "./extractor/extract.ts";
 
@@ -127,10 +127,11 @@ export async function runBackfillExtraction(
     const llm = createCompleteFn(params.effectiveModel, cfg.llm);
     const extractor = new Extractor(llm);
     const recaller = new Recaller(driver, cfg);
-    const embedFn = await createEmbedFn(cfg.embedding);
-    if (embedFn) {
-      recaller.setEmbedFn(embedFn);
-      log("[graph-memory-pro] embedding 已就绪，新节点将同步向量。");
+    const embedder = await createEmbedder(cfg.embedding);
+    if (embedder) {
+      recaller.setEmbedFn(embedder.embed);
+      recaller.setEmbedBatchFn(embedder.embedBatch);
+      log("[graph-memory-pro] embedding 已就绪，新节点将批量同步向量。");
     } else {
       log("[graph-memory-pro] 未配置 embedding，跳过向量同步（dual-path recall 会降级为文本搜索）。");
     }
@@ -235,11 +236,11 @@ async function extractSessionLoop(
     const extraction = await extractor.extract({ messages: msgs, existingNames: existing });
 
     const nameToId = new Map<string, string>();
-    // 批内 fire-and-forget 的 syncEmbed 收集到批边界统一 await：
+    // 批内节点收集到批边界统一批量嵌入（embedBatch + UNWIND 批读写）：
     // closeDriver 在 finally 里执行，若不等待，最后一批在途的 embedding
     // HTTP 请求会撞上已关闭的 driver 且错误被吞——向量丢失且不可自愈
     // （markExtracted 已执行，重跑 extract 不会补）。
-    const pendingEmbeds: Promise<void>[] = [];
+    const batchNodes: GmNode[] = [];
     for (const nc of extraction.nodes) {
       const { node } = await upsertNode(driver, {
         type: nc.type, name: nc.name,
@@ -247,7 +248,7 @@ async function extractSessionLoop(
       }, sessionId);
       nameToId.set(node.name, node.id);
       stats.nodes += 1;
-      pendingEmbeds.push(recaller.syncEmbed(node).catch(() => {}));
+      batchNodes.push(node);
     }
 
     for (const ec of extraction.edges) {
@@ -264,7 +265,7 @@ async function extractSessionLoop(
       }
     }
 
-    await Promise.allSettled(pendingEmbeds);
+    await recaller.syncEmbedBatch(batchNodes).catch(() => {});
 
     const maxTurn = msgs.reduce((m, msg) => Math.max(m, msg.turn_index ?? 0), 0);
     await markExtracted(

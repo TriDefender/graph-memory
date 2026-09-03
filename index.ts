@@ -10,7 +10,7 @@ import { Type } from "@sinclair/typebox";
 import { getDriver, initSchema, getSession } from "./src/store/db.ts";
 import { Neo4jGate } from "./src/store/gate.ts";
 import {
-  saveMessage, getUnextracted, getMaxTurnIndex,
+  saveMessage, getUnextracted, countUnextracted, getMaxTurnIndex,
   markExtracted, isTurnExtracted, commitTurnAdvance,
   upsertNode, upsertEdge, findByName, updateNode,
   deprecateNodeAndDisconnect, deprecateNodeAndDisconnectById,
@@ -19,15 +19,16 @@ import {
   getStats,
 } from "./src/store/store.ts";
 import { createCompleteFn, resolveProvider } from "./src/engine/llm.ts";
-import { createEmbedFn } from "./src/engine/embed.ts";
+import { createEmbedder } from "./src/engine/embed.ts";
 import { estimateTokens } from "./src/tokens.ts";
 import { Recaller, parseTimeRange } from "./src/recaller/recall.ts";
-import { Extractor } from "./src/extractor/extract.ts";
+import { Extractor, shouldRunFinalize } from "./src/extractor/extract.ts";
+import { shouldSkipTurnExtraction } from "./src/extractor/turn-filter.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { normalizeMessageRetentionPolicy } from "./src/store/retention.ts";
-import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
+import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, type GmConfig, type GmNode, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
 
@@ -195,6 +196,17 @@ export function extractUserText(msg: any): string {
   return raw;
 }
 
+/**
+ * 聚合一轮消息中 user 角色的（元数据剥离后）文本，供 trivial 预筛判定。
+ * assistant/工具结果不参与：它们跟随用户意图，用户输入有意义时整轮照常提取。
+ */
+export function turnUserText(messages: any[]): string {
+  return (messages ?? [])
+    .filter((m) => m && typeof m === "object" && m.role === "user")
+    .map((m) => extractUserText(m))
+    .join(" ");
+}
+
 export function sliceLastTurn(
   messages: any[],
   keepTurns: number = KEEP_TURNS,
@@ -331,6 +343,7 @@ const graphMemoryProPlugin = {
     if (raw.neo4j) cfg.neo4j = { ...DEFAULT_CONFIG.neo4j, ...raw.neo4j };
     if (raw.decay) cfg.decay = { ...DEFAULT_CONFIG.decay, ...raw.decay };
     if (raw.cron) cfg.cron = { ...DEFAULT_CONFIG.cron, ...raw.cron };
+    if (raw.extract) cfg.extract = { ...DEFAULT_CONFIG.extract, ...raw.extract };
 
     // 拼写兼容：接受小写 baseUrl（部分宿主/用户的配置习惯），统一归一到 baseURL。
     // 显式 baseURL 优先；trim 后为空视为未配置。
@@ -359,6 +372,13 @@ const graphMemoryProPlugin = {
       }
     }
     const cronCfg = cfg.cron ?? DEFAULT_CRON_CONFIG;
+
+    // 提取配置（LLM 成本控制）：per-turn/batched 模式 + trivial 轮本地预筛
+    const extractCfg = cfg.extract ?? DEFAULT_CONFIG.extract!;
+    const trivialFilterOpts = {
+      maxChars: extractCfg.trivialMaxChars,
+      extraPrompts: extractCfg.trivialPrompts,
+    };
 
     const providerModel = readDefaultModel(api.config);
 
@@ -428,10 +448,11 @@ const graphMemoryProPlugin = {
     let embedProbeInFlight = false;
     let lastEmbedProbeAt = 0;
 
-    createEmbedFn(cfg.embedding)
-      .then((fn) => {
-        if (fn) {
-          recaller.setEmbedFn(fn);
+    createEmbedder(cfg.embedding)
+      .then((embedder) => {
+        if (embedder) {
+          recaller.setEmbedFn(embedder.embed);
+          recaller.setEmbedBatchFn(embedder.embedBatch);
           api.logger.info("[graph-memory-pro] vector search ready");
         } else {
           lastEmbedProbeAt = Date.now();
@@ -478,6 +499,15 @@ const graphMemoryProPlugin = {
             api.logger.info(`[graph-memory-pro] turn ${turnNum}: already extracted (compact), skipping`);
             return;
           }
+
+          // LLM 成本控制：trivial 轮本地预筛（无意义词表 / ≤trivialMaxChars 纯文本），
+          // 命中则零 LLM 直接标记（producedKnowledge=false，原始证据保留）
+          if (shouldSkipTurnExtraction(turnUserText(rawMessages), trivialFilterOpts)) {
+            await markExtracted(driver, sessionId, turnNum, false);
+            api.logger.info(`[graph-memory-pro] turn ${turnNum}: trivial prompt, extraction skipped (local pre-filter)`);
+            return;
+          }
+
         const existing = (await getBySession(driver, sessionId)).map(n => n.name);
         const result = await extractor.extract({
           messages: rawMessages,
@@ -494,14 +524,17 @@ const graphMemoryProPlugin = {
         }
 
         const nameToId = new Map<string, string>();
+        const upsertedNodes: GmNode[] = [];
         for (const nc of result.nodes) {
           const { node } = await upsertNode(driver, {
             type: nc.type, name: nc.name,
             description: nc.description, content: nc.content,
           }, sessionId);
           nameToId.set(node.name, node.id);
-          recaller.syncEmbed(node).catch(() => {});
+          upsertedNodes.push(node);
         }
+        // 批量向量同步：N 个节点一次 embedBatch + 一次 UNWIND 批读写（替代逐节点 N 次单发）
+        void recaller.syncEmbedBatch(upsertedNodes).catch(() => {});
 
         for (const ec of result.edges) {
           const fromNode = await findByName(driver, ec.from);
@@ -524,6 +557,95 @@ const graphMemoryProPlugin = {
         api.logger.error(`[graph-memory-pro] turn ${turnNum} extract failed: ${err}`);
       }
       });
+    }
+
+    /**
+     * 批量提取共享体（compact / batched 模式攒批触发 / session_end 尾批冲洗）：
+     * 读未提取消息 → LLM → upsert + 批量向量同步 → markExtracted。
+     * 调用方负责 cron/熔断门控；内部经 withExtractLock 与 per-turn 路径串行化。
+     */
+    async function extractUnextractedBatch(sessionId: string): Promise<{
+      ok: boolean; compacted: boolean; reason?: string; summary?: string;
+    }> {
+      return withExtractLock(sessionId, async () => {
+        // 掉线恢复后的补提取路径：先把缓冲消息刷进 DB 再读未提取集
+        if (messageBuffer.length) await flushMessageBuffer();
+        const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
+
+        if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
+
+        try {
+          const existing = (await getBySession(driver, sessionId)).map(n => n.name);
+          const result = await extractor.extract({ messages: msgs, existingNames: existing });
+
+          const nameToId = new Map<string, string>();
+          const upsertedNodes: GmNode[] = [];
+          for (const nc of result.nodes) {
+            const { node } = await upsertNode(driver, {
+              type: nc.type, name: nc.name,
+              description: nc.description, content: nc.content,
+            }, sessionId);
+            nameToId.set(node.name, node.id);
+            upsertedNodes.push(node);
+          }
+          void recaller.syncEmbedBatch(upsertedNodes).catch(() => {});
+
+          for (const ec of result.edges) {
+            const fromNode = await findByName(driver, ec.from);
+            const toNode = await findByName(driver, ec.to);
+            const fromId = nameToId.get(ec.from) ?? fromNode?.id;
+            const toId = nameToId.get(ec.to) ?? toNode?.id;
+            if (fromId && toId) {
+              await upsertEdge(driver, {
+                fromId, toId, type: ec.type,
+                instruction: ec.instruction, condition: ec.condition, sessionId,
+              });
+            }
+          }
+
+          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
+          await markExtracted(
+            driver, sessionId, maxTurn,
+            result.nodes.length > 0 || result.edges.length > 0,
+          );
+
+          return {
+            ok: true, compacted: true,
+            summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
+          };
+        } catch (err) {
+          api.logger.error(`[graph-memory-pro] batch extraction failed: ${err}`);
+          return { ok: false, compacted: false, reason: String(err) };
+        }
+      });
+    }
+
+    /**
+     * 轮提取统一入口（LLM 成本控制的模式分发）：
+     * - per-turn（默认）：每轮即时 LLM 提取（内含 trivial 本地预筛）；
+     * - batched：不在轮边界调 LLM；未提取消息累计到 compactTurnCount*3 条时
+     *   批量提取一次（LLM 调用 ~1/N），session_end 冲洗尾批。
+     *   注意 batched 不做逐轮 trivial 标记——markExtracted 是前缀语义，
+     *   会误吞留给攒批的更早轮次；trivial 消息随批进入 prompt，成本由批摊薄。
+     */
+    function scheduleTurnExtraction(sessionId: string, turnNum: number, rawMessages: any[]): void {
+      const run = extractCfg.mode === "batched"
+        ? handleBatchedTurn(sessionId)
+        : extractTurnKnowledge(sessionId, turnNum, rawMessages);
+      run.catch(err => api.logger.error(`[graph-memory-pro] extract failed: ${err}`));
+    }
+
+    async function handleBatchedTurn(sessionId: string): Promise<void> {
+      // 熔断开启时跳过计数/提取：消息保持未标记，恢复后由攒批/冲洗/CLI 补提取
+      if (!neo4jGate.isAvailable()) return;
+      try {
+        const pending = await countUnextracted(driver, sessionId);
+        if (pending >= cfg.compactTurnCount * 3) {
+          await extractUnextractedBatch(sessionId);
+        }
+      } catch (err) {
+        api.logger.error(`[graph-memory-pro] batched turn check failed: ${err}`);
+      }
     }
 
     // ── Session 运行时状态 ──────────────────────────────────
@@ -751,10 +873,11 @@ const graphMemoryProPlugin = {
       if (Date.now() - lastEmbedProbeAt < EMBED_REPROBE_INTERVAL_MS) return;
       embedProbeInFlight = true;
       lastEmbedProbeAt = Date.now();
-      createEmbedFn(cfg.embedding)
-        .then(fn => {
-          if (fn) {
-            recaller.setEmbedFn(fn);
+      createEmbedder(cfg.embedding)
+        .then((embedder) => {
+          if (embedder) {
+            recaller.setEmbedFn(embedder.embed);
+            recaller.setEmbedBatchFn(embedder.embedBatch);
             api.logger.info("[graph-memory-pro] embedding re-probe succeeded — vector search re-enabled");
           }
         })
@@ -932,58 +1055,17 @@ const graphMemoryProPlugin = {
         if (!neo4jGate.isAvailable()) {
           return { ok: true, compacted: false, reason: "neo4j unavailable (circuit open)" };
         }
-        return withExtractLock(sessionId, async () => {
-          // compact 是掉线恢复后的补提取路径：先把缓冲消息刷进 DB 再读未提取集
-          if (messageBuffer.length) await flushMessageBuffer();
-          const msgs = await getUnextracted(driver, sessionId, cfg.compactTurnCount * 3);
-
-          if (!msgs.length) return { ok: true, compacted: false, reason: "no messages" };
-
-          try {
-            const existing = (await getBySession(driver, sessionId)).map(n => n.name);
-            const result = await extractor.extract({ messages: msgs, existingNames: existing });
-
-            const nameToId = new Map<string, string>();
-            for (const nc of result.nodes) {
-              const { node } = await upsertNode(driver, {
-                type: nc.type, name: nc.name,
-                description: nc.description, content: nc.content,
-              }, sessionId);
-              nameToId.set(node.name, node.id);
-              recaller.syncEmbed(node).catch(() => {});
-            }
-
-            for (const ec of result.edges) {
-              const fromNode = await findByName(driver, ec.from);
-              const toNode = await findByName(driver, ec.to);
-              const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-              const toId = nameToId.get(ec.to) ?? toNode?.id;
-              if (fromId && toId) {
-                await upsertEdge(driver, {
-                  fromId, toId, type: ec.type,
-                  instruction: ec.instruction, condition: ec.condition, sessionId,
-                });
-              }
-            }
-
-            const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-            await markExtracted(
-              driver, sessionId, maxTurn,
-              result.nodes.length > 0 || result.edges.length > 0,
-            );
-
-            return {
-              ok: true, compacted: true,
-              result: {
-                summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
-                tokensBefore: currentTokenCount ?? 0,
-              },
-            };
-          } catch (err) {
-            api.logger.error(`[graph-memory-pro] compact failed: ${err}`);
-            return { ok: false, compacted: false, reason: String(err) };
-          }
-        });
+        const res = await extractUnextractedBatch(sessionId);
+        return {
+          ok: res.ok, compacted: res.compacted,
+          ...(res.reason ? { reason: res.reason } : {}),
+          ...(res.summary ? {
+            result: {
+              summary: res.summary,
+              tokensBefore: currentTokenCount ?? 0,
+            },
+          } : {}),
+        };
       },
 
       async afterTurn({ sessionId, sessionKey, messages, prePromptMessageCount, isHeartbeat }: {
@@ -1032,10 +1114,8 @@ const graphMemoryProPlugin = {
           return;
         }
 
-        // 直接用原始消息提取知识图谱（异步，不阻塞）
-        extractTurnKnowledge(sessionId, turnNum, newMessages).catch(err => {
-          api.logger.error(`[graph-memory-pro] extract failed: ${err}`);
-        });
+        // 按模式分发：per-turn 即时 LLM 提取；batched 攒批（LLM 调用 ~1/N）
+        scheduleTurnExtraction(sessionId, turnNum, newMessages);
       },
 
       /**
@@ -1093,9 +1173,7 @@ const graphMemoryProPlugin = {
             // 只覆盖旧前缀 → 本轮消息保持未提取 → compact 重复提取
             if (messageBuffer.length) await flushMessageBuffer();
             const turnNum = msgSeq.get(sid) ?? 0;
-            extractTurnKnowledge(sid, turnNum, messages).catch(err => {
-              api.logger.error(`[graph-memory-pro] extract failed: ${err}`);
-            });
+            scheduleTurnExtraction(sid, turnNum, messages);
           }
         }
         return { status: "committed" as const };
@@ -1167,6 +1245,11 @@ const graphMemoryProPlugin = {
           return;
         }
 
+        // batched 模式：会话结束冲洗残留未提取批（攒批未达阈值时保证知识不丢）
+        if (extractCfg.mode === "batched") {
+          await extractUnextractedBatch(sid);
+        }
+
         let nodes: Awaited<ReturnType<typeof getBySession>>;
         try {
           nodes = await getBySession(driver, sid);
@@ -1177,7 +1260,7 @@ const graphMemoryProPlugin = {
           api.logger.error(`[graph-memory-pro] session_end error: ${err}`);
           return;
         }
-        if (nodes.length) {
+        if (nodes.length && shouldRunFinalize(nodes)) {
           // finalize 的 upsert 与 afterTurn/compact 的提取共用 per-session 互斥锁：
           // 最后一轮的 afterTurn 提取可能仍在途，不串行化会重复 upsert（validatedCount 双递增）
           await withExtractLock(sid, async () => {
@@ -1219,6 +1302,11 @@ const graphMemoryProPlugin = {
             }
             for (const id of fin.invalidations) await deprecateNodeAndDisconnectById(driver, id);
           });
+        } else if (nodes.length) {
+          // finalize 阶梯触发（LLM 成本控制）：小会话/无 EVENT 节点时跳过这次调用
+          api.logger.info(
+            `[graph-memory-pro] session_end ${sid.slice(0, 12)}…: finalize skipped (small session / no EVENT nodes)`,
+          );
         }
 
         // 图维护：后台单飞（A1）—— 衰减→去重→PR→社区→LLM 摘要可能耗时数分钟，

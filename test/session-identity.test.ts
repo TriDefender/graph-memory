@@ -55,6 +55,7 @@ vi.mock("../src/engine/llm.ts", () => ({
 
 vi.mock("../src/engine/embed.ts", () => ({
   createEmbedFn: async () => null,
+    createEmbedder: async () => null,
 }));
 
 vi.mock("../src/recaller/recall.ts", () => ({
