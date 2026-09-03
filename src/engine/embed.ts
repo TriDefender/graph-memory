@@ -15,7 +15,7 @@
  */
 
 import type { EmbeddingConfig } from "../types.ts";
-import { fetchRetry } from "./http.ts";
+import { fetchRetry, throwForStatus } from "./http.ts";
 
 export type EmbedMode = "db" | "query";
 export type EmbedFn = (text: string, mode?: EmbedMode) => Promise<number[]>;
@@ -138,8 +138,7 @@ export async function createEmbedder(cfg: EmbeddingConfig | undefined): Promise<
     const res = await postEmbedding(buildBody(input, mode), 10_000);
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`[graph-memory-pro] Embedding API ${res.status}: ${errText.slice(0, 200)}`);
+      await throwForStatus(res, "[graph-memory-pro] Embedding API");
     }
 
     const data = await res.json() as any;
@@ -157,8 +156,7 @@ export async function createEmbedder(cfg: EmbeddingConfig | undefined): Promise<
     const res = await postEmbedding(buildBody(texts, mode), Math.max(10_000, 2_000 * texts.length));
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`[graph-memory-pro] Embedding API ${res.status}: ${errText.slice(0, 200)}`);
+      await throwForStatus(res, "[graph-memory-pro] Embedding API");
     }
 
     const data = await res.json() as any;

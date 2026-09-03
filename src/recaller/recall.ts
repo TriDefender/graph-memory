@@ -192,6 +192,10 @@ export class Recaller {
       this.driver, seedIds, candidateIds, this.cfg,
     );
 
+    // PPR 排序后的过滤/截断尾块与 recallGeneralized 结构一致，但 tiebreak
+    // 顺序刻意相反：precise 以 validatedCount 决胜（精确命中的知识更受认可），
+    // generalized 以 updatedAt 决胜（泛化探索偏向新鲜）。改动前先同步
+    // test/ablation.study.test.ts 的镜像 harness。
     const filtered = nodes
       .filter(n => !timeRange || matchTimeRange(n, timeRange))
       .sort((a, b) =>
@@ -246,6 +250,7 @@ export class Recaller {
       this.driver, seedIds, candidateIds, this.cfg,
     );
 
+    // tiebreak 与 recallPrecise 相反（updatedAt 决胜）——见该处的注释
     const filtered = nodes
       .filter(n => !timeRange || matchTimeRange(n, timeRange))
       .sort((a, b) =>
@@ -296,7 +301,7 @@ export class Recaller {
       const vec = this.embed
         ? await this.embed(text, "db")
         : (await this.embedBatch!([text], "db"))[0];
-      if (vec.length) await saveVector(this.driver, node.id, text, vec);
+      if (vec.length) await saveVector(this.driver, node.id, text, vec, hash);
     } catch {}
   }
 
@@ -330,7 +335,7 @@ export class Recaller {
       for (const t of pending) {
         try {
           const vec = await this.embed!(t.text, "db");
-          if (vec.length) await saveVector(this.driver, t.node.id, t.text, vec);
+          if (vec.length) await saveVector(this.driver, t.node.id, t.text, vec, t.hash);
         } catch {}
       }
       return;

@@ -13,15 +13,12 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import type { Driver } from "neo4j-driver";
-import type { GmConfig, GmNode } from "./types.ts";
+import type { GmConfig } from "./types.ts";
 import { getDriver, initSchema, closeDriver } from "./store/db.ts";
 import {
   listUnextractedSessions,
   getUnextracted,
   markExtracted,
-  upsertNode,
-  upsertEdge,
-  findByName,
   getBySession,
   type UnextractedSessionInfo,
 } from "./store/store.ts";
@@ -29,6 +26,7 @@ import { createCompleteFn, resolveProvider } from "./engine/llm.ts";
 import { createEmbedder } from "./engine/embed.ts";
 import { Recaller } from "./recaller/recall.ts";
 import { Extractor } from "./extractor/extract.ts";
+import { persistExtractionResult } from "./extractor/persist.ts";
 
 const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "ok", "okay", "true", "1", "confirm"]);
 
@@ -235,37 +233,15 @@ async function extractSessionLoop(
     const existing = (await getBySession(driver, sessionId)).map(n => n.name);
     const extraction = await extractor.extract({ messages: msgs, existingNames: existing });
 
-    const nameToId = new Map<string, string>();
-    // 批内节点收集到批边界统一批量嵌入（embedBatch + UNWIND 批读写）：
-    // closeDriver 在 finally 里执行，若不等待，最后一批在途的 embedding
-    // HTTP 请求会撞上已关闭的 driver 且错误被吞——向量丢失且不可自愈
-    // （markExtracted 已执行，重跑 extract 不会补）。
-    const batchNodes: GmNode[] = [];
-    for (const nc of extraction.nodes) {
-      const { node } = await upsertNode(driver, {
-        type: nc.type, name: nc.name,
-        description: nc.description, content: nc.content,
-      }, sessionId);
-      nameToId.set(node.name, node.id);
-      stats.nodes += 1;
-      batchNodes.push(node);
-    }
-
-    for (const ec of extraction.edges) {
-      const fromNode = await findByName(driver, ec.from);
-      const toNode = await findByName(driver, ec.to);
-      const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-      const toId = nameToId.get(ec.to) ?? toNode?.id;
-      if (fromId && toId) {
-        await upsertEdge(driver, {
-          fromId, toId, type: ec.type,
-          instruction: ec.instruction, condition: ec.condition, sessionId,
-        });
-        stats.edges += 1;
-      }
-    }
-
-    await recaller.syncEmbedBatch(batchNodes).catch(() => {});
+    // awaitEmbedSync=true：closeDriver 在 finally 里执行，最后一批的 embedding
+    // 请求必须等完 —— 不等待会撞上已关闭的 driver 且错误被吞
+    // （markExtracted 已执行，重跑 extract 不会补向量）。
+    const outcome = await persistExtractionResult(driver, recaller, extraction, {
+      sessionId,
+      awaitEmbedSync: true,
+      onNodeUpserted: () => { stats.nodes += 1; },
+    });
+    stats.edges += outcome.edges;
 
     const maxTurn = msgs.reduce((m, msg) => Math.max(m, msg.turn_index ?? 0), 0);
     await markExtracted(

@@ -76,6 +76,34 @@ function normalizeName(name: string): string {
 
 export { normalizeName };
 
+// ─── 边行读取（单一来源）─────────────────────────────────────
+// 知识边类型白名单的 Cypher 片段与 RETURN 投影/记录映射只在此定义，
+// allEdges/edgesFrom/edgesTo/edgesTouching/graphWalk/getStats 共用 ——
+// 新增 EdgeType 时只改 types.ts 的 EDGE_TYPES，勿在 Cypher 里内联字面量。
+
+const EDGE_TYPE_FILTER = `type(r) IN ${JSON.stringify([...EDGE_TYPES])}`;
+
+const EDGE_ROW_RETURN = `
+      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
+             r.instruction AS instruction, r.condition AS condition,
+             r.sessionId AS sessionId, r.createdAt AS createdAt`;
+
+type EdgeRowResult = { records: Array<{ get(key: string): any }> };
+
+/** 边行记录 → GmEdge（与 EDGE_ROW_RETURN 投影一一对应） */
+function mapEdgeRecords(result: EdgeRowResult): GmEdge[] {
+  return result.records.map(r => ({
+    id: r.get("id"),
+    fromId: r.get("fromId"),
+    toId: r.get("toId"),
+    type: r.get("type") as EdgeType,
+    instruction: r.get("instruction"),
+    condition: r.get("condition") ?? undefined,
+    sessionId: r.get("sessionId"),
+    createdAt: toInt(r.get("createdAt")),
+  }));
+}
+
 // ─── 节点 CRUD ───────────────────────────────────────────────
 
 export async function findByName(driver: Driver, name: string): Promise<GmNode | null> {
@@ -123,21 +151,9 @@ export async function allEdges(driver: Driver): Promise<GmEdge[]> {
   try {
     const result = await session.run(`
       MATCH (a:Task|Skill|Event)-[r]->(b:Task|Skill|Event)
-      WHERE type(r) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
-      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
-             r.instruction AS instruction, r.condition AS condition,
-             r.sessionId AS sessionId, r.createdAt AS createdAt
+      WHERE ${EDGE_TYPE_FILTER}${EDGE_ROW_RETURN}
     `);
-    return result.records.map(r => ({
-      id: r.get("id"),
-      fromId: r.get("fromId"),
-      toId: r.get("toId"),
-      type: r.get("type") as EdgeType,
-      instruction: r.get("instruction"),
-      condition: r.get("condition") ?? undefined,
-      sessionId: r.get("sessionId"),
-      createdAt: toInt(r.get("createdAt")),
-    }));
+    return mapEdgeRecords(result);
   } finally {
     await session.close();
   }
@@ -593,21 +609,9 @@ export async function edgesFrom(driver: Driver, id: string): Promise<GmEdge[]> {
   try {
     const result = await session.run(`
       MATCH (a:Task|Skill|Event {id: $id})-[r]->(b:Task|Skill|Event)
-      WHERE type(r) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
-      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
-             r.instruction AS instruction, r.condition AS condition,
-             r.sessionId AS sessionId, r.createdAt AS createdAt
+      WHERE ${EDGE_TYPE_FILTER}${EDGE_ROW_RETURN}
     `, { id });
-    return result.records.map(r => ({
-      id: r.get("id"),
-      fromId: r.get("fromId"),
-      toId: r.get("toId"),
-      type: r.get("type") as EdgeType,
-      instruction: r.get("instruction"),
-      condition: r.get("condition") ?? undefined,
-      sessionId: r.get("sessionId"),
-      createdAt: toInt(r.get("createdAt")),
-    }));
+    return mapEdgeRecords(result);
   } finally {
     await session.close();
   }
@@ -618,21 +622,9 @@ export async function edgesTo(driver: Driver, id: string): Promise<GmEdge[]> {
   try {
     const result = await session.run(`
       MATCH (a:Task|Skill|Event)-[r]->(b:Task|Skill|Event {id: $id})
-      WHERE type(r) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
-      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
-             r.instruction AS instruction, r.condition AS condition,
-             r.sessionId AS sessionId, r.createdAt AS createdAt
+      WHERE ${EDGE_TYPE_FILTER}${EDGE_ROW_RETURN}
     `, { id });
-    return result.records.map(r => ({
-      id: r.get("id"),
-      fromId: r.get("fromId"),
-      toId: r.get("toId"),
-      type: r.get("type") as EdgeType,
-      instruction: r.get("instruction"),
-      condition: r.get("condition") ?? undefined,
-      sessionId: r.get("sessionId"),
-      createdAt: toInt(r.get("createdAt")),
-    }));
+    return mapEdgeRecords(result);
   } finally {
     await session.close();
   }
@@ -646,21 +638,9 @@ export async function edgesTouching(driver: Driver, ids: string[]): Promise<GmEd
     const result = await session.run(`
       MATCH (a:Task|Skill|Event)-[r]->(b:Task|Skill|Event)
       WHERE (a.id IN $ids OR b.id IN $ids)
-        AND type(r) IN ${JSON.stringify([...EDGE_TYPES])}
-      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
-             r.instruction AS instruction, r.condition AS condition,
-             r.sessionId AS sessionId, r.createdAt AS createdAt
+        AND ${EDGE_TYPE_FILTER}${EDGE_ROW_RETURN}
     `, { ids });
-    return result.records.map(r => ({
-      id: r.get("id"),
-      fromId: r.get("fromId"),
-      toId: r.get("toId"),
-      type: r.get("type") as EdgeType,
-      instruction: r.get("instruction"),
-      condition: r.get("condition") ?? undefined,
-      sessionId: r.get("sessionId"),
-      createdAt: toInt(r.get("createdAt")),
-    }));
+    return mapEdgeRecords(result);
   } finally {
     await session.close();
   }
@@ -689,6 +669,23 @@ export async function deleteEdges(
            RETURN count(r) AS deleted`,
           { fromId, toId },
         );
+    return toInt(result.records[0]?.get("deleted") ?? 0);
+  } finally {
+    await session.close();
+  }
+}
+
+/** 按 edge id 删除单条边（REST DELETE /edges?id= 用）。返回删除条数（0/1）。 */
+export async function deleteEdgeById(driver: Driver, edgeId: string): Promise<number> {
+  const session = getSession(driver);
+  try {
+    const result = await session.run(
+      `MATCH ()-[r]->()
+       WHERE r.id = $edgeId
+       DELETE r
+       RETURN count(r) AS deleted`,
+      { edgeId },
+    );
     return toInt(result.records[0]?.get("deleted") ?? 0);
   } finally {
     await session.close();
@@ -799,14 +796,20 @@ export async function communityVectorSearch(
 
 // ─── 向量存储 ───────────────────────────────────────────────
 
-export async function saveVector(driver: Driver, nodeId: string, content: string, vec: number[]): Promise<void> {
-  const hash = createHash("md5").update(content).digest("hex");
+/**
+ * 单发写向量 + contentHash。hash 可选：调用方已为短路检查预计算过 md5 时
+ * 直接传入，避免对同一 content 重复哈希（缺省时内部补算）。
+ */
+export async function saveVector(
+  driver: Driver, nodeId: string, content: string, vec: number[], hash?: string,
+): Promise<void> {
+  const contentHash = hash ?? createHash("md5").update(content).digest("hex");
   const session = getSession(driver);
   try {
     await session.run(`
       MATCH (n:Task|Skill|Event {id: $nodeId})
-      SET n.embedding = $vec, n.contentHash = $hash
-    `, { nodeId, vec, hash });
+      SET n.embedding = $vec, n.contentHash = $contentHash
+    `, { nodeId, vec, contentHash });
   } finally {
     await session.close();
   }
@@ -1083,22 +1086,10 @@ export async function graphWalk(
     const edgeResult = await session.run(`
       MATCH (a:Task|Skill|Event)-[r]->(b:Task|Skill|Event)
       WHERE a.id IN $nodeIds AND b.id IN $nodeIds
-        AND type(r) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
-      RETURN r.id AS id, a.id AS fromId, b.id AS toId, type(r) AS type,
-             r.instruction AS instruction, r.condition AS condition,
-             r.sessionId AS sessionId, r.createdAt AS createdAt
+        AND ${EDGE_TYPE_FILTER}${EDGE_ROW_RETURN}
     `, { nodeIds });
 
-    const edges = edgeResult.records.map(r => ({
-      id: r.get("id"),
-      fromId: r.get("fromId"),
-      toId: r.get("toId"),
-      type: r.get("type") as EdgeType,
-      instruction: r.get("instruction"),
-      condition: r.get("condition") ?? undefined,
-      sessionId: r.get("sessionId"),
-      createdAt: toInt(r.get("createdAt")),
-    }));
+    const edges = mapEdgeRecords(edgeResult);
 
     return { nodes, edges };
   } finally {
@@ -1389,7 +1380,7 @@ export async function getStats(driver: Driver): Promise<{
 
     const edgeResult = await session.run(`
       MATCH ()-[r]->()
-      WHERE type(r) IN ['USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH']
+      WHERE ${EDGE_TYPE_FILTER}
       RETURN type(r) AS type, count(r) AS c
     `);
     let totalEdges = 0;

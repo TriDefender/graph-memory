@@ -32,7 +32,7 @@ vi.mock("../src/store/store.ts", () => ({
 
 vi.mock("../src/engine/llm.ts", () => ({
   createCompleteFn: () => async () => "",
-  resolveProvider: () => ({ provider: "anthropic", effectiveModel: "m", inferred: false }),
+  resolveProvider: () => ({ provider: "anthropic", inferred: false }),
 }));
 
 vi.mock("../src/engine/embed.ts", () => ({

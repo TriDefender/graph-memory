@@ -20,7 +20,7 @@ import { NODE_TYPE_TO_LABEL, isValidEdgeDirection, EDGE_DIRECTION_RULES, EDGE_TY
 import {
   upsertNode, findById, findByName, allActiveNodes, allEdges,
   upsertEdge, edgesFrom, edgesTo, deprecateNodeAndDisconnectById, mergeNodes,
-  searchNodes, getStats, normalizeName,
+  searchNodes, getStats, normalizeName, deleteEdges, deleteEdgeById,
 } from "../store/store.ts";
 import { getSession } from "../store/db.ts";
 
@@ -477,9 +477,8 @@ async function handleCreateEdge(
     return true;
   }
 
-  const validTypes = ["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"];
-  if (!validTypes.includes(type)) {
-    json(res, 400, { error: `Invalid edge type: ${type}. Must be one of: ${validTypes.join(", ")}` });
+  if (!EDGE_TYPES.includes(type)) {
+    json(res, 400, { error: `Invalid edge type: ${type}. Must be one of: ${EDGE_TYPES.join(", ")}` });
     return true;
   }
 
@@ -522,6 +521,7 @@ async function handleCreateEdge(
 /**
  * DELETE /edges?id=xxx
  * 或 DELETE /edges?fromId=xxx&toId=yyy&type=USED_SKILL
+ * 删除下沉到 store 层（deleteEdgeById / deleteEdges），路由层不写 Cypher。
  */
 async function handleDeleteEdge(
   res: ServerResponse,
@@ -533,38 +533,20 @@ async function handleDeleteEdge(
   const toId = query.toId ?? query.to_id;
   const edgeType = query.type;
 
-  const session = getSession(driver);
-  try {
-    if (edgeId) {
-      // Delete by edge id
-      await session.run(`
-        MATCH ()-[r]->()
-        WHERE r.id = $edgeId
-        DELETE r
-      `, { edgeId });
-    } else if (fromId && toId) {
-      // Delete by endpoints (+ optional type filter)
-      if (edgeType) {
-        await session.run(`
-          MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
-          WHERE type(r) = $edgeType
-          DELETE r
-        `, { fromId, toId, edgeType: edgeType.toUpperCase() });
-      } else {
-        await session.run(`
-          MATCH (a:Task|Skill|Event {id: $fromId})-[r]->(b:Task|Skill|Event {id: $toId})
-          DELETE r
-        `, { fromId, toId });
-      }
-    } else {
-      json(res, 400, { error: "Provide either id or fromId+toId" });
-      return true;
-    }
-  } finally {
-    await session.close();
+  let deleted: number;
+  if (edgeId) {
+    deleted = await deleteEdgeById(driver, edgeId);
+  } else if (fromId && toId) {
+    deleted = await deleteEdges(
+      driver, fromId, toId,
+      edgeType ? (edgeType.toUpperCase() as EdgeType) : undefined,
+    );
+  } else {
+    json(res, 400, { error: "Provide either id or fromId+toId" });
+    return true;
   }
 
-  json(res, 200, { success: true });
+  json(res, 200, { success: true, deleted });
   return true;
 }
 

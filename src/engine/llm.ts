@@ -33,9 +33,10 @@ import {
   normalizeOauthModel,
   buildOauthEndpoint,
   extractOutputTextFromSse,
+  extractOutputTextFromResponsePayload,
 } from "./oauth.ts";
 import type { OAuthSession } from "./oauth.ts";
-import { fetchRetry } from "./http.ts";
+import { fetchRetry, throwForStatus } from "./http.ts";
 
 export type LlmProvider = "openai" | "anthropic" | "oauth";
 
@@ -189,26 +190,14 @@ export function createCompleteFn(
       }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`[graph-memory] OAuth LLM API ${res.status}: ${errText.slice(0, 500)}`);
+        await throwForStatus(res, "[graph-memory] OAuth LLM API", 500);
       }
 
       const bodyText = await res.text();
       let text: string | null = null;
       try {
-        const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-        const output = Array.isArray(parsed.output) ? parsed.output : [];
-        for (const item of output) {
-          if (!item || typeof item !== "object") continue;
-          const content = Array.isArray((item as Record<string, unknown>).content)
-            ? (item as Record<string, unknown>).content as Array<Record<string, unknown>>
-            : [];
-          for (const part of content) {
-            if (part?.type === "output_text" && typeof part.text === "string") {
-              text = (text ?? "") + part.text;
-            }
-          }
-        }
+        // Responses JSON → output_text 收集（与 oauth.ts 的 SSE 嵌套解析共用同一遍历）
+        text = extractOutputTextFromResponsePayload(JSON.parse(bodyText));
       } catch {
         // 服务器忽略 stream:false 时回退到 SSE 解析
         text = extractOutputTextFromSse(bodyText);
@@ -242,8 +231,7 @@ export function createCompleteFn(
         }),
       }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
       if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`[graph-memory] Anthropic API ${res.status}: ${errText.slice(0, 200)}`);
+        await throwForStatus(res, "[graph-memory] Anthropic API");
       }
       const data = await res.json() as any;
       // 遍历 content 找 text 块：只看 content[0] 时，thinking 块在前会误报 empty content
@@ -287,8 +275,7 @@ export function createCompleteFn(
       }),
     }, { retries: 3, timeoutMs, label: "[graph-memory] LLM" });
     if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`[graph-memory] LLM API ${res.status}: ${errText.slice(0, 200)}`);
+      await throwForStatus(res, "[graph-memory] LLM API");
     }
     const data = await res.json() as any;
     const choice = data.choices?.[0];

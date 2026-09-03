@@ -80,3 +80,12 @@ export async function fetchRetry(
   }
   throw new Error(`${label} request failed after retries`);
 }
+
+/**
+ * !res.ok 统一抛错（llm / embed 各调用方共用，消灭散落的 text().catch + slice 样板）。
+ * 消息格式与既有调用方一致：`"${label} ${status}: ${errText.slice(0, sliceLen)}"`。
+ */
+export async function throwForStatus(res: Response, label: string, sliceLen = 200): Promise<never> {
+  const errText = await res.text().catch(() => "");
+  throw new Error(`${label} ${res.status}: ${errText.slice(0, sliceLen)}`);
+}

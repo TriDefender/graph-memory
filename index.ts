@@ -7,14 +7,14 @@
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
-import { getDriver, initSchema, getSession } from "./src/store/db.ts";
+import { getDriver, initSchema } from "./src/store/db.ts";
 import { Neo4jGate } from "./src/store/gate.ts";
 import {
   saveMessage, getUnextracted, countUnextracted, getMaxTurnIndex,
   markExtracted, isTurnExtracted, commitTurnAdvance,
   upsertNode, upsertEdge, findByName, updateNode,
   deprecateNodeAndDisconnect, deprecateNodeAndDisconnectById,
-  getBySession, edgesTouching,
+  getBySession, edgesTouching, topNodes,
   deleteEdges, mergeNodes,
   getStats,
 } from "./src/store/store.ts";
@@ -24,11 +24,12 @@ import { estimateTokens } from "./src/tokens.ts";
 import { Recaller, parseTimeRange } from "./src/recaller/recall.ts";
 import { Extractor, shouldRunFinalize } from "./src/extractor/extract.ts";
 import { shouldSkipTurnExtraction } from "./src/extractor/turn-filter.ts";
+import { persistExtractionResult } from "./src/extractor/persist.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { normalizeMessageRetentionPolicy } from "./src/store/retention.ts";
-import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, type GmConfig, type GmNode, type RecallResult, type EdgeType } from "./src/types.ts";
+import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, EDGE_TYPES, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
 
@@ -523,31 +524,8 @@ const graphMemoryProPlugin = {
           return;
         }
 
-        const nameToId = new Map<string, string>();
-        const upsertedNodes: GmNode[] = [];
-        for (const nc of result.nodes) {
-          const { node } = await upsertNode(driver, {
-            type: nc.type, name: nc.name,
-            description: nc.description, content: nc.content,
-          }, sessionId);
-          nameToId.set(node.name, node.id);
-          upsertedNodes.push(node);
-        }
-        // 批量向量同步：N 个节点一次 embedBatch + 一次 UNWIND 批读写（替代逐节点 N 次单发）
-        void recaller.syncEmbedBatch(upsertedNodes).catch(() => {});
-
-        for (const ec of result.edges) {
-          const fromNode = await findByName(driver, ec.from);
-          const toNode = await findByName(driver, ec.to);
-          const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-          const toId = nameToId.get(ec.to) ?? toNode?.id;
-          if (fromId && toId) {
-            await upsertEdge(driver, {
-              fromId, toId, type: ec.type,
-              instruction: ec.instruction, condition: ec.condition, sessionId,
-            });
-          }
-        }
+        // upsert 节点 + 批量向量同步（fire-and-forget）+ 建边 —— 单一来源见 persist.ts
+        await persistExtractionResult(driver, recaller, result, { sessionId });
 
         // 标记该轮消息已提取
         await markExtracted(driver, sessionId, turnNum);
@@ -578,30 +556,8 @@ const graphMemoryProPlugin = {
           const existing = (await getBySession(driver, sessionId)).map(n => n.name);
           const result = await extractor.extract({ messages: msgs, existingNames: existing });
 
-          const nameToId = new Map<string, string>();
-          const upsertedNodes: GmNode[] = [];
-          for (const nc of result.nodes) {
-            const { node } = await upsertNode(driver, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            upsertedNodes.push(node);
-          }
-          void recaller.syncEmbedBatch(upsertedNodes).catch(() => {});
-
-          for (const ec of result.edges) {
-            const fromNode = await findByName(driver, ec.from);
-            const toNode = await findByName(driver, ec.to);
-            const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-            const toId = nameToId.get(ec.to) ?? toNode?.id;
-            if (fromId && toId) {
-              await upsertEdge(driver, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
-            }
-          }
+          // upsert 节点 + 批量向量同步（fire-and-forget）+ 建边 —— 单一来源见 persist.ts
+          await persistExtractionResult(driver, recaller, result, { sessionId });
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           await markExtracted(
@@ -1264,21 +1220,10 @@ const graphMemoryProPlugin = {
           // finalize 的 upsert 与 afterTurn/compact 的提取共用 per-session 互斥锁：
           // 最后一轮的 afterTurn 提取可能仍在途，不串行化会重复 upsert（validatedCount 双递增）
           await withExtractLock(sid, async () => {
-            // 获取图谱摘要
-            const session = getSession(driver);
-            let summary = "";
-            try {
-              const summaryResult = await session.run(`
-                MATCH (n:Task|Skill|Event {status: 'active'})
-                RETURN n.name AS name, n.type AS type, n.validatedCount AS vc, n.pagerank AS pr
-                ORDER BY n.pagerank DESC LIMIT 20
-              `);
-              summary = summaryResult.records
-                .map(r => `${r.get("type")}:${r.get("name")}(v${r.get("vc")},pr${(r.get("pr") ?? 0).toFixed?.(3) ?? "0"})`)
-                .join(", ");
-            } finally {
-              await session.close();
-            }
+            // 图谱摘要：top-pagerank 节点走 store.topNodes（勿在路由/钩子里内联同义 Cypher）
+            const summary = (await topNodes(driver, 20))
+              .map(n => `${n.type}:${n.name}(v${n.validatedCount},pr${n.pagerank.toFixed(3)})`)
+              .join(", ");
 
             const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
 
@@ -1532,11 +1477,9 @@ const graphMemoryProPlugin = {
       { name: "gm_update" },
     );
 
-    const EDGE_TYPE_LITERAL = (label: string) => Type.Literal(label);
+    // 边类型 union 从 EDGE_TYPES 派生（事实源 types.ts）—— 加新边类型只改一处
     const edgeTypeUnion = (description: string) => Type.Union(
-      [EDGE_TYPE_LITERAL("USED_SKILL"), EDGE_TYPE_LITERAL("SOLVED_BY"),
-       EDGE_TYPE_LITERAL("REQUIRES"), EDGE_TYPE_LITERAL("PATCHES"),
-       EDGE_TYPE_LITERAL("CONFLICTS_WITH")],
+      EDGE_TYPES.map(t => Type.Literal(t)),
       { description },
     );
 
@@ -1703,21 +1646,14 @@ const graphMemoryProPlugin = {
         parameters: Type.Object({}),
         async execute() {
           const stats = await getStats(driver);
-          const session = getSession(driver);
-          let topPr: any[] = [];
-          try {
-            const r = await session.run("MATCH (n:Task|Skill|Event {status:'active'}) RETURN n.name AS name, n.type AS type, n.pagerank AS pr ORDER BY n.pagerank DESC LIMIT 5");
-            topPr = r.records.map(rec => ({ name: rec.get("name"), type: rec.get("type"), pr: rec.get("pr") ?? 0 }));
-          } finally {
-            await session.close();
-          }
+          const topPr = await topNodes(driver, 5);
           const text = [
             `📊 知识图谱统计（Neo4j）`,
             `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
             `PageRank Top 5：`,
-            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${(typeof n.pr === "number" ? n.pr : 0).toFixed(4)})`),
+            ...topPr.map((n, i) => `  ${i + 1}. ${n.name} (${n.type}, pr=${n.pagerank.toFixed(4)})`),
           ].join("\n");
           return { content: [{ type: "text", text }], details: stats };
         },
