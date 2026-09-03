@@ -279,6 +279,8 @@ export interface ExtractConfig {
    * 本地预筛阈值：用户输入清洗（去空白/标点）后长度 ≤ 该值且不含技术词
    * （连续 ≥3 位字母数字，如 pnpm/jwt）时，跳过 LLM 提取直接标记。
    * 保守默认 5（中文 5 字以内基本不可能承载可提取知识）。
+   * 例外：轮内含工具劳动（tool/toolResult 角色）时不判 trivial——"继续"触发的
+   * 一轮真实修复劳动恰是可提取知识，不误杀（见 turn-filter.ts 的 turnHasToolWork）。
    */
   trivialMaxChars?: number;
   /** 额外无意义词表（与内置表合并，清洗后小写精确匹配，如 "继续"、"resume"）。 */

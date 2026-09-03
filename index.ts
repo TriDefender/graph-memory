@@ -23,7 +23,7 @@ import { createEmbedder } from "./src/engine/embed.ts";
 import { estimateTokens } from "./src/tokens.ts";
 import { Recaller, parseTimeRange } from "./src/recaller/recall.ts";
 import { Extractor, shouldRunFinalize } from "./src/extractor/extract.ts";
-import { shouldSkipTurnExtraction } from "./src/extractor/turn-filter.ts";
+import { shouldSkipTurnExtraction, turnHasToolWork } from "./src/extractor/turn-filter.ts";
 import { persistExtractionResult } from "./src/extractor/persist.ts";
 import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
@@ -156,6 +156,9 @@ export function missingIngestMessages(messages: any[], ingestedCount: number): a
 // ─── assemble 消息裁剪：保留最近 N 轮，旧轮只留文本 ──────────
 
 const KEEP_TURNS = 5;
+
+/** batched 模式 session_end 冲洗的最大批数（防积压失控；残余保持未提取，CLI extract 可回填） */
+const SESSION_END_FLUSH_ROUNDS = 5;
 
 function estimateMsgTokens(msg: any): number {
   const text = typeof msg.content === "string"
@@ -485,6 +488,19 @@ const graphMemoryProPlugin = {
       return result;
     }
 
+    /**
+     * 会话内"upsert 命中已有节点"（isNew=false）计数：finalize 阶梯的第二触发条件。
+     * invalidations（纠错弃用）只有 finalize 一条产出路径，而纠错常发生在
+     * 小会话/无 EVENT 会话——shouldRunFinalize 的规模/EVENT 双门恰好会漏掉它们；
+     * 会话触碰过既有知识 = 有纠错/跨会话建边价值，值得一次 finalize LLM 调用。
+     */
+    const sessionUpdatedHits = new Map<string, number>();
+    function trackUpdatedExisting(sessionId: string, count: number): void {
+      if (count > 0) {
+        sessionUpdatedHits.set(sessionId, (sessionUpdatedHits.get(sessionId) ?? 0) + count);
+      }
+    }
+
     async function extractTurnKnowledge(sessionId: string, turnNum: number, rawMessages: any[]): Promise<void> {
       // 熔断开启时跳过本轮提取：消息保持未标记，恢复后由 compact / extract 补提取
       if (!neo4jGate.isAvailable()) {
@@ -502,8 +518,11 @@ const graphMemoryProPlugin = {
           }
 
           // LLM 成本控制：trivial 轮本地预筛（无意义词表 / ≤trivialMaxChars 纯文本），
-          // 命中则零 LLM 直接标记（producedKnowledge=false，原始证据保留）
-          if (shouldSkipTurnExtraction(turnUserText(rawMessages), trivialFilterOpts)) {
+          // 命中则零 LLM 直接标记（producedKnowledge=false，原始证据保留）。
+          // 轮内含工具劳动（tool/toolResult）时不判 trivial："继续"触发的一轮真实
+          // 修复劳动恰是图谱最该吸收的知识，且 per-turn 路径没有自动补提触发点。
+          if (!turnHasToolWork(rawMessages)
+            && shouldSkipTurnExtraction(turnUserText(rawMessages), trivialFilterOpts)) {
             await markExtracted(driver, sessionId, turnNum, false);
             api.logger.info(`[graph-memory-pro] turn ${turnNum}: trivial prompt, extraction skipped (local pre-filter)`);
             return;
@@ -525,7 +544,8 @@ const graphMemoryProPlugin = {
         }
 
         // upsert 节点 + 批量向量同步（fire-and-forget）+ 建边 —— 单一来源见 persist.ts
-        await persistExtractionResult(driver, recaller, result, { sessionId });
+        const outcome = await persistExtractionResult(driver, recaller, result, { sessionId });
+        trackUpdatedExisting(sessionId, outcome.updatedExisting);
 
         // 标记该轮消息已提取
         await markExtracted(driver, sessionId, turnNum);
@@ -557,7 +577,8 @@ const graphMemoryProPlugin = {
           const result = await extractor.extract({ messages: msgs, existingNames: existing });
 
           // upsert 节点 + 批量向量同步（fire-and-forget）+ 建边 —— 单一来源见 persist.ts
-          await persistExtractionResult(driver, recaller, result, { sessionId });
+          const outcome = await persistExtractionResult(driver, recaller, result, { sessionId });
+          trackUpdatedExisting(sessionId, outcome.updatedExisting);
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           await markExtracted(
@@ -1153,6 +1174,7 @@ const graphMemoryProPlugin = {
           msgSeqLoaders.delete(childSessionId);
           extractLocks.delete(childSessionId);
           ingestedSinceTurn.delete(childSessionId);
+          sessionUpdatedHits.delete(childSessionId);
         }
         sessionIdsByKey.delete(childSessionKey);
         pendingSubagentRecall.delete(childSessionKey);
@@ -1167,6 +1189,7 @@ const graphMemoryProPlugin = {
         sessionIdsByKey.clear();
         pendingSubagentRecall.clear();
         ingestedSinceTurn.clear();
+        sessionUpdatedHits.clear();
         // 仅当释放的是当前活跃引擎时清空标记 —— 真正的重载（dispose 后重新
         // register）才会走完整初始化路径
         if (activeEngine === engine) activeEngine = null;
@@ -1201,9 +1224,15 @@ const graphMemoryProPlugin = {
           return;
         }
 
-        // batched 模式：会话结束冲洗残留未提取批（攒批未达阈值时保证知识不丢）
+        // batched 模式：会话结束冲洗残留未提取批（攒批未达阈值时保证知识不丢）。
+        // drain 循环（上限 5）：中途 LLM 失败可能积压超过单批 limit（compactTurnCount*3），
+        // 只冲一批会留尾部知识缺口；ok=false（本批失败）即停，避免同因反复打 LLM。
+        // 仍超限的残余保持未提取——retention fail-closed 不删，可再跑 `graph-memory extract` 回填。
         if (extractCfg.mode === "batched") {
-          await extractUnextractedBatch(sid);
+          for (let i = 0; i < SESSION_END_FLUSH_ROUNDS; i++) {
+            const flush = await extractUnextractedBatch(sid);
+            if (!flush.ok || !flush.compacted) break;
+          }
         }
 
         let nodes: Awaited<ReturnType<typeof getBySession>>;
@@ -1216,7 +1245,9 @@ const graphMemoryProPlugin = {
           api.logger.error(`[graph-memory-pro] session_end error: ${err}`);
           return;
         }
-        if (nodes.length && shouldRunFinalize(nodes)) {
+        // finalize 阶梯：规模/EVENT 门（shouldRunFinalize）之外，会话内 upsert 命中过
+        // 已有节点也触发——纠错型 invalidations 只有 finalize 能产出，小会话纠错不可漏
+        if (nodes.length && (shouldRunFinalize(nodes) || (sessionUpdatedHits.get(sid) ?? 0) > 0)) {
           // finalize 的 upsert 与 afterTurn/compact 的提取共用 per-session 互斥锁：
           // 最后一轮的 afterTurn 提取可能仍在途，不串行化会重复 upsert（validatedCount 双递增）
           await withExtractLock(sid, async () => {
@@ -1266,6 +1297,7 @@ const graphMemoryProPlugin = {
         recalled.delete(sid);
         recalledPrompt.delete(sid);
         ingestedSinceTurn.delete(sid);
+        sessionUpdatedHits.delete(sid);
         if (sessionKey && sessionIdsByKey.get(sessionKey) === sid) {
           sessionIdsByKey.delete(sessionKey);
           pendingSubagentRecall.delete(sessionKey);

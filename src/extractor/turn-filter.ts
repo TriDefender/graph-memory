@@ -10,8 +10,9 @@
  *   3. 清洗后长度 ≤ trivialMaxChars（默认 5）且不含技术词
  *      （连续 ≥3 位字母数字，如 pnpm/jwt/k8s——这类短输入仍走 LLM）。
  *
- * 只看 user 角色文本；工具结果与 assistant 回复不参与（它们跟随用户意图，
- * 用户输入有意义时整轮照常提取）。
+ * 判定"文本"只取 user 角色（工具结果与 assistant 回复的内容不参与），但轮内只要
+ * 存在工具劳动（tool/toolResult 角色，见 turnHasToolWork）就不判 trivial——
+ * "继续"触发的一轮真实修复劳动恰是图谱最该吸收的知识。
  */
 
 /** 清洗：去空白与中西文标点，转小写。用于词表精确匹配与长度计量。 */
@@ -64,4 +65,18 @@ export function shouldSkipTurnExtraction(userText: string, opts?: TrivialFilterO
   if (normalized.length <= maxChars && !TECH_TOKEN_RE.test(normalized)) return true;
 
   return false;
+}
+
+/**
+ * 轮内是否含工具劳动（tool / toolResult 角色）。这类轮即使 user 文本命中
+ * trivial 词表也不应跳过提取："继续"触发的一轮真实修复劳动恰是可提取知识，
+ * 且 per-turn 路径没有自动补提触发点——extracted 一旦标记，只有手动重置
+ * + `graph-memory extract` 才能回挖。
+ */
+export function turnHasToolWork(messages: readonly unknown[]): boolean {
+  return (messages ?? []).some((m) => {
+    if (!m || typeof m !== "object") return false;
+    const role = (m as { role?: unknown }).role;
+    return role === "tool" || role === "toolResult";
+  });
 }

@@ -10,7 +10,7 @@
 
 import { describe, it, expect } from "vitest";
 import {
-  normalizeTrivialText, shouldSkipTurnExtraction, BUILTIN_TRIVIAL_PROMPTS,
+  normalizeTrivialText, shouldSkipTurnExtraction, turnHasToolWork, BUILTIN_TRIVIAL_PROMPTS,
 } from "../src/extractor/turn-filter.ts";
 import { turnUserText } from "../index.ts";
 
@@ -98,5 +98,43 @@ describe("turnUserText — 轮级 user 文本聚合", () => {
   it("非 user 消息不参与", () => {
     expect(turnUserText([{ role: "assistant", content: "继续" }])).toBe("");
     expect(shouldSkipTurnExtraction(turnUserText([{ role: "assistant", content: "继续" }]))).toBe(true);
+  });
+});
+
+describe("turnHasToolWork — 工具劳动守卫（trivial 预筛的误杀保险）", () => {
+  it("含 tool / toolResult 角色 → true", () => {
+    expect(turnHasToolWork([
+      { role: "user", content: "继续" },
+      { role: "assistant", content: [{ type: "toolUse", id: "t1", name: "fix" }] },
+      { role: "tool", content: "patched" },
+    ])).toBe(true);
+    expect(turnHasToolWork([
+      { role: "user", content: "继续" },
+      { role: "toolResult", content: [{ type: "text", text: "done" }] },
+    ])).toBe(true);
+  });
+
+  it("纯 user/assistant 对话 → false", () => {
+    expect(turnHasToolWork([
+      { role: "user", content: "继续" },
+      { role: "assistant", content: "好的" },
+    ])).toBe(false);
+    expect(turnHasToolWork([])).toBe(false);
+  });
+
+  it("畸形消息不炸", () => {
+    expect(turnHasToolWork([null, undefined, "str", 42, { role: 123 }, {}])).toBe(false);
+  });
+
+  it("组合语义：user 文本命中词表 + 轮内有工具劳动 → 整轮照常提取", () => {
+    const messages = [
+      { role: "user", content: "继续" },
+      { role: "assistant", content: [{ type: "toolUse", id: "t1", name: "bash" }] },
+      { role: "toolResult", content: "bug fixed, tests green" },
+    ];
+    // 单独看 user 文本命中词表……
+    expect(shouldSkipTurnExtraction(turnUserText(messages))).toBe(true);
+    // ……但轮内有工具劳动，预筛必须让路
+    expect(turnHasToolWork(messages)).toBe(true);
   });
 });

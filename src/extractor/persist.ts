@@ -30,12 +30,19 @@ export interface PersistExtractionOutcome {
   nodes: GmNode[];
   /** 成功建立的边数（两端可解析且方向合法；upsertEdge 内部仍会按库中真实端点复核方向） */
   edges: number;
+  /**
+   * 命中已有节点的 upsert 数（isNew=false）。index.ts 把它按会话累加为
+   * finalize 阶梯的第二触发条件——纠错型 invalidations 只有 finalize 能产出，
+   * 而纠错常发生在小会话/无 EVENT 会话（shouldRunFinalize 的双门会漏掉）。
+   */
+  updatedExisting: number;
 }
 
 /**
  * 将一次 ExtractionResult 落库：upsert 全部节点 → 启动批量向量同步
  * （awaitEmbedSync 决定是否等待）→ 逐条解析并 upsert 边。
- * 边端点优先用本次 upsert 得到的 name→id 索引，未命中再查库（findByName）。
+ * 边端点优先查本次 upsert 得到的 name→id 索引（零往返；键是规范化名，LLM
+ * 原文未必规范化，未命中必须回源 findByName——它做 normalizeName）。
  * 不负责 markExtracted —— 各调用方的 upToTurn/producedKnowledge 语义不同。
  */
 export async function persistExtractionResult(
@@ -46,13 +53,15 @@ export async function persistExtractionResult(
 ): Promise<PersistExtractionOutcome> {
   const nameToId = new Map<string, string>();
   const upserted: GmNode[] = [];
+  let updatedExisting = 0;
   for (const nc of result.nodes) {
-    const { node } = await upsertNode(driver, {
+    const { node, isNew } = await upsertNode(driver, {
       type: nc.type, name: nc.name,
       description: nc.description, content: nc.content,
     }, opts.sessionId);
     nameToId.set(node.name, node.id);
     upserted.push(node);
+    if (!isNew) updatedExisting += 1;
     opts.onNodeUpserted?.(node);
   }
 
@@ -63,10 +72,8 @@ export async function persistExtractionResult(
 
   let edgeCount = 0;
   for (const ec of result.edges) {
-    const fromNode = await findByName(driver, ec.from);
-    const toNode = await findByName(driver, ec.to);
-    const fromId = nameToId.get(ec.from) ?? fromNode?.id;
-    const toId = nameToId.get(ec.to) ?? toNode?.id;
+    const fromId = nameToId.get(ec.from) ?? (await findByName(driver, ec.from))?.id;
+    const toId = nameToId.get(ec.to) ?? (await findByName(driver, ec.to))?.id;
     if (fromId && toId) {
       await upsertEdge(driver, {
         fromId, toId, type: ec.type,
@@ -76,5 +83,5 @@ export async function persistExtractionResult(
     }
   }
 
-  return { nodes: upserted, edges: edgeCount };
+  return { nodes: upserted, edges: edgeCount, updatedExisting };
 }
