@@ -23,26 +23,9 @@
 
 ## The problem it solves
 
-```mermaid
-flowchart LR
-  subgraph BEFORE[Without Graph Memory]
-    B1[Old Q/A] --> B2[Reasoning + tool traces]
-    B2 --> B3[More turns]
-    B3 --> B4[Ever-growing model context]
-  end
-
-  subgraph AFTER[With Graph Memory]
-    A1[Newest N completed Q/A] --> A4[Bounded model context]
-    A2[Current question] --> A3[Vector / FTS recall]
-    A5[(Graph + exact source Q/A)] --> A3
-    A3 --> A4
-  end
-
-  classDef baseline fill:#fff2ee,stroke:#e16645,color:#111827;
-  classDef memory fill:#edf3ff,stroke:#1748d1,color:#111827;
-  class B1,B2,B3,B4 baseline;
-  class A1,A2,A3,A4,A5 memory;
-```
+<p align="center">
+  <img src="docs/images/context-memory-illustration.webp" alt="Long agent history becomes graph navigation plus a compact recent-turn context" width="100%">
+</p>
 
 Graph Memory owns the **model-visible historical surface** without deleting DSH's event log. By default it keeps the newest five completed user turns, removes completed reasoning/tool traces from future requests, and recalls relevant older or cross-session source Q/A automatically.
 
@@ -66,20 +49,6 @@ Graph Memory owns the **model-visible historical surface** without deleting DSH'
 [Read the Markdown benchmark, per-turn data, method, and limits →](benchmarks/dsh-context-takeover/README.md)
 
 ## Memory survives the context window
-
-```mermaid
-sequenceDiagram
-  participant A as Session A
-  participant GM as Graph Memory
-  participant DB as Local SQLite / vectors
-  participant B as Session B
-  A->>GM: completed user question + final answer
-  GM->>DB: typed nodes + edges + source IDs
-  B->>GM: new question
-  GM->>DB: query-first vector / FTS Top-K
-  DB-->>GM: graph navigation + exact source Q/A
-  GM-->>B: relevant memory before the model request
-```
 
 <p align="center">
   <img src="docs/images/dsh/plugin-inventory-active.png" alt="Graph Memory active in DSH" width="48%">
@@ -110,18 +79,6 @@ Confirm that `graph-memory/dsh` is active under **Settings → Plugins**. The de
 | Durable memory | Local SQLite, stable provenance, cross-session and cross-project recall |
 | Failure behavior | Invalid extraction is quarantined; foreground conversation continues; bad data is not repaired or persisted |
 | Host support | Native DSH/Cordis adapter; maintained OpenClaw Context Engine adapter |
-
-```mermaid
-flowchart LR
-  Q[Current question] --> R[Vector / FTS Top-K]
-  DB[(TASK · SKILL · EVENT)] --> R
-  R --> E[Existing edges]
-  R --> S[Exact source Q/A]
-  F[Newest N completed turns] --> C[Model context]
-  E --> C
-  S --> C
-  C --> M[Main model]
-```
 
 <details>
 <summary><strong>Optional embeddings</strong></summary>
@@ -189,7 +146,7 @@ The repository also contains an experimental read-only DSH Pro Lite Host + Clien
 
 ## Verification and limits
 
-Current beta `1.6.0-beta.12` passes **123/123 automated tests**, both TypeScript builds, npm package verification, and a clean-profile install/boot on official DSH `0.1.3-alpha.1` (`d347e70390`).
+Current beta `1.6.0-beta.13` passes **124/124 automated tests**, both TypeScript builds, npm package verification, and a clean-profile install/boot on official DSH `0.1.3-alpha.1` (`d347e70390`).
 
 - Structured extraction still depends on model contract compliance: the measured run succeeded 19/20 times; failures stay quarantined and never block the foreground conversation.
 - Recall is bounded by configurable Top-K. Focused probes succeeded; one broad multi-topic query can require a larger Top-K or separate questions.

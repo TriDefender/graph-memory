@@ -343,6 +343,20 @@ export function getNextUnextractedTurn(db, sid, completedTurn) {
     ORDER BY rowid
   `).all(sid, Number(next.turn_index));
 }
+/**
+ * Read one exact completed turn. Live DSH extraction uses this path so an
+ * unrelated legacy backlog can never be pulled into a foreground session.
+ * Historical retries deliberately use getNextUnextractedTurn instead.
+ */
+export function getUnextractedTurn(db, sid, turn) {
+    if (!Number.isInteger(turn) || turn < 1)
+        return [];
+    return db.prepare(`
+    SELECT * FROM gm_messages
+    WHERE session_id=? AND turn_index=? AND extracted=0 AND extraction_state='pending'
+    ORDER BY rowid
+  `).all(sid, turn);
+}
 /** Persist the highest DSH/OpenClaw turn known to be complete. */
 export function markExtractionTurnCompleted(db, sid, completedTurn) {
     if (!Number.isFinite(completedTurn))

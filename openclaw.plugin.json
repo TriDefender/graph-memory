@@ -1,7 +1,7 @@
 {
   "id": "graph-memory",
   "name": "Graph Memory",
-  "version": "1.6.0-beta.12",
+  "version": "1.6.0-beta.13",
   "description": "知识图谱记忆引擎：从对话提取三元组，按当前问题进行向量/FTS5 召回并接管上下文",
   "contracts": {
     "tools": ["gm_search", "gm_record", "gm_update", "gm_stats", "gm_maintain"]

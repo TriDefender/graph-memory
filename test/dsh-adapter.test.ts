@@ -381,6 +381,87 @@ function countState(dbPath: string, state: string): number {
 }
 
 describe("DSH completed-turn memory extraction", () => {
+  it("never imports an existing Session backlog automatically", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-live-turn-only-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const requests: any[] = [];
+    const session: any = { id: "existing-session", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "old question that predates plugin startup"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "old answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    const agentListeners = new Map<string, (...args: any[]) => any>();
+    const agent: any = {
+      id: session.id,
+      session,
+      ctx: {
+        on(name: string, listener: (...args: any[]) => any) {
+          agentListeners.set(name, listener);
+          return () => {};
+        },
+      },
+    };
+    const { context, listeners, cleanups } = adapterContext(async function* (options: any) {
+      requests.push(options);
+      yield structuredExtraction(EMPTY_EXTRACTION);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    context.agents = {
+      list: () => [agent],
+      get: () => agent,
+    };
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+    const legacy = new DatabaseSync(dbPath);
+    try {
+      const insert = legacy.prepare(`
+        INSERT INTO gm_messages
+          (id, session_id, turn_index, role, content, created_at)
+        VALUES (?, 'dsh:existing-session', 1, ?, ?, ?)
+      `);
+      insert.run("legacy-user", "user", JSON.stringify("legacy queued question"), Date.now());
+      insert.run("legacy-assistant", "assistant", JSON.stringify("legacy queued answer"), Date.now());
+    } finally {
+      legacy.close();
+    }
+
+    for (const listener of listeners.get("agent/session-start") ?? []) {
+      await listener({ agent });
+    }
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(requests).toHaveLength(0);
+    const before = new DatabaseSync(dbPath);
+    try {
+      expect((before.prepare("SELECT COUNT(*) AS c FROM gm_messages").get() as any).c).toBe(2);
+      expect((before.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extraction_state='pending'").get() as any).c).toBe(2);
+    } finally {
+      before.close();
+    }
+
+    session.events.push(
+      { type: "turn/start", seq: 4, data: { turn: 2 } },
+      userMsg(5, "new question after plugin startup"),
+      { type: "assistant/message", seq: 6, data: { turn: 2, message: { content: [{ type: "text", text: "new answer" }] } } },
+      { type: "turn/end", seq: 7, data: { turn: 2, reason: { kind: "completed" } } },
+    );
+    await listeners.get("session/event")![0](session, session.events[7]);
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+    expect(countState(dbPath, "pending")).toBe(2);
+    expect(requests).toHaveLength(1);
+    const prompt = requests[0].messages[0].content[0].text;
+    expect(prompt).toContain("new question after plugin startup");
+    expect(prompt).not.toContain("old question that predates plugin startup");
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("uses one turn/end worker call with only the question and final answer", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gm-turn-memory-"));
     const dbPath = join(dir, "graph-memory.db");

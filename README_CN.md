@@ -23,26 +23,9 @@
 
 ## 它解决什么
 
-```mermaid
-flowchart LR
-  subgraph BEFORE[没有 Graph Memory]
-    B1[历史问答] --> B2[推理与工具轨迹]
-    B2 --> B3[更多轮次]
-    B3 --> B4[模型上下文持续膨胀]
-  end
-
-  subgraph AFTER[启用 Graph Memory]
-    A1[最近 N 轮完整问答] --> A4[有界模型上下文]
-    A2[当前问题] --> A3[向量 / FTS 召回]
-    A5[(图谱 + 精确来源问答)] --> A3
-    A3 --> A4
-  end
-
-  classDef baseline fill:#fff2ee,stroke:#e16645,color:#111827;
-  classDef memory fill:#edf3ff,stroke:#1748d1,color:#111827;
-  class B1,B2,B3,B4 baseline;
-  class A1,A2,A3,A4,A5 memory;
-```
+<p align="center">
+  <img src="docs/images/context-memory-illustration.webp" alt="不断增长的 Agent 历史转化为图谱导航和精简的近期上下文" width="100%">
+</p>
 
 Graph Memory 接管的是**发给模型的历史表面**，不会删除 DSH 的事件记录。默认保留最近 5 个已完成用户轮次；已完成的推理和工具轨迹不再重复发送；旧轮次与跨会话记忆按当前问题自动召回。
 
@@ -66,20 +49,6 @@ Graph Memory 接管的是**发给模型的历史表面**，不会删除 DSH 的�
 [查看 Markdown 实测报告、逐轮数据、方法与限制 →](benchmarks/dsh-context-takeover/README.md)
 
 ## 上下文可以缩小，记忆不会消失
-
-```mermaid
-sequenceDiagram
-  participant A as Session A
-  participant GM as Graph Memory
-  participant DB as 本地 SQLite / 向量
-  participant B as Session B
-  A->>GM: 已完成的用户问题 + 最终回答
-  GM->>DB: 类型节点 + 关系边 + 来源 ID
-  B->>GM: 新问题
-  GM->>DB: 按问题进行向量 / FTS Top-K
-  DB-->>GM: 图谱导航 + 精确来源问答
-  GM-->>B: 主模型请求前自动注入相关记忆
-```
 
 <p align="center">
   <img src="docs/images/dsh/plugin-inventory-active.png" alt="Graph Memory 已在 DSH 启用" width="48%">
@@ -110,18 +79,6 @@ npx @deepseek-ai/dsh web
 | 持久记忆 | 本地 SQLite、稳定溯源、跨轮次/跨会话/跨项目召回 |
 | 失败行为 | 非法抽取进入隔离；前台对话继续；坏数据不修补、不入库 |
 | 宿主支持 | DSH/Cordis 原生适配；继续维护 OpenClaw Context Engine 适配 |
-
-```mermaid
-flowchart LR
-  Q[当前问题] --> R[向量 / FTS Top-K]
-  DB[(TASK · SKILL · EVENT)] --> R
-  R --> E[已有关系边]
-  R --> S[精确来源问答]
-  F[最近 N 轮完整问答] --> C[模型上下文]
-  E --> C
-  S --> C
-  C --> M[主模型]
-```
 
 <details>
 <summary><strong>可选 Embedding</strong></summary>
@@ -189,7 +146,7 @@ openclaw gateway restart
 
 ## 验证与边界
 
-当前 beta 1.6.0-beta.12 已通过 **123/123 自动化测试**、两套 TypeScript 构建、npm 包验证，并在官方 DSH 0.1.3-alpha.1（d347e70390）完成全新 profile 安装和启动。
+当前 beta 1.6.0-beta.13 已通过 **124/124 自动化测试**、两套 TypeScript 构建、npm 包验证，并在官方 DSH 0.1.3-alpha.1（d347e70390）完成全新 profile 安装和启动。
 
 - 结构化抽取仍依赖模型遵守合同：实测 19/20 成功；失败数据保持隔离，且不会阻塞前台对话。
 - 召回数量由 Top-K 限制。聚焦问题实测成功；一次包含多个主题的宽查询可能需要提高 Top-K 或拆开提问。

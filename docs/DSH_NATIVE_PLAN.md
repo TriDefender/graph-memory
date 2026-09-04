@@ -1,7 +1,7 @@
 # Graph Memory × DeepSeek Harness 原生架构与 Pro 路线图
 
 > 更新：2026-09-04
-> Community 状态：`1.6.0-beta.12` 已完成 DSH 原生加载、无模型滚动上下文接管、查询优先召回、无安装脚本分发与真实跨会话验证
+> Community 状态：`1.6.0-beta.13` 已完成 DSH 原生加载、无模型滚动上下文接管、查询优先召回、无安装脚本分发与真实跨会话验证
 > Pro 状态：SQLite GraphSnapshot、DSH Host、Typed Remote 与只读 Client 已实现；2D/3D、分屏和拖拽尚未实现
 
 ## 1. 结论
@@ -203,7 +203,7 @@ interface GraphStore {
 
 | 阶段 | 目标 | 当前进度 | 完成标准 |
 |---|---|---:|---|
-| 第一步：Community 原生插件 | 可安装、可显示、上下文接管、跨会话记录/召回、向量检索、OpenClaw 保留 | `1.6.0-beta.12` 发布候选已完成 | 多 profile 的 update/remove 矩阵与更多模型反馈 |
+| 第一步：Community 原生插件 | 可安装、可显示、上下文接管、跨会话记录/召回、向量检索、OpenClaw 保留 | `1.6.0-beta.13` 发布候选已完成 | 多 profile 的 update/remove 矩阵与更多模型反馈 |
 | 第二步：Pro Lite 客户端 | SQLite 图快照、2D 图谱、分屏、受控拖拽、Skill/MCP 索引 | Host、Typed Remote、只读卡片 Client 已完成；2D/分屏/拖拽未开始 | 不改 DSH core；1 万节点交互性能达标；完整权限与审计 |
 | 第三步：Pro 完整版 | 3D renderer、可选 Neo4j/GDS、迁移与大图能力 | 待开始 | SQLite/Neo4j 同契约；凭据零下发；多平台安装与回滚通过 |
 
@@ -215,7 +215,7 @@ interface GraphStore {
 - DSH adapter 回归覆盖 credential missing/rotation、回填、dispose、并发 Session 与首次召回等待 embedding 初始化。
 - 全新 profile 的 tarball `plugin add`、`--dump-config` 与打包内容已验证；继续补齐多 profile update/remove 矩阵。
 - secret scan、数据库/日志排除和无会话内容诊断已完成。
-- 发布 `1.6.0-beta.12`，收集不同 DSH profile 与模型的兼容反馈。
+- 发布 `1.6.0-beta.13`，收集不同 DSH profile 与模型的兼容反馈。
 
 ### P1：Community 稳定版
 
@@ -234,4 +234,4 @@ interface GraphStore {
 
 ## 11. 发布决策
 
-当前不建议继续沿用含义混乱的 `v2.0` 标签。`1.6.0-beta.12` 将无模型滚动上下文、完成轮次 Q/A 投影、长期图记忆、查询优先召回与 Pro Lite 组合，并完成真实 20 轮模型闭环和全新 DSH profile tarball 安装验证；多 profile 安装矩阵仍需继续验证。README、截图和视频必须始终区分自动化组合测试、真实宿主加载和真实模型结果。
+当前不建议继续沿用含义混乱的 `v2.0` 标签。`1.6.0-beta.13` 将无模型滚动上下文、完成轮次 Q/A 投影、长期图记忆、查询优先召回与 Pro Lite 组合，并完成真实 20 轮模型闭环和全新 DSH profile tarball 安装验证；多 profile 安装矩阵仍需继续验证。README、截图和视频必须始终区分自动化组合测试、真实宿主加载和真实模型结果。

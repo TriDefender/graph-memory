@@ -16,6 +16,7 @@ import {
   getStats,
   getVectorStats,
   getNextUnextractedTurn,
+  getUnextractedTurn,
   getExtractionStats,
   getPendingSessionIds,
   getExtractionCompletedTurn,
@@ -519,17 +520,22 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     }
   }
 
-  const extractionRequested = new Set<string>();
-
-  function scheduleExtract(sessionId: unknown): Promise<void> {
+  function scheduleExtract(sessionId: unknown, liveTurn?: number): Promise<void> {
     if (!extractionEnabled || closing) return Promise.resolve();
     const key = String(sessionId);
+    const sid = sessionKey(sessionId);
+    const run = async () => {
+      if (liveTurn !== undefined) {
+        const rows = getUnextractedTurn(db, sid, liveTurn);
+        if (rows.length) await drainTurn(sessionId, sid, rows);
+        return;
+      }
+      // No turn means an explicit administrative retry. Only that path is
+      // allowed to consume a pre-existing durable backlog.
+      await extractPending(sessionId);
+    };
     const previous = extractChain.get(key);
-    if (previous) {
-      extractionRequested.add(key);
-      return previous;
-    }
-    const running = extractPending(sessionId);
+    const running = previous ? previous.then(run, run) : run();
     const next = running.catch(error => {
       ctx.logger.error(`[graph-memory] DSH extraction queue failed: ${error instanceof Error ? error.name : "unknown error"}`);
     });
@@ -537,7 +543,6 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     void next.then(() => {
       if (extractChain.get(key) === next) {
         extractChain.delete(key);
-        if (extractionRequested.delete(key)) void scheduleExtract(sessionId);
       }
     });
     return next;
@@ -633,7 +638,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     });
   }
 
-  function backfill(agent: any): void {
+  function restoreRoutes(agent: any): void {
     const id = agent?.id ?? agent?.session?.id;
     const events = typeof agent?.session?.snapshotEvents === "function"
       ? agent.session.snapshotEvents()
@@ -642,11 +647,6 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     for (const event of events) {
       const route = routeFromEvent(event);
       if (route) latestRoute.set(String(id), route);
-      if (event?.type !== "turn/end") continue;
-      const turn = Number(event.data?.turn);
-      if (Number.isInteger(turn) && turn > 0) {
-        captureCompletedTurn(agent.session, turn, Number(event.seq));
-      }
     }
   }
 
@@ -782,16 +782,16 @@ export function apply(ctx: DshContext, input: Config = {}): void {
   // DSH's scoped carrier; existing agents are attached as a reload safeguard.
   for (const agent of ctx.agents?.list?.() ?? []) {
     attachRollingCompaction(agent);
-    backfill(agent);
+    restoreRoutes(agent);
   }
   ctx.on("agent/created", ({ agent }: any) => attachRollingCompaction(agent));
   ctx.on("agent/session-start", ({ agent }: any) => {
     // session-start is also a resume-safe fallback for hosts that publish an
     // existing Agent before this plugin fiber finishes loading.
     attachRollingCompaction(agent);
-    backfill(agent);
-    const id = agent?.id ?? agent?.session?.id;
-    if (id !== undefined) void scheduleExtract(id);
+    // Existing Session history is intentionally not imported automatically.
+    // Doing so can turn plugin startup into thousands of hidden LLM calls.
+    restoreRoutes(agent);
   });
 
   ctx.on("session/event", (session: any, event: any) => {
@@ -812,7 +812,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       }
       // The committed turn is durable before the single per-session worker is
       // scheduled. No model call runs in turn-stopping or blocks the response.
-      void scheduleExtract(id);
+      void scheduleExtract(id, turn);
       maintain(id);
       if (Number.isInteger(turn) && turn > 0) projectCompletedTurn(session, turn, Number(event.seq));
     }
@@ -839,7 +839,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       const messageCount = Number((db.prepare("SELECT COUNT(*) AS count FROM gm_messages").get() as any)?.count ?? 0);
       const extraction = getExtractionStats(db);
       const retentionRevision = messageRetentionPolicyRevision(messageRetention);
-      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"} (pending=${extraction.pending}, succeeded=${extraction.succeeded}, quarantined=${extraction.quarantined})\nExtraction source: one completed turn = user question + final answer\nExtraction scheduling: session/event turn/end, one serial worker per session, no automatic retries\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nAssistant tools: ${assistantTools}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nContext takeover: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, failed=${compactionMetrics.failed}, shadowedEvents=${compactionMetrics.shadowedEvents}, shadowedTokens=${compactionMetrics.shadowedTokens}, projectedTurns=${compactionMetrics.projectedTurns}, projectedEvents=${compactionMetrics.projectedEvents}, projectedTokens=${compactionMetrics.projectedTokens}`;
+      return `Graph Memory active (DSH native)\nStore: ${config.dbPath}\nNodes: ${stats.totalNodes}\nEdges: ${stats.totalEdges}\nMessages: ${messageCount}\nExtraction: ${extractionEnabled ? "enabled" : "disabled"} (pending=${extraction.pending}, succeeded=${extraction.succeeded}, quarantined=${extraction.quarantined})\nExtraction source: one completed turn = user question + final answer\nExtraction scheduling: live turn/end only, one serial worker per session, no startup history import, no automatic retries\nRecall: ${recallEnabled ? "enabled" : "disabled"}\nEmbedding: ${embeddingState}${embeddingModel}\nVectors: ${vectors.count}/${stats.totalNodes}${vectors.dimensions.length ? ` (${vectors.dimensions.join(", ")} dimensions)` : ""}\nAssistant tools: ${assistantTools}\nMessage retention: keep=${messageRetention.keep}, recentTurns=${messageRetention.recentTurns}, retentionDays=${messageRetention.retentionDays}, batchSize=${messageRetention.batchSize}, dryRun=${messageRetention.dryRun}, revision=${retentionRevision}\nRetention GC: runs=${retentionMetrics.runs}, dryRuns=${retentionMetrics.dryRuns}, selected=${retentionMetrics.selectedRows}, deleted=${retentionMetrics.deletedRows}, estimatedDeletedBytes=${retentionMetrics.deletedBytes}\nContext takeover: attached=${compactionMetrics.attached}, selected=${compactionMetrics.selected}, succeeded=${compactionMetrics.succeeded}, failed=${compactionMetrics.failed}, shadowedEvents=${compactionMetrics.shadowedEvents}, shadowedTokens=${compactionMetrics.shadowedTokens}, projectedTurns=${compactionMetrics.projectedTurns}, projectedEvents=${compactionMetrics.projectedEvents}, projectedTokens=${compactionMetrics.projectedTokens}`;
     },
   });
 
@@ -951,7 +951,7 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     closing = true;
     abortingExtraction = true;
     // Shutdown never starts maintenance requests. Pending turns remain durable
-    // and are recovered at the next session start.
+    // and can be retried explicitly with gm_retry_extraction.
     for (const controller of activeExtractionControllers) {
       controller.abort(new Error("[graph-memory] extraction stopped with the DSH plugin"));
     }
@@ -959,7 +959,6 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     latestRoute.clear();
     turnCounts.clear();
     pendingTurnProjections.clear();
-    extractionRequested.clear();
     db.close();
   }, "graph-memory.close");
 
