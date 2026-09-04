@@ -15,7 +15,13 @@ describe("local LLM configuration", () => {
         headers: new Headers(init?.headers),
         body: JSON.parse(String(init?.body)) as Record<string, unknown>,
       });
-      return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      return new Response(JSON.stringify({ choices: [{ message: { tool_calls: [{
+        type: "function",
+        function: {
+          name: "submit_graph_extraction",
+          arguments: '{"nodes":[],"edges":[],"invalidations":[]}',
+        },
+      }] } }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -26,9 +32,13 @@ describe("local LLM configuration", () => {
       model: "local-model",
     });
 
-    await expect(complete("system", "user")).resolves.toBe("ok");
+    await expect(complete("system", "user")).resolves.toBe('{"nodes":[],"edges":[],"invalidations":[]}');
     expect(requests[0].url).toBe("http://127.0.0.1:8080/v1/chat/completions");
     expect(requests[0].headers.has("Authorization")).toBe(false);
     expect(requests[0].body).toMatchObject({ model: "local-model" });
+    expect(requests[0].body).toMatchObject({
+      tools: [{ function: { name: "submit_graph_extraction" } }],
+      tool_choice: { function: { name: "submit_graph_extraction" } },
+    });
   });
 });

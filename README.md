@@ -1,10 +1,17 @@
 # Graph Memory
 
-![DeepSeek Harness + OpenClaw → Graph Memory](docs/images/brand/graph-memory-hosts-banner.png)
+<p align="center">
+  <img src="docs/images/deepseek-harness-wordmark.svg" alt="DeepSeek Harness" width="310">
+</p>
 
 <p align="center">
-  <strong>Traceable, searchable, cross-session memory for AI agents.</strong><br>
-  One memory core, native to DeepSeek Harness, with the OpenClaw plugin entry retained.
+  <strong>Stop model-visible history from growing while durable memory keeps learning.</strong><br>
+  Graph Memory owns historical context natively in DeepSeek Harness, recalls only relevant source-backed memory, and retains its OpenClaw integration.
+</p>
+
+<p align="center">
+  <img src="docs/images/brand/openclaw-wordmark.svg" alt="Compatible with OpenClaw" width="118"><br>
+  <sub>One memory core · OpenClaw Context Engine entry maintained</sub>
 </p>
 
 <p align="center">
@@ -23,13 +30,25 @@
 
 Compaction answers “how much of this conversation still fits?” Graph Memory answers “which past knowledge is worth recalling now?”
 
+| What users need to know first | What Graph Memory does |
+|---|---|
+| Will the current conversation keep expanding? | Keeps the newest five completed user turns by default and replaces the older model surface with one archive marker. |
+| Does old knowledge disappear? | No source event is deleted; the current query retrieves graph nodes and their exact source Q/A. |
+| Does this require a DSH fork? | No. It uses the Cordis plugin lifecycle and public DSH context protocols. |
+
+<p align="center">
+  <img src="docs/images/dsh-context-takeover-chart.svg" alt="DSH 20-turn first-request context token comparison" width="96%">
+</p>
+
+> In a real 20-turn engineering workload, T20 first-request tokens fell from 56,998 to 16,769 (−70.58%), and message count fell from 171 to 24. Cumulative first-request tokens fell 51.61%. After including nondeterministic main-agent tool loops, Graph Memory maintenance, and embeddings, measured total tokens fell 3.47%. [Read the full methodology and caveats](docs/GRAPH_MEMORY_README_REPORT.html) · [Re-run the sanitized benchmark](benchmarks/dsh-context-takeover/README.md)
+
 Reusable conversation knowledge becomes typed nodes:
 
 - `TASK`: goals, execution, and outcomes;
 - `SKILL`: validated reusable methods;
 - `EVENT`: errors, fixes, decisions, changes, and facts.
 
-Typed edges such as `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, and `CONFLICTS_WITH` preserve relationships. A new question retrieves a relevant local subgraph instead of replaying the complete history.
+Generic `RELATES` edges carry conversation-derived predicates for topic navigation, while compatibility edges such as `USED_SKILL` and `SOLVED_BY` preserve established agent-memory semantics. A new question retrieves a relevant local subgraph instead of replaying the complete history.
 
 ## Core advantages
 
@@ -40,6 +59,8 @@ Typed edges such as `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, and `CONFL
 - Disposes database, cache, and event listeners with its plugin fiber.
 - Does not fork or modify DeepSeek Harness core.
 
+Automatic recall does not require a tool call. `assistantTools` defaults to `none`, adding no model-facing schema; use `search` for explicit `gm_search` or `all` temporarily for administration.
+
 ### Durable cross-session memory
 
 - Knowledge from Session A can be recalled automatically in Session B.
@@ -49,13 +70,14 @@ Typed edges such as `USED_SKILL`, `SOLVED_BY`, `REQUIRES`, `PATCHES`, and `CONFL
 
 ### Smaller, cleaner context
 
-- Keeps the newest real user turns verbatim (`freshTurnCount`, default `5`).
-- Uses the agent-scoped public DSH compaction service to replace the older model-facing prefix with one rolling checkpoint; the durable source event log remains intact.
-- Indexes each landed checkpoint and preserves exact source-message provenance for later dereferencing.
+- Keeps the five newest completed user turns verbatim before the current prompt (`freshTurnCount`, default `5`).
+- Uses DSH's public surface-replacement and token-meter shadow-price protocols to replace older model-facing history with one constant-size archive marker. This makes no compaction-model request; the durable source event log remains intact.
+- Preserves exact source-message provenance and retrieves both archived same-session memory and cross-session memory for the current query.
 - Semantic vector retrieval with FTS5 lexical fallback.
-- Community detection, PageRank, personalized PageRank, and bounded graph traversal.
-- Only a relevant cross-session subgraph enters the current prompt, within `recallTokenBudget` (default `4096`).
-- Automatic injection uses a high-precision semantic gate (`autoRecallMinScore`, default `0.6`) and never falls back to query-independent community representatives; explicit `gm_search` remains broad.
+- Community detection and PageRank remain local maintenance/inspection tools; query-time ranking stays semantic.
+- Only memories ranked for the current question enter the prompt; full source Q/A is attached atomically and the host/provider owns token accounting.
+- Automatic recall and `gm_search` share one vector/FTS ranking path. `semanticScoreThreshold` is optional because cosine scales vary by embedding model; the default is provider-neutral Top-K.
+- Query-time PageRank reranking is disabled: graph centrality no longer displaces the strongest semantic match. PageRank remains an offline graph-maintenance statistic.
 - Recalled history is marked as untrusted reference material and cannot override current user instructions.
 
 ### Local-first and lightweight
@@ -94,7 +116,7 @@ The DSH integration does not discard the original project. Graph Memory is evolv
 
 | Stage | Deliverable | Status |
 |---|---|---|
-| OpenClaw origin | Context Engine, cross-session graph memory, dual-path recall | Maintained |
+| OpenClaw origin | Context Engine, cross-session graph memory, vector/FTS5 recall | Maintained |
 | Community graph engine | SQLite, FTS5, vectors, graph ranking, provenance | Available |
 | DeepSeek Harness | Cordis adapter, native tools, auto-recall, Credentials | Implemented and tested |
 | Graph Memory Pro | Visual graph workbench, controlled drag-and-drop, optional Neo4j | Pro Lite read-only Host + Client implemented; 2D/3D and drag pending |
@@ -131,19 +153,18 @@ SKILL  ──CONFLICTS_WITH──▶ SKILL
 
 Nodes retain episodic user/assistant provenance. This preserves the context in which knowledge was created, not only a lossy summary.
 
-### Dual-path recall
+### Query-first recall
 
 ```mermaid
 flowchart LR
-  Q[Current query] --> EXACT[Exact path]
-  Q --> GENERAL[Generalized path]
-  EXACT --> SEARCH[Vector / FTS5]
-  SEARCH --> EXPAND[Community expansion + traversal]
-  GENERAL --> SUMMARY[Community-summary match]
-  SUMMARY --> MEMBERS[Community members]
-  EXPAND --> PPR[Personalized PageRank]
-  MEMBERS --> PPR
-  PPR --> CONTEXT[Deduplicated local context]
+  Q[Current query] --> VECTOR[Vector ranking]
+  Q --> FTS[FTS5 fallback]
+  VECTOR --> TOPK[Relevant Top-K nodes]
+  FTS --> TOPK
+  TOPK --> EDGES[Edges among selected nodes]
+  TOPK --> SOURCE[Exact source Q/A]
+  EDGES --> CONTEXT[Atomic memory bundle]
+  SOURCE --> CONTEXT
 ```
 
 ### Host data flow
@@ -153,15 +174,14 @@ flowchart LR
   USER[User message] --> SESSION[DSH Session Events]
   SESSION --> ADAPTER[Graph Memory Cordis Adapter]
   ADAPTER --> POLICY[Keep newest N user turns]
-  POLICY --> COMPACT[DSH public CompactionEngine]
-  COMPACT --> CHECKPOINT[Rolling model-surface checkpoint]
+  POLICY --> ARCHIVE[Public surface replacement]
+  ARCHIVE --> SURFACE[Bounded model surface]
   ADAPTER --> EXTRACT[Structured Extraction]
   EXTRACT --> GRAPH[(SQLite / FTS5 / Vectors)]
 
   USER --> RECALL[Semantic + Lexical Recall]
   GRAPH --> RECALL
-  RECALL --> RANK[Community Expansion + PPR]
-  RANK --> PROMPT[Prompt Assembly]
+  RECALL --> PROMPT[Graph + exact source Q/A]
   PROMPT --> LOOP[DSH Agent Loop]
 
   CREDS[DSH Credentials] --> ADAPTER
@@ -177,8 +197,8 @@ graph-memory/
 ├── cordis.patch.yml       # DSH bundle entry
 └── src/
     ├── extractor/         # conversation → TASK / SKILL / EVENT
-    ├── recaller/          # vector, FTS5, graph expansion and recall
-    ├── graph/             # PageRank, communities and deduplication
+    ├── recaller/          # query-first vector / FTS5 recall
+    ├── graph/             # PageRank and communities
     ├── store/             # SQLite schema and queries
     ├── format/            # safe context assembly
     └── engine/            # LLM and embedding providers
@@ -189,14 +209,14 @@ graph-memory/
 | Capability | Status | Notes |
 |---|---|---|
 | Native Cordis loading | **Done** | No DSH fork required |
-| Rolling context ownership | **Done** | Configurable newest N turns; older surface prefix becomes a checkpoint |
-| Cross-session auto-recall | **Done** | Injected during Prompt Assembly |
+| Rolling context ownership | **Done** | Configurable newest N turns; older surface prefix becomes an archive marker |
+| Cross-session auto-recall | **Done** | Injected before the first model request; waits for embedding initialization |
 | Explicit record and search | **Done** | `gm_record`, `gm_search` |
 | Vector backfill and migration | **Done** | Model, dimension, and fingerprint tracked |
 | Visible plugin state | **Done** | Active in Plugin Inventory |
 | Pro visual workbench | **Experimental** | Separate DSH Client Plugin with a read-only card snapshot |
 
-Current beta: `1.6.0-beta.11`. Functional acceptance used DeepSeek Harness `0.1.0-rc.8`; script-free Git installation and profile config composition were subsequently reverified against `0.1.1-rc.2`. Testing covered script-free Git and tarball installation, Web and Headless profile loading, configurable five-turn rolling compaction through the public agent-preset compaction service, exact source provenance, a lossless bounded extraction queue, failure quarantine and recovery, bounded raw-message retention, token-budget enforcement, high-precision automatic recall, FTS5 fallback, and the Pro Lite Host, Typed Remote, and Client bundle boundaries. All 149 automated tests passed. Real model-backed acceptance also verified rolling checkpoint replacement, 1024-dimensional `text-embedding-v4` vectors, and automatic cross-project recall without an explicit memory tool call.
+Current beta: `1.6.0-beta.12`. The current candidate passes 123 automated tests across 20 files, both TypeScript builds, and npm dry-run packaging. A fresh-profile tarball install, expanded-config check, and real boot also passed on the latest official DSH `0.1.3-alpha.1` (`d347e70390`). A 20-turn GLM-5.2 run verified configurable five-turn context ownership, per-turn tool-trace projection, exact source provenance, query-first vector/FTS recall, failure quarantine, and cross-session recall without an explicit memory tool call. The first-request context total fell from 532,451 to 257,656 tokens (51.61%); T20 fell from 56,998 to 16,769 (70.58%). Nineteen of twenty structured extractions succeeded; the failed turn was quarantined rather than repaired or persisted. Full evidence and caveats are in [`docs/GRAPH_MEMORY_README_REPORT.html`](docs/GRAPH_MEMORY_README_REPORT.html).
 
 <p align="center">
   <strong>Plugin enabled: graph-memory/dsh is active in the DSH plugin list</strong><br>
@@ -226,7 +246,7 @@ cd graph-memory
 npm install
 npm test
 npm pack
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.10.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.12.tgz
 ```
 
 After installation, verify that `graph-memory/dsh` is enabled under **Settings → Plugins → Plugin list**.
@@ -291,7 +311,15 @@ Before enabling deletion, back up `$DSH_HOME/graph-memory/graph-memory.db`, keep
 | `gm_maintain` | Run one bounded graph + configured retention maintenance tick |
 | `gm_retry_extraction` | Requeue quarantined extraction failures without deleting or truncating source messages |
 
-The extraction queue bounds each temporary projection to 8,000 characters and 15 messages by default. One oversized message is extracted in semantic chunks while its durable SQLite event remains complete. Repeated failures become `quarantined`: they are never mislabeled as learned and retention cannot delete them. `gm_status` and `gm_stats` expose pending, succeeded, and quarantined counts. All bounds live under `extractionDrain`; see `cordis.patch.yml` for defaults.
+Each completed DSH turn creates exactly one extraction job containing only its original user question and final visible assistant answer. Reasoning, tool calls, and tool results are excluded and no character/message splitting is performed. The adapter sets no default output-token cap and performs no automatic retries; incomplete or failed results remain `quarantined` until explicitly requeued with `gm_retry_extraction`.
+
+Extraction is an auxiliary workload and can use a dedicated DSH model route. Set
+`GRAPH_MEMORY_LLM_PROVIDER` and `GRAPH_MEMORY_LLM_MODEL`; that route takes
+precedence over the foreground Agent route. Optionally set
+`GRAPH_MEMORY_LLM_REASONING_EFFORT=off` when the selected DSH provider/model
+declares that capability, and `GRAPH_MEMORY_LLM_MAX_TOKENS` when an explicit
+response cap is desired. Unsupported reasoning controls fail visibly instead
+of silently changing provider behavior.
 
 Automatic recall does not require an explicit `gm_search` tool call. The plugin retrieves relevant memory during Prompt Assembly.
 

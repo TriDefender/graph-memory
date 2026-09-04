@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { apply, eventMessage, inject } from "../dsh.ts";
+import { apply } from "../dsh.ts";
+import { GRAPH_EXTRACTION_TOOL_NAME } from "../src/extractor/contract.ts";
 import { DatabaseSync } from "../src/store/sqlite.ts";
-import { normalizeExtractionContent } from "../src/extractor/extract.ts";
 
 function user(seq: number) {
   return {
@@ -16,22 +16,26 @@ function user(seq: number) {
 }
 
 describe("native DSH context takeover", () => {
+  it("adds no assistant tool schema by default", async () => {
+    const tools: string[] = [];
+    const cleanups: Array<() => void | Promise<void>> = [];
+    apply({
+      logger: { info() {}, warn() {}, error() {} },
+      llm: { async *stream() {} },
+      tools: { register(definition: any) { tools.push(definition.name); return () => {}; } },
+      credentials: { async resolve() { return undefined; } },
+      on() { return () => {}; },
+      effect(register: () => () => void | Promise<void>) { cleanups.push(register()); return () => {}; },
+    } as any, { dbPath: ":memory:", extractionEnabled: false, recallEnabled: false });
+    expect(tools).toEqual([]);
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+  });
+
   it("fails closed on an ambiguous destructive retention policy", () => {
     expect(() => apply({} as any, {
       dbPath: ":memory:",
       messageRetention: { keep: "recent" },
     })).toThrow(/requires recentTurns or retentionDays/);
-  });
-
-  it("validates extraction bounds before opening the configured database", () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-config-"));
-    const dbPath = join(dir, "must-not-open.db");
-    expect(() => apply({} as any, {
-      dbPath,
-      extractionDrain: { maxBatchChars: 1 },
-    })).toThrow(/extractionDrain.maxBatchChars/);
-    expect(existsSync(dbPath)).toBe(false);
-    rmSync(dir, { recursive: true, force: true });
   });
 
   it("exposes the effective retention policy and bounded maintenance receipt", async () => {
@@ -58,6 +62,7 @@ describe("native DSH context takeover", () => {
       dbPath: ":memory:",
       extractionEnabled: false,
       recallEnabled: false,
+      assistantTools: "all",
       messageRetention: {
         keep: "referenced",
         recentTurns: 5,
@@ -84,36 +89,17 @@ describe("native DSH context takeover", () => {
     await Promise.all(cleanups.map(cleanup => cleanup()));
   });
 
-  it("keeps immutable source events but does not duplicate derived replacements", () => {
-    expect(eventMessage({
-      type: "assistant/message",
-      surfaceOp: "append",
-      data: { message: { content: [{ type: "text", text: "original" }] } },
-    })).toEqual({
-      role: "assistant",
-      message: { content: [{ type: "text", text: "original" }] },
-    });
-    expect(eventMessage({
-      type: "assistant/message",
-      surfaceOp: { op: "replace", start: 1, end: 3 },
-      sourceEventSeqs: [1, 2, 3],
-      data: { message: { content: [{ type: "text", text: "derived" }] } },
-    })).toBeUndefined();
-  });
-
-  it("uses the agent-scoped public compaction service and retains configurable turns", async () => {
+  it("takes over the DSH surface without calling a compaction model", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
-    let compactionService: any;
     const context: any = {
       logger: { info() {}, warn() {}, error() {} },
       llm: { async *stream() {} },
       tools: { register() { return () => {}; } },
       credentials: { async resolve() { return undefined; } },
-      agentPresets: {
-        serviceFor(_agent: any, key: string) {
-          expect(key).toBe("compaction");
-          return compactionService;
+      tokenMeter: {
+        measure(session: any) {
+          return { nodes: session.surface.nodes.map((seq: number) => ({ seq, heuristicTokens: 10 })) };
         },
       },
       on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
@@ -146,9 +132,25 @@ describe("native DSH context takeover", () => {
       events.push({ type: "assistant/message", seq: assistantSeq, data: {} });
       surface.push(assistantSeq);
     }
-    const calls: any[][] = [];
+    const session: any = {
+      id: "takeover-test",
+      events,
+      surface: { nodes: surface },
+      append(type: string, data: any, options?: any) {
+        const seq = events.length;
+        const event = { type, seq, data, ...options };
+        events.push(event);
+        if (options?.surfaceOp?.op === "replace") {
+          const start = surface.indexOf(options.surfaceOp.start);
+          const end = surface.indexOf(options.surfaceOp.end);
+          surface.splice(start, end - start + 1, seq);
+        }
+        return event;
+      },
+    };
     const agent = {
-      session: { events, surface: { nodes: surface } },
+      id: "takeover-test",
+      session,
       ctx: {
         on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
           const current = agentListeners.get(name) ?? [];
@@ -159,40 +161,48 @@ describe("native DSH context takeover", () => {
         },
       },
     };
-    compactionService = {
-      async compactRegion(...args: any[]) {
-        calls.push(args);
-        return { shadowedSeqs: [0, 1] };
-      },
-    };
     listeners.get("agent/created")![0]({ agent });
     const next = async () => "continued";
     const result = await agentListeners.get("agent/pre-step")![0]({
       agent,
+      messages: [{ source: { kind: "user" } }],
       signal: new AbortController().signal,
     }, next);
 
     expect(result).toBe("continued");
-    expect(calls).toHaveLength(1);
-    expect(calls[0][0]).toBe(0);
-    expect(calls[0][1]).toBe(1);
-    expect(calls[0][2]).toBe(agent);
+    expect(events.at(-2)).toMatchObject({
+      type: "compaction/prune",
+      data: { shadowedSeqs: [0, 1], shadowedTokenCount: 20 },
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: "user/message",
+      surfaceOp: { op: "replace", start: 0, end: 1 },
+      data: { source: { kind: "plugin", plugin: "graph-memory" } },
+    });
+    expect(surface).toEqual([events.length - 1, 2, 3, 4, 5]);
     await Promise.all(cleanups.map(cleanup => cleanup()));
   });
 
   it("keeps a 30-turn model surface bounded instead of growing linearly", async () => {
     const listeners = new Map<string, Array<(...args: any[]) => any>>();
     const cleanups: Array<() => void | Promise<void>> = [];
-    let compactionService: any;
     const context: any = {
       logger: { info() {}, warn() {}, error() {} },
       llm: { async *stream() {} },
       tools: { register() { return () => {}; } },
       credentials: { async resolve() { return undefined; } },
-      agentPresets: {
-        serviceFor(_agent: any, key: string) {
-          expect(key).toBe("compaction");
-          return compactionService;
+      tokenMeter: {
+        measure(session: any) {
+          return {
+            nodes: session.surface.nodes.map((seq: number) => {
+              const event = session.events[seq];
+              const content = event?.type === "assistant/message"
+                ? event.data?.message?.content
+                : event?.data?.content;
+              const chars = content?.[0]?.text?.length ?? 0;
+              return { seq, heuristicTokens: Math.max(1, Math.ceil(chars / 4)) };
+            }),
+          };
         },
       },
       on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
@@ -218,9 +228,26 @@ describe("native DSH context takeover", () => {
     const surface = { nodes: [] as number[] };
     const agentListeners = new Map<string, Array<(...args: any[]) => any>>();
     let compactions = 0;
+    const session: any = {
+      id: "long-dialog",
+      events,
+      surface,
+      append(type: string, data: any, options?: any) {
+        const seq = events.length;
+        const event = { type, seq, data, ...options };
+        events.push(event);
+        if (options?.surfaceOp?.op === "replace") {
+          const startPosition = surface.nodes.indexOf(options.surfaceOp.start);
+          const endPosition = surface.nodes.indexOf(options.surfaceOp.end);
+          surface.nodes.splice(startPosition, endPosition - startPosition + 1, seq);
+          compactions += 1;
+        }
+        return event;
+      },
+    };
     const agent: any = {
       id: "long-dialog",
-      session: { events, surface },
+      session,
       ctx: {
         on(name: string, listener: (...args: any[]) => any, options?: Record<string, unknown>) {
           const current = agentListeners.get(name) ?? [];
@@ -229,27 +256,6 @@ describe("native DSH context takeover", () => {
           agentListeners.set(name, current);
           return () => {};
         },
-      },
-    };
-    compactionService = {
-      async compactRegion(start: number, end: number) {
-        const startPosition = surface.nodes.indexOf(start);
-        const endPosition = surface.nodes.indexOf(end);
-        const shadowedSeqs = surface.nodes.slice(startPosition, endPosition + 1);
-        const replacementSeq = events.length;
-        events.push({
-          type: "user/message",
-          seq: replacementSeq,
-          surfaceOp: { op: "replace", start, end },
-          sourceEventSeqs: shadowedSeqs,
-          data: {
-            source: { kind: "plugin", plugin: "compaction-basic" },
-            content: [{ type: "text", text: `checkpoint-${compactions}`.padEnd(600, ".") }],
-          },
-        });
-        surface.nodes.splice(startPosition, shadowedSeqs.length, replacementSeq);
-        compactions += 1;
-        return { shadowedSeqs };
       },
     };
     listeners.get("agent/created")![0]({ agent });
@@ -299,10 +305,10 @@ describe("native DSH context takeover", () => {
     }, 0);
     const uncompressedChars = 30 * 2 * (payload.length + 20);
 
-    expect(compactions).toBe(25);
-    expect(realUsers).toHaveLength(5);
-    expect(surface.nodes).toHaveLength(11);
-    expect(surfaceChars).toBeLessThan(uncompressedChars * 0.2);
+    expect(compactions).toBe(24);
+    expect(realUsers).toHaveLength(6);
+    expect(surface.nodes).toHaveLength(13);
+    expect(surfaceChars).toBeLessThan(uncompressedChars * 0.22);
     await Promise.all(cleanups.map(cleanup => cleanup()));
   });
 });
@@ -315,7 +321,19 @@ function userMsg(seq: number, text: string) {
   };
 }
 
-const EMPTY_EXTRACTION = '{"nodes":[],"edges":[]}';
+const EMPTY_EXTRACTION = '{"nodes":[],"edges":[],"invalidations":[]}';
+
+function structuredExtraction(argumentsJson: string) {
+  return {
+    type: "block-end",
+    block: {
+      type: "tool-call",
+      id: "extraction-call",
+      name: GRAPH_EXTRACTION_TOOL_NAME,
+      arguments: argumentsJson,
+    },
+  };
+}
 
 function adapterContext(llmStream: (options?: any) => AsyncGenerator<any>) {
   const listeners = new Map<string, Array<(...args: any[]) => any>>();
@@ -352,16 +370,6 @@ async function waitFor(check: () => boolean, timeoutMs = 8000): Promise<void> {
   }
 }
 
-function countPending(dbPath: string): number {
-  const db = new DatabaseSync(dbPath);
-  try {
-    const row = db.prepare("SELECT COUNT(*) AS c FROM gm_messages WHERE extraction_state = 'pending'").get() as any;
-    return Number(row.c);
-  } finally {
-    db.close();
-  }
-}
-
 function countState(dbPath: string, state: string): number {
   const db = new DatabaseSync(dbPath);
   try {
@@ -372,32 +380,195 @@ function countState(dbPath: string, state: string): number {
   }
 }
 
-async function startAndEndTurn(
-  listeners: Map<string, Array<(...args: any[]) => any>>,
-  agent: any,
-): Promise<void> {
-  listeners.get("agent/session-start")![0]({ agent });
-  await listeners.get("agent/turn-stopping")![0]({
-    agent,
-    signal: new AbortController().signal,
-  });
-  await listeners.get("session/event")![0]({ id: agent.id }, { type: "turn/end", seq: 99_999 });
-}
+describe("DSH completed-turn memory extraction", () => {
+  it("uses one turn/end worker call with only the question and final answer", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-turn-memory-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const requests: any[] = [];
+    const { context, listeners, cleanups } = adapterContext(async function* (options: any) {
+      requests.push(options);
+      yield structuredExtraction(EMPTY_EXTRACTION);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+    expect(listeners.has("agent/turn-stopping")).toBe(false);
 
-describe("extraction drain resilience", () => {
-  it("does not require the UI-only agentPresets service", () => {
-    expect(inject).not.toContain("agentPresets");
+    const session: any = { id: "semantic-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "What should we remember?"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [
+        { type: "reasoning", text: "private chain of thought" },
+        { type: "tool-call", name: "read", arguments: { path: "secret" } },
+      ] } } },
+      { type: "tool/result", seq: 3, data: { turn: 1, message: { content: [{ type: "text", text: "large tool output" }] } } },
+      { type: "assistant/message", seq: 4, data: { turn: 1, message: { content: [
+        { type: "reasoning", text: "final hidden reasoning" },
+        { type: "text", text: "Remember the verified final result." },
+      ] } } },
+      { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[5]);
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].maxTokens).toBeUndefined();
+    expect(requests[0].reasoningEffort).toBe("off");
+    expect(requests[0].tools).toHaveLength(1);
+    expect(requests[0].tools[0].name).toBe(GRAPH_EXTRACTION_TOOL_NAME);
+    expect(requests[0].tools[0].parameters.required).toEqual(["nodes", "edges", "invalidations"]);
+    const prompt = requests[0].messages[0].content[0].text;
+    expect(prompt).toContain("What should we remember?");
+    expect(prompt).toContain("Remember the verified final result.");
+    expect(prompt).not.toContain("private chain of thought");
+    expect(prompt).not.toContain("large tool output");
+    expect(prompt).not.toContain("final hidden reasoning");
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
   });
 
-  it("retries a transient LLM failure and then drains the backlog", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
+  it("prefers the configured extraction route over the foreground Agent route", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-extraction-route-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const requests: any[] = [];
+    const { context, listeners, cleanups } = adapterContext(async function* (options: any) {
+      requests.push(options);
+      yield structuredExtraction(EMPTY_EXTRACTION);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "memory-provider",
+      llmModel: "memory-model",
+      llmReasoningEffort: "off",
+      llmMaxTokens: 900,
+    });
+    const session: any = { id: "dedicated-route", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      { type: "request/header", seq: 1, data: { header: { config: { provider: "agent-provider", model: "agent-model" } } } },
+      userMsg(2, "question"),
+      { type: "assistant/message", seq: 3, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 4, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[1]);
+    await listeners.get("session/event")![0](session, session.events[4]);
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      provider: "memory-provider",
+      model: "memory-model",
+      reasoningEffort: "off",
+      maxTokens: 900,
+    });
+    expect(requests[0].messages[0].content[0].text).not.toContain("<Output Limits>");
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("passes prior graph knowledge into the next turn and applies a temporal correction", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-temporal-revision-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const requests: any[] = [];
+    const outputs = [
+      JSON.stringify({
+        nodes: [{
+          type: "EVENT", name: "project-port", description: "项目当前端口",
+          content: "端口是 8080", operation: "create",
+          temporal: { eventTime: "第一轮", state: "current" }, sourceTurns: [1],
+        }],
+        edges: [], invalidations: [],
+      }),
+      JSON.stringify({
+        nodes: [{
+          type: "EVENT", name: "project-port", description: "项目当前端口",
+          content: "端口是 9090", operation: "revise",
+          temporal: { eventTime: "第二轮", state: "current" }, sourceTurns: [2],
+        }],
+        edges: [], invalidations: [],
+      }),
+    ];
+    const { context, listeners, cleanups } = adapterContext(async function* (options: any) {
+      requests.push(options);
+      yield structuredExtraction(outputs[requests.length - 1]);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+
+    const session: any = { id: "revision-session", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "项目端口是多少？"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "确认是 8080。" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+
+    session.events.push(
+      { type: "turn/start", seq: 4, data: { turn: 2 } },
+      userMsg(5, "上一轮端口说错了，正确的是 9090。"),
+      { type: "assistant/message", seq: 6, data: { turn: 2, message: { content: [{ type: "text", text: "已纠正为 9090。" }] } } },
+      { type: "turn/end", seq: 7, data: { turn: 2, reason: { kind: "completed" } } },
+    );
+    await listeners.get("session/event")![0](session, session.events[7]);
+    await waitFor(() => countState(dbPath, "succeeded") === 4);
+
+    expect(requests).toHaveLength(2);
+    const secondPrompt = requests[1].messages[0].content[0].text;
+    expect(secondPrompt).toContain('"name":"project-port"');
+    expect(secondPrompt).toContain("端口是 8080");
+    const inspect = new DatabaseSync(dbPath);
+    try {
+      const node = inspect.prepare(
+        "SELECT content, temporal_json, validated_count FROM gm_nodes WHERE name='project-port'",
+      ).get() as any;
+      expect(node.content).toBe("端口是 9090");
+      expect(JSON.parse(node.temporal_json)).toEqual({ eventTime: "第二轮", state: "current" });
+      expect(node.validated_count).toBe(1);
+      const activeSources = inspect.prepare(`
+        SELECT s.turn_index FROM gm_node_sources s
+        JOIN gm_nodes n ON n.id=s.node_id
+        WHERE n.name='project-port' ORDER BY s.turn_index
+      `).all() as Array<{ turn_index: number }>;
+      expect(activeSources.map(source => source.turn_index)).toEqual([2, 2]);
+      const revision = inspect.prepare(`
+        SELECT previous_content, previous_source_refs
+        FROM gm_node_revisions r JOIN gm_nodes n ON n.id=r.node_id
+        WHERE n.name='project-port'
+      `).get() as any;
+      expect(revision.previous_content).toBe("端口是 8080");
+      expect(JSON.parse(revision.previous_source_refs)).toHaveLength(2);
+    } finally {
+      inspect.close();
+    }
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("never parses a max-tokens response and never retries it automatically", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-max-tokens-"));
     const dbPath = join(dir, "graph-memory.db");
     let calls = 0;
-    const { context, listeners, cleanups, logs } = adapterContext(async function* () {
+    const { context, listeners, cleanups } = adapterContext(async function* () {
       calls += 1;
-      if (calls === 1) throw new Error("transient provider hiccup");
-      yield { type: "text-delta", text: EMPTY_EXTRACTION };
-      yield { type: "finish", reason: { kind: "stop" } };
+      yield { type: "text-delta", text: '{"nodes":[' };
+      yield { type: "finish", reason: { kind: "max-tokens" } };
     });
     apply(context, {
       dbPath,
@@ -405,156 +576,25 @@ describe("extraction drain resilience", () => {
       recallEnabled: false,
       llmProvider: "test-provider",
       llmModel: "test-model",
-      extractionRetryDelaysMs: [0, 0],
     });
-    const agent = { id: "transient-test", session: { events: [userMsg(0, "alpha"), userMsg(1, "beta")] } };
-    await startAndEndTurn(listeners, agent);
+    const session: any = { id: "truncated-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "question"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
+    await waitFor(() => countState(dbPath, "quarantined") === 2);
+    expect(calls).toBe(1);
 
-    await waitFor(() => logs.some(l => l.includes("DSH extracted")));
-    expect(logs.some(l => l.includes("retry 1/2 in 0s"))).toBe(true);
-    expect(logs.some(l => l.includes("SKIP"))).toBe(false);
-    expect(countPending(dbPath)).toBe(0);
     await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("quarantines permanently failing messages without pretending they were extracted", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
-    const dbPath = join(dir, "graph-memory.db");
-    const { context, listeners, cleanups, logs } = adapterContext(async function* () {
-      throw new Error("always failing provider");
-    });
-    apply(context, {
-      dbPath,
-      extractionEnabled: true,
-      recallEnabled: false,
-      llmProvider: "test-provider",
-      llmModel: "test-model",
-      extractionRetryDelaysMs: [0, 0],
-    });
-    const agent = {
-      id: "poison-test",
-      session: { events: [userMsg(0, "alpha"), userMsg(1, "beta"), userMsg(2, "gamma")] },
-    };
-    await startAndEndTurn(listeners, agent);
-
-    await waitFor(() => logs.filter(l => l.includes("DSH extraction quarantined")).length >= 3);
-    expect(logs.filter(l => l.includes("DSH extraction quarantined"))).toHaveLength(3);
-    expect(logs.some(l => l.includes("split 3 -> 2+1"))).toBe(true);
-    expect(countPending(dbPath)).toBe(0);
-    expect(countState(dbPath, "quarantined")).toBe(3);
-    expect(countState(dbPath, "succeeded")).toBe(0);
-    await Promise.all(cleanups.map(cleanup => cleanup()));
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("caps each extraction batch by accumulated normalized length", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
-    const dbPath = join(dir, "graph-memory.db");
-    const users: string[] = [];
-    const { context, listeners, cleanups, logs } = adapterContext(async function* (opts: any) {
-      users.push(opts.messages[0].content[0].text);
-      yield { type: "text-delta", text: EMPTY_EXTRACTION };
-      yield { type: "finish", reason: { kind: "stop" } };
-    });
-    apply(context, {
-      dbPath,
-      extractionEnabled: true,
-      recallEnabled: false,
-      llmProvider: "test-provider",
-      llmModel: "test-model",
-      extractionRetryDelaysMs: [0, 0],
-    });
-    // One 10K-char message (always fits alone) plus two short messages:
-    // the long one must not drag the short ones into an oversized request.
-    const long = "x".repeat(10_000);
-    const agent = {
-      id: "length-test",
-      session: { events: [userMsg(0, long), userMsg(1, "short-a"), userMsg(2, "short-b")] },
-    };
-    await startAndEndTurn(listeners, agent);
-
-    await waitFor(() => logs.filter(l => l.includes("DSH extracted")).length >= 2);
-    expect(users.length).toBeGreaterThanOrEqual(2);
-    for (const user of users) {
-      // template (34) + names hint (<=3000) + msgs (<=8000) + JSON wrappers
-      expect(user.length).toBeLessThan(12_000);
-    }
-    expect(countPending(dbPath)).toBe(0);
-    const db = new DatabaseSync(dbPath);
-    const stored = db.prepare("SELECT content FROM gm_messages WHERE turn_index=0").get() as any;
-    expect(normalizeExtractionContent(stored.content)).toBe(long);
-    db.close();
-    await Promise.all(cleanups.map(cleanup => cleanup()));
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("passes an AbortSignal to DSH and aborts a stalled provider on timeout", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
-    const dbPath = join(dir, "graph-memory.db");
-    let observedSignal: AbortSignal | undefined;
-    const { context, listeners, cleanups } = adapterContext(async function* (opts: any) {
-      observedSignal = opts.signal;
-      await new Promise((_resolve, reject) => {
-        opts.signal.addEventListener("abort", () => reject(opts.signal.reason), { once: true });
-      });
-      if (false) yield undefined;
-    });
-    apply(context, {
-      dbPath,
-      extractionEnabled: true,
-      recallEnabled: false,
-      llmProvider: "test-provider",
-      llmModel: "test-model",
-      extractionDrain: { streamTimeoutMs: 20, maxRetries: 0, retryDelaysMs: [] },
-    });
-    await startAndEndTurn(listeners, {
-      id: "timeout-test", session: { events: [userMsg(0, "stall")] },
-    });
-
-    await waitFor(() => countState(dbPath, "quarantined") === 1);
-    expect(observedSignal).toBeInstanceOf(AbortSignal);
-    expect(observedSignal?.aborted).toBe(true);
-    await Promise.all(cleanups.map(cleanup => cleanup()));
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("requeues quarantined messages explicitly and learns them on a later healthy call", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
-    const dbPath = join(dir, "graph-memory.db");
-    let healthy = false;
-    const { context, listeners, cleanups, tools } = adapterContext(async function* () {
-      if (!healthy) throw new Error("provider unavailable");
-      yield { type: "text-delta", text: EMPTY_EXTRACTION };
-      yield { type: "finish", reason: { kind: "stop" } };
-    });
-    apply(context, {
-      dbPath,
-      extractionEnabled: true,
-      recallEnabled: false,
-      llmProvider: "test-provider",
-      llmModel: "test-model",
-      extractionDrain: { maxRetries: 0, retryDelaysMs: [] },
-    });
-    await startAndEndTurn(listeners, {
-      id: "retry-tool-test", session: { events: [userMsg(0, "remember me")] },
-    });
-    await waitFor(() => countState(dbPath, "quarantined") === 1);
-
-    healthy = true;
-    const result = await tools.get("gm_retry_extraction").execute({ sessionId: "retry-tool-test" });
-    expect(result).toContain("Requeued 1");
-    await waitFor(() => countState(dbPath, "succeeded") === 1);
-    expect(countState(dbPath, "quarantined")).toBe(0);
-    await Promise.all(cleanups.map(cleanup => cleanup()));
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("gracefully drains work scheduled immediately before host shutdown", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "gm-resilience-"));
+  it("fails closed when the model returns text instead of the extraction contract", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-text-extraction-"));
     const dbPath = join(dir, "graph-memory.db");
     const { context, listeners, cleanups } = adapterContext(async function* () {
-      await new Promise(resolve => setTimeout(resolve, 20));
       yield { type: "text-delta", text: EMPTY_EXTRACTION };
       yield { type: "finish", reason: { kind: "stop" } };
     });
@@ -564,19 +604,73 @@ describe("extraction drain resilience", () => {
       recallEnabled: false,
       llmProvider: "test-provider",
       llmModel: "test-model",
-      extractionDrain: { shutdownGraceMs: 1_000 },
     });
-    const agent = { id: "shutdown-test", session: { events: [userMsg(0, "last message")] } };
-    listeners.get("agent/session-start")![0]({ agent });
-    const ending = listeners.get("agent/turn-stopping")![0]({
-      agent,
-      signal: new AbortController().signal,
-    });
+    const session: any = { id: "text-contract-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "question"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
+    await waitFor(() => countState(dbPath, "quarantined") === 2);
 
     await Promise.all(cleanups.map(cleanup => cleanup()));
-    await ending;
-    expect(countState(dbPath, "succeeded")).toBe(1);
-    expect(countPending(dbPath)).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("uses the sole structured payload and ignores non-authoritative preamble text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-structured-preamble-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const { context, listeners, cleanups, logs } = adapterContext(async function* () {
+      yield { type: "text-delta", text: "Submitting the validated graph." };
+      yield structuredExtraction(EMPTY_EXTRACTION);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+    const session: any = { id: "structured-preamble-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "question"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+    expect(logs.some(message => message.includes("non-authoritative text"))).toBe(true);
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("fails closed when a structured tool-call omits a required field", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-incomplete-contract-"));
+    const dbPath = join(dir, "graph-memory.db");
+    const { context, listeners, cleanups } = adapterContext(async function* () {
+      yield structuredExtraction('{"nodes":[],"edges":[]}');
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "test-provider",
+      llmModel: "test-model",
+    });
+    const session: any = { id: "incomplete-contract-turn", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "question"),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [{ type: "text", text: "answer" }] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+    await listeners.get("session/event")![0](session, session.events[3]);
+    await waitFor(() => countState(dbPath, "quarantined") === 2);
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
 });

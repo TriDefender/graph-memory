@@ -4,26 +4,7 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  */
-/**
- * 社区检测 — Label Propagation Algorithm
- *
- * 原理：每个节点初始自成一个社区，迭代中每个节点采纳邻居中最频繁的社区标签。
- *       收敛后自然形成社区划分。
- *
- * 为什么选 Label Propagation 而不是 Louvain：
- *   - 实现简单（50 行核心逻辑）
- *   - 不需要外部库
- *   - 对小图（< 10000 节点）效果够好
- *   - O(iterations * edges)，几千节点 < 5ms
- *
- * 用途：
- *   - 发现知识域（Docker 相关技能自动聚成一组）
- *   - recall 时可以拉整个社区的节点
- *   - assemble 时同社区节点放一起，上下文更连贯
- *   - kg_stats 展示社区分布
- */
-import { createHash } from "node:crypto";
-import { getCommunitySummary, getCommunitySummaryBySignature, pruneCommunitySummaries, updateCommunities, upsertCommunitySummary, } from "../store/store.js";
+import { updateCommunities } from "../store/store.js";
 /**
  * 运行 Label Propagation 并写回 gm_nodes.community_id
  *
@@ -132,78 +113,4 @@ export function getCommunityPeers(db, nodeId, limit = 5) {
     ORDER BY validated_count DESC, updated_at DESC
     LIMIT ?
   `).all(row.community_id, nodeId, limit).map(r => r.id);
-}
-const COMMUNITY_SUMMARY_SYS = `你是知识图谱摘要引擎。根据节点列表，用简短的描述概括这组节点的主题领域。
-要求：
-- 只返回短语本身，不要解释
-- 描述涵盖的工具/技术/任务领域
-- 不要使用"社区"这个词`;
-function buildCommunityMemberSignature(memberIds) {
-    return createHash("sha1").update([...memberIds].sort().join(",")).digest("hex");
-}
-/**
- * 为所有社区生成 LLM 摘要描述 + embedding 向量
- *
- * 调用时机：runMaintenance → detectCommunities 之后
- */
-export async function summarizeCommunities(db, communities, llm, embedFn) {
-    let generated = 0;
-    for (const [communityId, memberIds] of communities) {
-        if (memberIds.length === 0)
-            continue;
-        const memberSignature = buildCommunityMemberSignature(memberIds);
-        const current = getCommunitySummary(db, communityId);
-        if (current?.memberSignature === memberSignature && current.summary.trim()) {
-            continue;
-        }
-        const reusable = getCommunitySummaryBySignature(db, memberSignature);
-        if (reusable?.summary.trim()) {
-            upsertCommunitySummary(db, communityId, reusable.summary, memberIds.length, reusable.embedding, memberSignature);
-            continue;
-        }
-        const placeholders = memberIds.map(() => "?").join(",");
-        const members = db.prepare(`
-      SELECT name, type, description FROM gm_nodes
-      WHERE id IN (${placeholders}) AND status='active'
-      ORDER BY validated_count DESC
-      LIMIT 10
-    `).all(...memberIds);
-        if (members.length === 0)
-            continue;
-        const memberText = members
-            .map((m) => `${m.type}:${m.name} — ${m.description}`)
-            .join("\n");
-        try {
-            // LLM 生成描述
-            const summary = await llm(COMMUNITY_SUMMARY_SYS, `社区成员：\n${memberText}`);
-            const cleaned = summary.trim()
-                .replace(/<think>[\s\S]*?<\/think>/gi, "") // 去掉思维链
-                .replace(/<think>[\s\S]*/gi, "") // 去掉未闭合的 <think>
-                .replace(/^["'「」]|["'「」]$/g, "")
-                .replace(/\n/g, " ")
-                .replace(/\s{2,}/g, " ")
-                .trim()
-                .slice(0, 100);
-            if (cleaned.length === 0)
-                continue;
-            // 生成社区 embedding（用描述 + 成员名拼接）
-            let embedding;
-            if (embedFn) {
-                try {
-                    const embedText = `${cleaned}\n${members.map((m) => m.name).join(", ")}`;
-                    embedding = await embedFn(embedText, "db");
-                }
-                catch { /* embedding is optional; keep the text summary */ }
-            }
-            upsertCommunitySummary(db, communityId, cleaned, memberIds.length, embedding, memberSignature);
-            generated++;
-        }
-        catch (err) {
-            console.log(`  [WARN] community summary failed for ${communityId}: ${err}`);
-        }
-    }
-    // Keep summaries from previous community ids available during the loop so
-    // an unchanged member set can reuse them. Remove obsolete ids afterwards.
-    pruneCommunitySummaries(db);
-    return generated;
 }

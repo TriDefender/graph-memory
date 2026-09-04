@@ -81,11 +81,143 @@ function migrate(db: DatabaseSyncInstance): void {
     m9_node_sources,
     m10_message_retention_index,
     m11_extraction_queue_state,
+    m12_extraction_turn_watermark,
+    m13_generic_navigation_edges,
+    m14_temporal_revisions,
   ];
   for (let i = cur; i < steps.length; i++) {
     steps[i](db);
     db.prepare("INSERT INTO _migrations (v,at) VALUES (?,?)").run(i + 1, Date.now());
   }
+}
+
+// ─── 时间语义与通用修订关系 ──────────────────────────────────
+
+function m14_temporal_revisions(db: DatabaseSyncInstance): void {
+  const nodeColumns = new Set(
+    (db.prepare("PRAGMA table_info(gm_nodes)").all() as Array<{ name: string }>).map(column => column.name),
+  );
+  if (!nodeColumns.has("temporal_json")) {
+    db.exec("ALTER TABLE gm_nodes ADD COLUMN temporal_json TEXT NOT NULL DEFAULT '{}'");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_node_revisions (
+      id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+      node_id                  TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      previous_description     TEXT NOT NULL,
+      previous_content         TEXT NOT NULL,
+      previous_temporal_json   TEXT NOT NULL DEFAULT '{}',
+      previous_validated_count INTEGER NOT NULL,
+      previous_source_refs     TEXT NOT NULL DEFAULT '[]',
+      replacement_session_id   TEXT NOT NULL,
+      replaced_at              INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_node_revisions_node
+      ON gm_node_revisions(node_id, replaced_at);
+  `);
+
+  const schema = String((db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='gm_edges'",
+  ).get() as { sql?: string } | undefined)?.sql ?? "");
+  if (schema.includes("'SUPERSEDES'")) return;
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE gm_edges_next (
+        id TEXT PRIMARY KEY,
+        from_id TEXT NOT NULL REFERENCES gm_nodes(id),
+        to_id TEXT NOT NULL REFERENCES gm_nodes(id),
+        type TEXT NOT NULL CHECK(type IN ('RELATES','SUPERSEDES','USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+        instruction TEXT NOT NULL,
+        condition TEXT,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO gm_edges_next
+        (id, from_id, to_id, type, instruction, condition, session_id, created_at)
+      SELECT id, from_id, to_id, type, instruction, condition, session_id, created_at FROM gm_edges;
+      DROP TABLE gm_edges;
+      ALTER TABLE gm_edges_next RENAME TO gm_edges;
+      CREATE INDEX ix_gm_edges_from ON gm_edges(from_id);
+      CREATE INDEX ix_gm_edges_to ON gm_edges(to_id);
+      COMMIT;
+    `);
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* no active transaction */ }
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+// ─── 通用导航关系：谓词存于 instruction，不绑定业务领域 ───────
+
+function m13_generic_navigation_edges(db: DatabaseSyncInstance): void {
+  const schema = String((db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='gm_edges'",
+  ).get() as { sql?: string } | undefined)?.sql ?? "");
+  if (!schema) {
+    db.exec(`
+      CREATE TABLE gm_edges (
+        id TEXT PRIMARY KEY,
+        from_id TEXT NOT NULL REFERENCES gm_nodes(id),
+        to_id TEXT NOT NULL REFERENCES gm_nodes(id),
+        type TEXT NOT NULL CHECK(type IN ('RELATES','USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+        instruction TEXT NOT NULL,
+        condition TEXT,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX ix_gm_edges_from ON gm_edges(from_id);
+      CREATE INDEX ix_gm_edges_to ON gm_edges(to_id);
+    `);
+    return;
+  }
+  if (schema.includes("'RELATES'")) return;
+
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE gm_edges_next (
+        id          TEXT PRIMARY KEY,
+        from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
+        to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
+        type        TEXT NOT NULL CHECK(type IN ('RELATES','USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+        instruction TEXT NOT NULL,
+        condition   TEXT,
+        session_id  TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+      );
+      INSERT INTO gm_edges_next
+        (id, from_id, to_id, type, instruction, condition, session_id, created_at)
+      SELECT id, from_id, to_id, type, instruction, condition, session_id, created_at
+      FROM gm_edges;
+      DROP TABLE gm_edges;
+      ALTER TABLE gm_edges_next RENAME TO gm_edges;
+      CREATE INDEX ix_gm_edges_from ON gm_edges(from_id);
+      CREATE INDEX ix_gm_edges_to ON gm_edges(to_id);
+      COMMIT;
+    `);
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* no active transaction */ }
+    throw error;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+// ─── 完整轮次水位：后台抽取不得读取仍在生成的当前轮 ─────────────
+
+function m12_extraction_turn_watermark(db: DatabaseSyncInstance): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS gm_extraction_sessions (
+      session_id      TEXT PRIMARY KEY,
+      completed_turn  INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+  `);
 }
 
 // ─── 可审计抽取队列：待处理 / 成功 / 隔离 ──────────────────────
@@ -155,6 +287,7 @@ function m1_core(db: DatabaseSyncInstance): void {
       name            TEXT NOT NULL,
       description     TEXT NOT NULL DEFAULT '',
       content         TEXT NOT NULL,
+      temporal_json   TEXT NOT NULL DEFAULT '{}',
       status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deprecated')),
       validated_count INTEGER NOT NULL DEFAULT 1,
       source_sessions TEXT NOT NULL DEFAULT '[]',
@@ -171,7 +304,7 @@ function m1_core(db: DatabaseSyncInstance): void {
       id          TEXT PRIMARY KEY,
       from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
       to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
-      type        TEXT NOT NULL CHECK(type IN ('USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+      type        TEXT NOT NULL CHECK(type IN ('RELATES','SUPERSEDES','USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
       instruction TEXT NOT NULL,
       condition   TEXT,
       session_id  TEXT NOT NULL,
@@ -179,6 +312,20 @@ function m1_core(db: DatabaseSyncInstance): void {
     );
     CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
     CREATE INDEX IF NOT EXISTS ix_gm_edges_to   ON gm_edges(to_id);
+
+    CREATE TABLE IF NOT EXISTS gm_node_revisions (
+      id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+      node_id                  TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      previous_description     TEXT NOT NULL,
+      previous_content         TEXT NOT NULL,
+      previous_temporal_json   TEXT NOT NULL DEFAULT '{}',
+      previous_validated_count INTEGER NOT NULL,
+      previous_source_refs     TEXT NOT NULL DEFAULT '[]',
+      replacement_session_id   TEXT NOT NULL,
+      replaced_at              INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ix_gm_node_revisions_node
+      ON gm_node_revisions(node_id, replaced_at);
   `);
 }
 

@@ -1,12 +1,11 @@
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.js";
-import { saveMessage, getUnextracted, markExtracted, upsertNode, upsertEdge, findByName, updateNode, getBySession, edgesFrom, edgesTo, deprecate, getStats, } from "./src/store/store.js";
+import { saveMessage, markMessagesExtracted, quarantineMessages, recordExtractionFailure, upsertNode, upsertEdge, findByName, updateNode, getBySession, deprecate, getStats, } from "./src/store/store.js";
 import { createCompleteFn } from "./src/engine/llm.js";
 import { createEmbedFn } from "./src/engine/embed.js";
 import { Recaller } from "./src/recaller/recall.js";
 import { Extractor } from "./src/extractor/extract.js";
 import { assembleContext } from "./src/format/assemble.js";
-import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.js";
 import { runMaintenance } from "./src/graph/maintenance.js";
 import { invalidateGraphCache, computeGlobalPageRank } from "./src/graph/pagerank.js";
 import { detectCommunities } from "./src/graph/community.js";
@@ -94,7 +93,7 @@ let activeEngine = null;
 const graphMemoryPlugin = {
     id: "graph-memory",
     name: "Graph Memory",
-    description: "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类+向量去重自动维护",
+    description: "知识图谱记忆引擎：从对话提取三元组，FTS5+图遍历+PageRank 跨对话召回，社区聚类维护",
     register(api) {
         // Some host builds have called register() repeatedly without disposing the
         // previous engine. Re-registering every hook/tool retains native SQLite
@@ -114,7 +113,7 @@ const graphMemoryPlugin = {
         const effectiveModel = cfg.llm?.model ?? model;
         if (!effectiveModel) {
             api.logger.warn("[graph-memory] No LLM model configured. Set agents.defaults.model in openclaw.json " +
-                "or config.llm.model in graph-memory plugin config — extraction and community summaries will fail.");
+                "or config.llm.model in graph-memory plugin config — extraction will fail.");
         }
         // ── 初始化核心模块 ──────────────────────────────────────
         const db = getDb(cfg.dbPath);
@@ -126,7 +125,7 @@ const graphMemoryPlugin = {
         const recaller = new Recaller(db, cfg);
         const extractor = new Extractor(cfg, llm);
         // ── 初始化 embedding ────────────────────────────────────
-        createEmbedFn(cfg.embedding)
+        const embeddingReady = createEmbedFn(cfg.embedding)
             .then((fn) => {
             if (fn) {
                 recaller.setEmbedFn(fn);
@@ -143,7 +142,7 @@ const graphMemoryPlugin = {
         const msgSeq = new Map();
         const recalled = new Map();
         const turnCounter = new Map(); // 社区维护计数器
-        const ingestedSinceTurn = new Map();
+        const ingestedRowsSinceTurn = new Map();
         // ── 提取串行化（同 session Promise chain，不同 session 并行）────
         const extractChain = new Map();
         /** 存一条消息到 gm_messages（同步，零 LLM） */
@@ -156,55 +155,79 @@ const graphMemoryPlugin = {
             }
             seq += 1;
             msgSeq.set(sessionId, seq);
-            saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
+            const id = saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
+            return { ...message, id, turn_index: seq, role: message.role ?? "unknown" };
         }
-        /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
-        async function runTurnExtract(sessionId, newMessages) {
-            if (!newMessages.length)
+        function extractionSources(candidate, messages) {
+            const cited = new Set(candidate.sourceTurns);
+            return messages
+                .filter(message => cited.has(Number(message.turn_index)))
+                .map(message => ({ messageId: String(message.id), turnIndex: Number(message.turn_index) }));
+        }
+        /** 每轮结束后只提取本轮的完整问答；失败隔离，不在下一轮隐式重试。 */
+        async function runTurnExtract(sessionId, turnRows) {
+            if (!turnRows.length)
                 return;
             // Promise chain：上一次提取完了才跑下一次，不会跳过
             const prev = extractChain.get(sessionId) ?? Promise.resolve();
             const next = prev.then(async () => {
+                const messageIds = turnRows.map(message => String(message.id));
                 try {
-                    const msgs = getUnextracted(db, sessionId, 50);
-                    if (!msgs.length)
-                        return;
                     const existing = getBySession(db, sessionId).map((n) => n.name);
+                    const sourcePairs = projectCompletedTurnPairs(turnRows);
+                    if (!sourcePairs.length) {
+                        markMessagesExtracted(db, messageIds);
+                        return;
+                    }
                     const result = await extractor.extract({
-                        messages: msgs,
+                        messages: sourcePairs,
                         existingNames: existing,
                     });
+                    // Resolve every declared endpoint before mutating the store. Missing
+                    // endpoints are a referential-integrity failure, never a silent drop.
+                    const emittedNames = new Set(result.nodes.map(node => node.name));
+                    for (const edge of result.edges) {
+                        const fromExists = emittedNames.has(edge.from) || Boolean(findByName(db, edge.from));
+                        const toExists = emittedNames.has(edge.to) || Boolean(findByName(db, edge.to));
+                        if (!fromExists || !toExists) {
+                            throw new Error(`[graph-memory] unresolved edge endpoint: ${edge.from} -> ${edge.to}`);
+                        }
+                    }
                     const nameToId = new Map();
                     for (const nc of result.nodes) {
-                        const { node } = upsertNode(db, {
-                            type: nc.type, name: nc.name,
-                            description: nc.description, content: nc.content,
-                        }, sessionId);
+                        const { node } = upsertNode(db, nc, sessionId, extractionSources(nc, sourcePairs));
                         nameToId.set(node.name, node.id);
                         recaller.syncEmbed(node).catch(() => { });
                     }
                     for (const ec of result.edges) {
                         const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
                         const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
-                        if (fromId && toId) {
-                            upsertEdge(db, {
-                                fromId, toId, type: ec.type,
-                                instruction: ec.instruction, condition: ec.condition, sessionId,
-                            });
-                        }
+                        if (!fromId || !toId)
+                            throw new Error(`[graph-memory] unresolved edge endpoint after node write: ${ec.from} -> ${ec.to}`);
+                        upsertEdge(db, {
+                            fromId, toId, type: ec.type,
+                            instruction: ec.instruction, condition: ec.condition, sessionId,
+                        });
+                        if (ec.type === "SUPERSEDES")
+                            deprecate(db, toId, "superseded");
                     }
-                    const maxTurn = Math.max(...msgs.map((m) => m.turn_index));
-                    markExtracted(db, sessionId, maxTurn);
+                    for (const item of result.invalidations) {
+                        const stale = findByName(db, item.name);
+                        if (stale)
+                            deprecate(db, stale.id, "historical");
+                    }
+                    markMessagesExtracted(db, messageIds);
                     if (result.nodes.length || result.edges.length) {
                         invalidateGraphCache();
-                        const nodeDetails = result.nodes.map((n) => `${n.type}:${n.name}`).join(", ");
-                        const edgeDetails = result.edges.map((e) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
-                        api.logger.info(`[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]`);
+                        api.logger.info(`[graph-memory] extracted ${result.nodes.length} nodes and ${result.edges.length} edges`);
                     }
                 }
                 catch (err) {
+                    const error = err instanceof Error ? err : new Error(String(err));
+                    recordExtractionFailure(db, messageIds, error.message, null);
+                    quarantineMessages(db, messageIds, error.message);
                     api.logger.error(`[graph-memory] turn extract failed: ${err}`);
-                    // 不 throw — 失败不阻塞 chain 中下一次提取
+                    // 失败不阻塞下一轮，但也不会被下一轮自动重试。
                 }
             });
             extractChain.set(sessionId, next);
@@ -220,7 +243,8 @@ const graphMemoryPlugin = {
                 if (prompt.includes("/new or /reset") || prompt.includes("new session was started"))
                     return;
                 const sid = ctx?.sessionId ?? ctx?.sessionKey;
-                api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
+                api.logger.info(`[graph-memory] recall query accepted (${prompt.length} characters)`);
+                await embeddingReady;
                 const res = await recaller.recall(prompt);
                 if (res.nodes.length) {
                     if (ctx?.sessionId)
@@ -248,16 +272,12 @@ const graphMemoryPlugin = {
             async ingest({ sessionId, message, isHeartbeat, }) {
                 if (isHeartbeat)
                     return { ingested: false };
-                ingestMessage(sessionId, message);
-                ingestedSinceTurn.set(sessionId, (ingestedSinceTurn.get(sessionId) ?? 0) + 1);
+                const rows = ingestedRowsSinceTurn.get(sessionId) ?? [];
+                rows.push(ingestMessage(sessionId, message));
+                ingestedRowsSinceTurn.set(sessionId, rows);
                 return { ingested: true };
             },
             async assemble({ sessionId, messages, tokenBudget, prompt, }) {
-                const activeNodes = getBySession(db, sessionId);
-                const activeEdges = activeNodes.flatMap((n) => [
-                    ...edgesFrom(db, n.id),
-                    ...edgesTo(db, n.id),
-                ]);
                 // OpenClaw 2026.03.28: use the prompt for a fresh, accurate recall
                 // at assembly time instead of relying solely on the pre-cached result
                 // from before_agent_start.
@@ -266,6 +286,7 @@ const graphMemoryPlugin = {
                     const cleaned = cleanPrompt(prompt);
                     if (cleaned) {
                         try {
+                            await embeddingReady;
                             const freshRec = await recaller.recall(cleaned);
                             if (freshRec.nodes.length) {
                                 rec = freshRec;
@@ -278,25 +299,21 @@ const graphMemoryPlugin = {
                         }
                     }
                 }
-                const totalGmNodes = activeNodes.length + rec.nodes.length;
-                if (totalGmNodes === 0) {
-                    return { messages: normalizeMessageContent(messages), estimatedTokens: 0 };
+                // ── 1. 近期问题 + 最终回答；工具/推理轨迹不回灌上下文 ──
+                const lastTurn = projectRecentTurns(messages, cfg.freshTurnCount);
+                if (rec.nodes.length === 0) {
+                    return { messages: normalizeMessageContent(lastTurn.messages), estimatedTokens: 0 };
                 }
-                // ── 1. 最后一轮完整对话 ─────────────────────────
-                const lastTurn = sliceLastTurn(messages);
-                const repaired = sanitizeToolUseResultPairing(lastTurn.messages);
                 // ── 2. 图谱 + 溯源 ─────────────────────────────
-                const { xml, systemPrompt, tokens: gmTokens, episodicXml, episodicTokens } = assembleContext(db, {
-                    tokenBudget: 0,
-                    activeNodes,
-                    activeEdges,
+                const { xml, systemPrompt, episodicXml } = assembleContext(db, {
                     recalledNodes: rec.nodes,
                     recalledEdges: rec.edges,
+                    freshTurnCount: cfg.freshTurnCount,
                 });
-                if (lastTurn.dropped > 0 || episodicTokens > 0) {
-                    api.logger.info(`[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
-                        `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
-                        (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""));
+                if (lastTurn.dropped > 0 || episodicXml) {
+                    api.logger.info(`[graph-memory] assemble: retained ${lastTurn.messages.length} projected messages, ` +
+                        `removed ${lastTurn.dropped} older/intermediate messages` +
+                        (episodicXml ? ", attached exact recalled evidence" : ""));
                 }
                 // ── 3. 组装 systemPrompt ────────────────────────
                 let systemPromptAddition;
@@ -305,56 +322,17 @@ const graphMemoryPlugin = {
                     systemPromptAddition = parts.join("\n\n");
                 }
                 return {
-                    messages: normalizeMessageContent(repaired),
-                    estimatedTokens: gmTokens + lastTurn.tokens,
+                    messages: normalizeMessageContent(lastTurn.messages),
+                    // The host/provider tokenizer owns token accounting. A character
+                    // divisor is especially inaccurate for CJK, JSON and tool payloads.
+                    estimatedTokens: 0,
                     ...(systemPromptAddition ? { systemPromptAddition } : {}),
                 };
             },
-            async compact({ sessionId, force, currentTokenCount, }) {
-                // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
-                const msgs = getUnextracted(db, sessionId, 50);
-                if (!msgs.length) {
-                    return { ok: true, compacted: false, reason: "no messages" };
-                }
-                try {
-                    const existing = getBySession(db, sessionId).map((n) => n.name);
-                    const result = await extractor.extract({
-                        messages: msgs,
-                        existingNames: existing,
-                    });
-                    const nameToId = new Map();
-                    for (const nc of result.nodes) {
-                        const { node } = upsertNode(db, {
-                            type: nc.type, name: nc.name,
-                            description: nc.description, content: nc.content,
-                        }, sessionId);
-                        nameToId.set(node.name, node.id);
-                        recaller.syncEmbed(node).catch(() => { });
-                    }
-                    for (const ec of result.edges) {
-                        const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-                        const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
-                        if (fromId && toId) {
-                            upsertEdge(db, {
-                                fromId, toId, type: ec.type,
-                                instruction: ec.instruction, condition: ec.condition, sessionId,
-                            });
-                        }
-                    }
-                    const maxTurn = Math.max(...msgs.map((m) => m.turn_index));
-                    markExtracted(db, sessionId, maxTurn);
-                    return {
-                        ok: true, compacted: true,
-                        result: {
-                            summary: `extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
-                            tokensBefore: currentTokenCount ?? 0,
-                        },
-                    };
-                }
-                catch (err) {
-                    api.logger.error(`[graph-memory] compact failed: ${err}`);
-                    return { ok: false, compacted: false, reason: String(err) };
-                }
+            async compact({ sessionId: _sessionId, }) {
+                // Context projection is performed by assemble(); extraction has one
+                // owner only: the serialized afterTurn queue.
+                return { ok: true, compacted: false, reason: "rolling projection is applied during assemble" };
             },
             async afterTurn({ sessionId, messages, prePromptMessageCount, isHeartbeat, }) {
                 if (isHeartbeat)
@@ -363,47 +341,32 @@ const graphMemoryPlugin = {
                 // phases. A few downstream builds incorrectly treat them as mutually
                 // exclusive. Backfill only the messages that ingest() did not deliver.
                 const newMessages = messages.slice(prePromptMessageCount ?? 0);
-                const ingestedCount = ingestedSinceTurn.get(sessionId) ?? 0;
-                const missingMessages = missingIngestMessages(newMessages, ingestedCount);
+                const turnRows = ingestedRowsSinceTurn.get(sessionId) ?? [];
+                const missingMessages = missingIngestMessages(newMessages, turnRows.length);
                 if (missingMessages.length > 0) {
                     for (const message of missingMessages) {
-                        ingestMessage(sessionId, message);
+                        turnRows.push(ingestMessage(sessionId, message));
                     }
                     api.logger.warn(`[graph-memory] afterTurn backfilled ${missingMessages.length} message(s) missing from ingest lifecycle`);
                 }
-                ingestedSinceTurn.delete(sessionId);
+                ingestedRowsSinceTurn.delete(sessionId);
                 const totalMsgs = msgSeq.get(sessionId) ?? 0;
-                api.logger.info(`[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`);
+                api.logger.info(`[graph-memory] afterTurn newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`);
                 // ★ 每轮直接提取
-                runTurnExtract(sessionId, newMessages).catch((err) => {
+                runTurnExtract(sessionId, turnRows).catch((err) => {
                     api.logger.error(`[graph-memory] turn extract failed: ${err}`);
                 });
                 // ★ 社区维护：每 N 轮触发一次（纯计算，<5ms）
                 const turns = (turnCounter.get(sessionId) ?? 0) + 1;
                 turnCounter.set(sessionId, turns);
-                const maintainInterval = cfg.compactTurnCount ?? 7;
+                const maintainInterval = cfg.compactTurnCount;
                 if (turns % maintainInterval === 0) {
                     try {
                         invalidateGraphCache();
                         const pr = computeGlobalPageRank(db, cfg);
                         const comm = detectCommunities(db);
                         api.logger.info(`[graph-memory] periodic maintenance (turn ${turns}): ` +
-                            `pagerank top=${pr.topK.slice(0, 3).map(n => n.name).join(",")}, ` +
-                            `communities=${comm.count}`);
-                        // 社区摘要：fire-and-forget（后台异步，不阻塞 afterTurn 返回）
-                        if (comm.communities.size > 0) {
-                            (async () => {
-                                try {
-                                    const { summarizeCommunities } = await import("./src/graph/community.js");
-                                    const embedFn = recaller.embed ?? undefined;
-                                    const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
-                                    api.logger.info(`[graph-memory] community summaries refreshed: ${summaries} summaries`);
-                                }
-                                catch (e) {
-                                    api.logger.error(`[graph-memory] community summary failed: ${e}`);
-                                }
-                            })();
-                        }
+                            `pagerank_candidates=${pr.topK.length}, communities=${comm.count}`);
                     }
                     catch (err) {
                         api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
@@ -425,14 +388,14 @@ const graphMemoryPlugin = {
                 msgSeq.clear();
                 recalled.clear();
                 turnCounter.clear();
-                ingestedSinceTurn.clear();
+                ingestedRowsSinceTurn.clear();
                 if (activeEngine === engine)
                     activeEngine = null;
             },
         };
         activeEngine = engine;
         api.registerContextEngine("graph-memory", () => engine);
-        // ── session_end：finalize + 图维护 ──────────────────────
+        // ── session_end：确定性的图维护（不再发起二次 LLM 语义改写） ──
         api.on("session_end", async (event, ctx) => {
             const sid = ctx?.sessionKey ??
                 ctx?.sessionId ??
@@ -441,43 +404,9 @@ const graphMemoryPlugin = {
             if (!sid)
                 return;
             try {
-                const nodes = getBySession(db, sid);
-                if (nodes.length) {
-                    const summary = db.prepare("SELECT name, type, validated_count, pagerank FROM gm_nodes WHERE status='active' ORDER BY pagerank DESC LIMIT 20").all()
-                        .map((n) => `${n.type}:${n.name}(v${n.validated_count},pr${n.pagerank.toFixed(3)})`)
-                        .join(", ");
-                    const fin = await extractor.finalize({
-                        sessionNodes: nodes,
-                        graphSummary: summary,
-                    });
-                    for (const nc of fin.promotedSkills) {
-                        if (nc.name && nc.content) {
-                            upsertNode(db, {
-                                type: "SKILL", name: nc.name,
-                                description: nc.description ?? "", content: nc.content,
-                            }, sid);
-                        }
-                    }
-                    for (const ec of fin.newEdges) {
-                        const fromId = findByName(db, ec.from)?.id;
-                        const toId = findByName(db, ec.to)?.id;
-                        if (fromId && toId) {
-                            upsertEdge(db, {
-                                fromId, toId, type: ec.type,
-                                instruction: ec.instruction, sessionId: sid,
-                            });
-                        }
-                    }
-                    for (const id of fin.invalidations)
-                        deprecate(db, id);
-                }
-                const embedFn = recaller.embed ?? undefined;
-                const result = await runMaintenance(db, cfg, llm, embedFn);
+                const result = await runMaintenance(db, cfg);
                 api.logger.info(`[graph-memory] maintenance: ${result.durationMs}ms, ` +
-                    `dedup=${result.dedup.merged}, ` +
-                    `communities=${result.community.count}, ` +
-                    `summaries=${result.communitySummaries}, ` +
-                    `top_pr=${result.pagerank.topK.slice(0, 3).map((n) => `${n.name}(${n.score.toFixed(3)})`).join(",")}`);
+                    `communities=${result.community.count}, pagerank_candidates=${result.pagerank.topK.length}`);
             }
             catch (err) {
                 api.logger.error(`[graph-memory] session_end error: ${err}`);
@@ -487,7 +416,7 @@ const graphMemoryPlugin = {
                 msgSeq.delete(sid);
                 recalled.delete(sid);
                 turnCounter.delete(sid);
-                ingestedSinceTurn.delete(sid);
+                ingestedRowsSinceTurn.delete(sid);
             }
         });
         // ── Agent Tools（改名 gm_*）──────────────────────────────
@@ -500,6 +429,7 @@ const graphMemoryPlugin = {
             }),
             async execute(_toolCallId, params) {
                 const { query } = params;
+                await embeddingReady;
                 const res = await recaller.recall(query);
                 if (!res.nodes.length) {
                     return {
@@ -507,7 +437,7 @@ const graphMemoryPlugin = {
                         details: { count: 0, query },
                     };
                 }
-                const lines = res.nodes.map((n) => `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content.slice(0, 400)}`);
+                const lines = res.nodes.map((n) => `[${n.type}] ${n.name} (pr:${n.pagerank.toFixed(3)})\n${n.description}\n${n.content}`);
                 const edgeLines = res.edges.map((e) => {
                     const from = res.nodes.find((n) => n.id === e.fromId)?.name ?? e.fromId;
                     const to = res.nodes.find((n) => n.id === e.toId)?.name ?? e.toId;
@@ -624,17 +554,12 @@ const graphMemoryPlugin = {
         api.registerTool((_ctx) => ({
             name: "gm_maintain",
             label: "Graph Memory Maintenance",
-            description: "手动触发图维护：运行去重、PageRank 重算、社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
+            description: "手动触发图维护：运行 PageRank 重算和社区检测。通常 session_end 时自动运行，这个工具用于手动触发。",
             parameters: Type.Object({}),
             async execute(_toolCallId, _params) {
-                const embedFn = recaller.embed ?? undefined;
-                const result = await runMaintenance(db, cfg, llm, embedFn);
+                const result = await runMaintenance(db, cfg);
                 const text = [
                     `图维护完成（${result.durationMs}ms）`,
-                    `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
-                    ...(result.dedup.pairs.length > 0
-                        ? result.dedup.pairs.slice(0, 5).map(p => `  "${p.nameA}" ≈ "${p.nameB}" (${(p.similarity * 100).toFixed(1)}%)`)
-                        : []),
                     `社区：${result.community.count} 个`,
                     `PageRank Top 5：`,
                     ...result.pagerank.topK.slice(0, 5).map((n, i) => `  ${i + 1}. ${n.name} (${n.score.toFixed(4)})`),
@@ -643,7 +568,6 @@ const graphMemoryPlugin = {
                     content: [{ type: "text", text }],
                     details: {
                         durationMs: result.durationMs,
-                        dedupMerged: result.dedup.merged,
                         communities: result.community.count,
                     },
                 };
@@ -653,13 +577,6 @@ const graphMemoryPlugin = {
     },
 };
 // ─── 取最近 N 轮用户交互（保留多步任务上下文） ──────────────
-function estimateMsgTokens(msg) {
-    const text = typeof msg.content === "string"
-        ? msg.content
-        : JSON.stringify(msg.content ?? "");
-    return Math.ceil(text.length / 3);
-}
-const KEEP_TURNS = 5; // 保留最近 5 轮用户交互
 /**
  * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
  */
@@ -704,73 +621,63 @@ function extractUserText(msg) {
     raw = raw.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
     return raw;
 }
-function sliceLastTurn(messages) {
+/**
+ * The extraction source is a completed conversational turn, not an agent
+ * transcript. Keep only the user's text and the final visible assistant text.
+ */
+function projectCompletedTurnPairs(messages) {
+    const question = messages.find(message => message?.role === "user");
+    const answer = [...messages].reverse().find(message => message?.role === "assistant");
+    if (!question || !answer)
+        return [];
+    const questionText = extractUserText(question);
+    const answerText = extractAssistantText(answer);
+    if (!questionText || !answerText)
+        return [];
+    return [
+        { ...question, content: questionText },
+        { ...answer, content: answerText },
+    ];
+}
+function projectRecentTurns(messages, freshTurnCount) {
     if (!messages.length) {
-        return { messages: [], tokens: 0, dropped: 0 };
+        return { messages: [], dropped: 0 };
     }
-    // ── 找到最近 N 个 user 消息的位置 ────────────────────
+    // Find the configured recent user turns. The host configuration, rather
+    // than a hidden literal, owns the retention policy.
     const userIndices = [];
     for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].role === "user") {
             userIndices.push(i);
-            if (userIndices.length >= KEEP_TURNS)
+            if (userIndices.length >= freshTurnCount)
                 break;
         }
     }
     if (!userIndices.length) {
-        return { messages: [], tokens: 0, dropped: messages.length };
+        return { messages: [], dropped: messages.length };
     }
-    // userIndices 是倒序的：[最新user, ..., 最早user]
-    // 最后一轮的 user 位置
-    const lastTurnUserIdx = userIndices[0];
-    // ── 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果）──
-    let lastTurnMsgs = messages.slice(lastTurnUserIdx);
-    const lastTurnTotal = lastTurnMsgs.length;
-    // 截断超长 tool_result
-    const TOOL_MAX = 6000;
-    lastTurnMsgs = lastTurnMsgs.map((msg) => {
-        if (msg.role !== "tool" && msg.role !== "toolResult")
-            return msg;
-        if (typeof msg.content !== "string")
-            return msg;
-        if (msg.content.length <= TOOL_MAX)
-            return msg;
-        const head = Math.floor(TOOL_MAX * 0.6);
-        const tail = Math.floor(TOOL_MAX * 0.3);
-        return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
-    });
-    // ── 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）──
-    const prevTurnMsgs = [];
-    let prevOriginalCount = 0;
-    if (userIndices.length > 1) {
-        // 从最早的 user 到最后一轮 user 之前
-        const earliestIdx = userIndices[userIndices.length - 1];
-        prevOriginalCount = lastTurnUserIdx - earliestIdx;
-        for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
-            const msg = messages[i];
-            if (!msg)
+    // A turn's durable context surface is exactly the user question and the
+    // final visible assistant answer. Tool payloads and chain-of-thought are
+    // not re-injected or truncated; retained facts are available through recall.
+    const selectedUsers = userIndices.reverse();
+    const kept = [];
+    for (let turn = 0; turn < selectedUsers.length; turn++) {
+        const start = selectedUsers[turn];
+        const end = selectedUsers[turn + 1] ?? messages.length;
+        const question = extractUserText(messages[start]);
+        if (question)
+            kept.push({ role: "user", content: question });
+        for (let i = end - 1; i > start; i--) {
+            if (messages[i]?.role !== "assistant")
                 continue;
-            if (msg.role === "user") {
-                const text = extractUserText(msg);
-                if (text) {
-                    prevTurnMsgs.push({ role: "user", content: text });
-                }
+            const answer = extractAssistantText(messages[i]);
+            if (answer) {
+                kept.push({ role: "assistant", content: answer });
+                break;
             }
-            else if (msg.role === "assistant") {
-                const text = extractAssistantText(msg);
-                if (text) {
-                    prevTurnMsgs.push({ role: "assistant", content: text });
-                }
-            }
-            // toolResult / tool_use / thinking 等全部跳过
         }
     }
-    // ── 合并：前 N-1 轮摘要 + 最后 1 轮完整 ────────────────
-    const kept = [...prevTurnMsgs, ...lastTurnMsgs];
     const dropped = messages.length - kept.length;
-    let tokens = 0;
-    for (const msg of kept)
-        tokens += estimateMsgTokens(msg);
-    return { messages: kept, tokens, dropped };
+    return { messages: kept, dropped };
 }
 export default graphMemoryPlugin;

@@ -84,7 +84,7 @@ window.__ModuleLoader__.load({
     function parseEdge(value, subject) {
       const edge = exact(value, ["id", "fromId", "toId", "type", "instruction", "condition", "createdAt"], subject);
       const type = string(edge.type, `${subject}.type`);
-      if (!["USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"].includes(type)) invalid(`${subject}.type`);
+      if (!["RELATES", "USED_SKILL", "SOLVED_BY", "REQUIRES", "PATCHES", "CONFLICTS_WITH"].includes(type)) invalid(`${subject}.type`);
       const parsed = {
         id: string(edge.id, `${subject}.id`),
         fromId: string(edge.fromId, `${subject}.fromId`),

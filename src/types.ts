@@ -17,12 +17,23 @@
 export type NodeType = "TASK" | "SKILL" | "EVENT";
 export type NodeStatus = "active" | "deprecated";
 
+export interface NodeTemporal {
+  /** Time stated by the evidence, preserved as written instead of guessed. */
+  eventTime?: string;
+  /** When the fact or decision starts to apply, if the dialogue says so. */
+  validFrom?: string;
+  /** When it stops applying, if known. */
+  validUntil?: string;
+  state?: "current" | "historical" | "uncertain" | "superseded";
+}
+
 export interface GmNode {
   id: string;
   type: NodeType;
   name: string;
   description: string;
   content: string;
+  temporal: NodeTemporal;
   status: NodeStatus;
   validatedCount: number;
   sourceSessions: string[];
@@ -35,6 +46,8 @@ export interface GmNode {
 // ─── 边 ───────────────────────────────────────────────────────
 
 export type EdgeType =
+  | "RELATES"
+  | "SUPERSEDES"
   | "USED_SKILL"
   | "SOLVED_BY"
   | "REQUIRES"
@@ -52,22 +65,6 @@ export interface GmEdge {
   createdAt: number;
 }
 
-// ─── 信号 ─────────────────────────────────────────────────────
-
-export type SignalType =
-  | "tool_error"
-  | "tool_success"
-  | "skill_invoked"
-  | "user_correction"
-  | "explicit_record"
-  | "task_completed";
-
-export interface Signal {
-  type: SignalType;
-  turnIndex: number;
-  data: Record<string, any>;
-}
-
 // ─── 提取结果 ─────────────────────────────────────────────────
 
 export interface ExtractionResult {
@@ -76,8 +73,12 @@ export interface ExtractionResult {
     name: string;
     description: string;
     content: string;
+    /** How this observation changes a same-named concept already in memory. */
+    operation: "create" | "confirm" | "revise";
+    /** Evidence-backed temporal meaning; absent fields must not be invented. */
+    temporal: NodeTemporal;
     /** Source message turn/event indices cited by the extractor. */
-    sourceTurns?: number[];
+    sourceTurns: number[];
   }>;
   edges: Array<{
     from: string;
@@ -86,22 +87,7 @@ export interface ExtractionResult {
     instruction: string;
     condition?: string;
   }>;
-}
-
-export interface FinalizeResult {
-  promotedSkills: Array<{
-    type: "SKILL";
-    name: string;
-    description: string;
-    content: string;
-  }>;
-  newEdges: Array<{
-    from: string;
-    to: string;
-    type: EdgeType;
-    instruction: string;
-  }>;
-  invalidations: string[];
+  invalidations: Array<{ name: string; reason: string }>;
 }
 
 // ─── 召回结果 ─────────────────────────────────────────────────
@@ -109,7 +95,6 @@ export interface FinalizeResult {
 export interface RecallResult {
   nodes: GmNode[];
   edges: GmEdge[];
-  tokenEstimate: number;
 }
 
 // ─── Embedding 配置 ──────────────────────────────────────────
@@ -130,9 +115,12 @@ export interface EmbeddingConfig {
 export interface GmConfig {
   dbPath: string;
   compactTurnCount: number;
+  /** Maximum query-matched memory nodes returned by one recall. */
   recallMaxNodes: number;
-  recallMaxDepth: number;
-  freshTailCount: number;
+  /** Optional provider-calibrated cosine floor. Unset means ranked top-k only. */
+  semanticScoreThreshold?: number;
+  /** Number of recent user turns kept verbatim on the host context surface. */
+  freshTurnCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
     apiKey?: string;
@@ -140,9 +128,9 @@ export interface GmConfig {
     /** Alias used by OpenClaw and several OpenAI-compatible providers. */
     baseUrl?: string;
     model?: string;
+    /** Required only for direct Anthropic REST calls, whose protocol requires a response cap. */
+    maxTokens?: number;
   };
-  /** 向量去重阈值，余弦相似度超过此值视为重复 (0-1) */
-  dedupThreshold: number;
   /** PageRank 阻尼系数 */
   pagerankDamping: number;
   /** PageRank 迭代次数 */
@@ -153,9 +141,7 @@ export const DEFAULT_CONFIG: GmConfig = {
   dbPath: "~/.openclaw/graph-memory.db",
   compactTurnCount: 6,
   recallMaxNodes: 6,
-  recallMaxDepth: 2,
-  freshTailCount: 10,
-  dedupThreshold: 0.90,
+  freshTurnCount: 5,
   pagerankDamping: 0.85,
   pagerankIterations: 20,
 };

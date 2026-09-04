@@ -47,6 +47,16 @@ describe("database migrations", () => {
         community_id TEXT,
         status TEXT NOT NULL
       );
+      CREATE TABLE gm_edges (
+        id TEXT PRIMARY KEY,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+        instruction TEXT NOT NULL,
+        condition TEXT,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
       CREATE TABLE gm_communities (
         id TEXT PRIMARY KEY,
         summary TEXT NOT NULL,
@@ -67,6 +77,9 @@ describe("database migrations", () => {
       INSERT INTO gm_nodes (id, community_id, status) VALUES
         ('n2', 'c1', 'active'),
         ('n1', 'c1', 'active');
+      INSERT INTO gm_edges
+        (id, from_id, to_id, type, instruction, condition, session_id, created_at)
+        VALUES ('e1', 'n1', 'n2', 'USED_SKILL', 'legacy edge', NULL, 's1', 1);
       INSERT INTO gm_communities
         (id, summary, node_count, embedding, created_at, updated_at)
         VALUES ('c1', 'legacy summary', 2, NULL, 1, 1);
@@ -89,7 +102,7 @@ describe("database migrations", () => {
     expect(row.member_signature).toMatch(/^[a-f0-9]{40}$/);
     expect(
       (upgraded.prepare("SELECT MAX(v) AS version FROM _migrations").get() as any).version,
-    ).toBe(11);
+    ).toBe(14);
     const sourceColumns = upgraded.prepare("PRAGMA table_info(gm_node_sources)").all() as Array<{ name: string }>;
     expect(sourceColumns.map((column) => column.name)).toEqual([
       "node_id", "session_id", "message_id", "turn_index",
@@ -99,6 +112,12 @@ describe("database migrations", () => {
     expect(messageIndexes.some((index) => index.name === "ix_gm_msg_extraction_queue")).toBe(true);
     const messageColumns = upgraded.prepare("PRAGMA table_info(gm_messages)").all() as Array<{ name: string }>;
     expect(messageColumns.map(column => column.name)).toContain("extraction_state");
+    const extractionSessionColumns = upgraded.prepare(
+      "PRAGMA table_info(gm_extraction_sessions)",
+    ).all() as Array<{ name: string }>;
+    expect(extractionSessionColumns.map(column => column.name)).toEqual([
+      "session_id", "completed_turn", "updated_at",
+    ]);
     const queueRows = upgraded.prepare(
       "SELECT id, extraction_state FROM gm_messages ORDER BY id",
     ).all() as Array<{ id: string; extraction_state: string }>;
@@ -106,5 +125,17 @@ describe("database migrations", () => {
       { id: "done", extraction_state: "succeeded" },
       { id: "todo", extraction_state: "pending" },
     ]);
+    expect((upgraded.prepare("SELECT type FROM gm_edges WHERE id='e1'").get() as any).type).toBe("USED_SKILL");
+    upgraded.prepare(`INSERT INTO gm_edges
+      (id, from_id, to_id, type, instruction, condition, session_id, created_at)
+      VALUES ('e2', 'n1', 'n2', 'RELATES', 'generic predicate', NULL, 's1', 2)`).run();
+    upgraded.prepare(`INSERT INTO gm_edges
+      (id, from_id, to_id, type, instruction, condition, session_id, created_at)
+      VALUES ('e3', 'n2', 'n1', 'SUPERSEDES', 'newer evidence', NULL, 's1', 3)`).run();
+    const nodeColumns = upgraded.prepare("PRAGMA table_info(gm_nodes)").all() as Array<{ name: string }>;
+    expect(nodeColumns.map(column => column.name)).toContain("temporal_json");
+    expect((upgraded.prepare(
+      "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='gm_node_revisions'",
+    ).get() as any).count).toBe(1);
   });
 });

@@ -1,0 +1,25 @@
+{
+  "id": "release-orchestrator-continuous-development-v1",
+  "turns": [
+    {"id":"T01","prompt":"Read README.md, package.json, src/orchestrator.js, src/index.js, and test/orchestrator.test.js, then run npm test. Do not modify files. Summarize the module, public API, test entry, and constraints: zero runtime dependencies, ESM, and tested behavior."},
+    {"id":"T02","prompt":"Add normalized config for project, owner, port, and rollbackMinutes. Defaults: project=ORBIT-21, owner=Lin, port=43127, rollbackMinutes=42. Add tests and run them."},
+    {"id":"T03","prompt":"Add only project validation: it must be a non-empty string or throw code=INVALID_PROJECT. Add two small tests and run them."},
+    {"id":"T04","prompt":"Add only owner validation: it must be a non-empty string or throw code=INVALID_OWNER. Add tests and run them."},
+    {"id":"T05","prompt":"Add only port validation: it must be an integer from 1 to 65535 or throw code=INVALID_PORT. Add tests and run them."},
+    {"id":"T06","prompt":"Add only rollbackMinutes validation: it must be a positive integer or throw code=INVALID_ROLLBACK. Add tests and run them."},
+    {"id":"T07","prompt":"Make addService accept a dependencies array and store a copy. Missing dependencies throw code=MISSING_DEPENDENCY. Add tests and run them."},
+    {"id":"T08","prompt":"Add topologicalOrder() for acyclic services, returning dependency-first order. Add a three-service test and run it."},
+    {"id":"T09","prompt":"Add cycle detection to topologicalOrder(); cycles throw code=DEPENDENCY_CYCLE. Add tests and run them."},
+    {"id":"T10","prompt":"Add buildPlan(): return serviceId, ordinal, project, and port in topological order without mutating services. Add tests and run them."},
+    {"id":"T11","prompt":"Change the current owner to Tang and port to 43129; Lin and 43127 become revoked values. Add updateConfig() with before/after audit records. Tests must prove current state no longer returns old values."},
+    {"id":"T12","prompt":"Add exportState() returning schemaVersion=1, current config, services, and revoked values as a deep copy. Add tests and run them."},
+    {"id":"T13","prompt":"Implement incident I-72: diagnoseFailure(error) recommends exactly gm repair --scope recall --dry-run when adapter latencyMs exceeds 900. Return incident, thresholdMs, command, and batch=B-2048. Add tests and run them."},
+    {"id":"T14","prompt":"Add getAuditLog() with increasing sequence and type for addService and updateConfig. Return a deep copy. Add tests and run them."},
+    {"id":"T15","prompt":"Add dryRun() returning plan, config, and warnings. With no services, warnings includes EMPTY_PLAN. It must not change state. Add tests and run them."},
+    {"id":"T16","prompt":"Add execute(adapter), calling adapter.release(step) in build-plan order. Normalize failures to code=RELEASE_FAILED. Use a fake adapter; add tests and run them."},
+    {"id":"T17","prompt":"Add retryLimit=1 to execute: retry once after the first failure and record attempts. Add no real delay. Add tests and run them."},
+    {"id":"T18","prompt":"Add and export redactSecrets(value), recursively masking key, token, secret, and password fields. Add tests and run them."},
+    {"id":"T19","prompt":"Change rollbackMinutes from 42 to 36; 42 becomes revoked. Update current config, snapshots, dryRun, and audit tests so current config never returns 42. Run all tests."},
+    {"id":"T20","prompt":"Run syntax checks and all tests, fix failures, update README API examples, and generate release-report.json from the repository state. It must include project=ORBIT-21, owner=Tang, port=43129, rollbackMinutes=36, incident=I-72, batch=B-2048, command, testSummary, and revoked=[Lin,43127,42]."}
+  ]
+}

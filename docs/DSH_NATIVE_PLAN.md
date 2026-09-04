@@ -1,7 +1,7 @@
 # Graph Memory × DeepSeek Harness 原生架构与 Pro 路线图
 
-> 更新：2026-08-30
-> Community 状态：`1.6.0-beta.10` 已完成 DSH 原生加载、滚动上下文接管、无安装脚本分发、可选原始消息保留策略与真实跨项目召回验证
+> 更新：2026-09-04
+> Community 状态：`1.6.0-beta.12` 已完成 DSH 原生加载、无模型滚动上下文接管、查询优先召回、无安装脚本分发与真实跨会话验证
 > Pro 状态：SQLite GraphSnapshot、DSH Host、Typed Remote 与只读 Client 已实现；2D/3D、分屏和拖拽尚未实现
 
 ## 1. 结论
@@ -48,8 +48,8 @@ graph-memory/
 ├── cordis.patch.yml       # DSH bundle patch
 └── src/
     ├── extractor/         # structured extraction
-    ├── recaller/          # vector/FTS recall and graph expansion
-    ├── graph/             # PageRank, PPR, communities, dedup
+    ├── recaller/          # query-first vector/FTS recall
+    ├── graph/             # PageRank and communities (offline maintenance)
     ├── store/             # SQLite schema and queries
     ├── format/            # safe prompt assembly
     └── engine/            # LLM and embedding providers
@@ -61,30 +61,30 @@ graph-memory/
 
 ### 写入链路
 
-1. `session/event` 接收最终 user、assistant 和 tool result 事件。
-2. 只保存不可变的 append 原事件；派生的 surface replacement 不重复入库。幂等键采用 `dsh:<sessionId>:<event.seq>`，resume/HMR 回放不会重复记录。
-3. `turn/end` 串行调度该会话的结构化抽取。
-4. 节点与边写入 SQLite，随后生成 embedding。
-5. 抽取失败时消息仍为 pending，后续可以重试，不伪装成功。
+1. `turn/end` 从 DSH 不可变事件日志确定性投影该轮真实用户问题与最终可见回答。
+2. reasoning、工具调用和工具结果不进入 `gm_messages`；派生的 surface replacement 也不重复入库。
+3. 稳定事件 ID 采用 `dsh:<sessionId>:<event.seq>`，resume/HMR 回放不会重复记录。
+4. 每个完成轮次串行产生一次结构化抽取；节点与边通过合同校验后写入 SQLite，再异步生成 embedding。
+5. 抽取失败时该轮来源消息进入 `quarantined`，不修补、不写坏图；只有显式 `gm_retry_extraction` 才重新入队。
 
 ### 上下文接管链路
 
 1. `freshTurnCount` 只统计来源为真实用户的 `user/message`，默认保留最近 5 轮。
-2. `agent/pre-step` 选择更早的完整 surface 前缀，不拆开工具调用/结果边界。
-3. 插件从 agent 作用域取得 DSH 公共 `compaction` 服务并调用 `compactRegion`；不修改 DSH 源码。
-4. DSH 原子写入 summary 与 replacement，原始事件仍在 durable log 中。
-5. Graph Memory 把 summary 记录为稳定的 Session Capsule，并关联 `shadowedSeqs` 对应的精确原消息。
-6. 当前 Session 不再自动重复注入自身图节点；跨 Session 召回受独立 token 预算约束。
+2. `turn/end` 使用 DSH 公共 surface replace / prune 协议，把已完成轮次的中间工具轨迹替换为固定 marker；问题和最终回答仍可见。
+3. `agent/pre-step` 选择更早的完整 surface 前缀，保留最近 N 个已完成用户轮次，并用另一个固定 archive marker 替换旧前缀。
+4. `tokenMeter` 为被替换事件提供 shadow price；插件不调用 DSH compaction 模型，也不生成滚动摘要。
+5. 原始事件始终留在 DSH durable log；Graph Memory 的节点来源绑定精确原始问答。
+6. 当前 Session 已归档记忆和跨 Session 记忆走同一查询路径；只过滤仍在近期窗口中原样可见的来源，避免重复注入。
 
 ### 召回链路
 
 1. `agent/inbox/claimed` 取得当前用户问题。
-2. 向量精确路径与社区泛化路径召回候选节点。
+2. 向量按当前问题排序候选节点；embedding 未配置或失败时使用 FTS5。
 3. FTS5 在 embedding 未配置或失败时兜底。
-4. 局部图遍历与 PPR 排序后限制节点数和深度。
-5. `system-prompt/assemble` 注入带来源的历史参考。
+4. 查询阶段保留直接语义顺序，只返回 Top-K 节点以及这些节点之间已经存在的边；PageRank 和社区不参与在线重排。
+5. `agent/pre-step` 在当前用户指令之前注入图导航与去重后的精确来源问答。
 
-Graph Memory 负责“何时压、保留几轮、压缩结果如何进入长期图记忆”；DSH CompactionEngine 负责安全的摘要生成、工具配对校验和 surface replacement 事务。两者是策略层与宿主执行层的组合，不是互不相干的两套系统。
+Graph Memory 负责“保留几轮、哪些历史离开模型表面、当前问题召回什么”；DSH 提供不可变事件日志、surface replacement 与 token-meter 协议。接管是确定性的插件操作，不依赖第二个摘要模型，也不修改 DSH 核心源码。
 
 ### 持久消息保留链路
 
@@ -122,11 +122,12 @@ embedding:
 | 跨会话语义召回 | 不同措辞、无显式 `gm_search` 仍命中 |
 | 重启持久化 | 通过 |
 | 无 embedding 降级 | FTS5，通过 |
-| 单元/迁移/组合测试 | 139/139（含滚动压缩、溯源、消息保留、预算、高精度召回和 Pro Lite） |
+| 单元/迁移/组合测试 | 123/123，20 个测试文件（含上下文接管、溯源、消息保留、查询优先召回和 Pro Lite） |
 | TypeScript build | 通过 |
-| 真实模型滚动压缩 | DSH rc.8 上通过；第 6 个真实用户轮次触发最旧完整前缀替换 |
+| 真实模型上下文接管 | GLM-5.2 的 20 轮运行通过；T07 起归档旧前缀，T20 首请求 171 条消息降至 24 条 |
 | 真实跨项目召回 | 新项目不调用 `gm_search`，自动召回并准确回答 |
 | 真实向量写入 | `text-embedding-v4`，1024 dimensions |
+| 最新 DSH 冷安装 | 官方 `0.1.3-alpha.1` / `d347e70390`：全新 profile tarball add、dump-config 和 web boot 通过 |
 
 证据截图位于 `docs/images/dsh/`。
 
@@ -202,7 +203,7 @@ interface GraphStore {
 
 | 阶段 | 目标 | 当前进度 | 完成标准 |
 |---|---|---:|---|
-| 第一步：Community 原生插件 | 可安装、可显示、跨会话记录/召回、向量检索、OpenClaw 保留 | 约 85%，beta 闭环完成 | 自动抽取 P0 修复、发布包/安装/卸载 E2E、文档与版本发布 |
+| 第一步：Community 原生插件 | 可安装、可显示、上下文接管、跨会话记录/召回、向量检索、OpenClaw 保留 | `1.6.0-beta.12` 发布候选已完成 | 多 profile 的 update/remove 矩阵与更多模型反馈 |
 | 第二步：Pro Lite 客户端 | SQLite 图快照、2D 图谱、分屏、受控拖拽、Skill/MCP 索引 | Host、Typed Remote、只读卡片 Client 已完成；2D/分屏/拖拽未开始 | 不改 DSH core；1 万节点交互性能达标；完整权限与审计 |
 | 第三步：Pro 完整版 | 3D renderer、可选 Neo4j/GDS、迁移与大图能力 | 待开始 | SQLite/Neo4j 同契约；凭据零下发；多平台安装与回滚通过 |
 
@@ -210,11 +211,11 @@ interface GraphStore {
 
 ### P0：发布前
 
-- 给自动抽取增加确定性 JSON 修复、失败计数与 `gm_status` 诊断。
-- 增加 DSH adapter mock 测试：credential missing/rotation、回填、dispose、并发 Session。
-- 验证 `plugin add`、update、remove、重装和 tarball 内容。
-- 增加 secret scan 与数据库/日志排除检查。
-- 发布 `1.6.0-beta.9`，收集不同 DSH profile 的兼容反馈。
+- 保持结构化抽取只做字段合同校验；模型未按合同调用工具时明确失败并隔离，不猜测、不补边、不修补后入库。
+- DSH adapter 回归覆盖 credential missing/rotation、回填、dispose、并发 Session 与首次召回等待 embedding 初始化。
+- 全新 profile 的 tarball `plugin add`、`--dump-config` 与打包内容已验证；继续补齐多 profile update/remove 矩阵。
+- secret scan、数据库/日志排除和无会话内容诊断已完成。
+- 发布 `1.6.0-beta.12`，收集不同 DSH profile 与模型的兼容反馈。
 
 ### P1：Community 稳定版
 
@@ -233,4 +234,4 @@ interface GraphStore {
 
 ## 11. 发布决策
 
-当前不建议继续沿用含义混乱的 `v2.0` 标签。`1.6.0-beta.9` 在 DSH 上下文接管基础上补齐了无安装脚本分发：滚动上下文、长期图记忆、高精度跨项目召回与 Pro Lite 已组合，并已完成真实模型闭环；多 profile 安装矩阵仍需继续验证。README、截图和视频必须始终区分自动化组合测试、真实宿主加载和真实模型结果。
+当前不建议继续沿用含义混乱的 `v2.0` 标签。`1.6.0-beta.12` 将无模型滚动上下文、完成轮次 Q/A 投影、长期图记忆、查询优先召回与 Pro Lite 组合，并完成真实 20 轮模型闭环和全新 DSH profile tarball 安装验证；多 profile 安装矩阵仍需继续验证。README、截图和视频必须始终区分自动化组合测试、真实宿主加载和真实模型结果。

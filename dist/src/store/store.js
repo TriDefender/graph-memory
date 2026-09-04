@@ -13,6 +13,7 @@ function toNode(r) {
     return {
         id: r.id, type: r.type, name: r.name,
         description: r.description ?? "", content: r.content,
+        temporal: JSON.parse(r.temporal_json ?? "{}"),
         status: r.status, validatedCount: r.validated_count,
         sourceSessions: JSON.parse(r.source_sessions ?? "[]"),
         communityId: r.community_id ?? null,
@@ -55,20 +56,47 @@ export function upsertNode(db, c, sessionId, sources = []) {
     const ex = findByName(db, name);
     if (ex) {
         const sessions = JSON.stringify(Array.from(new Set([...ex.sourceSessions, sessionId])));
-        const content = c.content.length > ex.content.length ? c.content : ex.content;
-        const desc = c.description.length > ex.description.length ? c.description : ex.description;
-        const count = ex.validatedCount + 1;
-        db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
+        // The extractor owns the claim operation.  Content length is not evidence
+        // of correctness, so the store must never use it to choose a version.
+        // Only an explicit confirmation preserves the current claim; create and
+        // revise both publish the model's current structured claim as a revision.
+        const replace = c.operation !== "confirm";
+        const content = replace ? c.content : ex.content;
+        const desc = replace ? c.description : ex.description;
+        const temporal = replace
+            ? (c.temporal ?? {})
+            : c.temporal && Object.keys(c.temporal).length
+                ? c.temporal
+                : ex.temporal;
+        // A correction is a new claim version, not another validation of the old
+        // claim. Confirmation alone increases confidence.
+        const count = replace ? 1 : ex.validatedCount + 1;
+        if (replace) {
+            const previousSourceRefs = db.prepare(`
+        SELECT session_id, message_id, turn_index
+        FROM gm_node_sources WHERE node_id=?
+        ORDER BY turn_index, message_id
+      `).all(ex.id);
+            db.prepare(`INSERT INTO gm_node_revisions
+        (node_id, previous_description, previous_content, previous_temporal_json,
+         previous_validated_count, previous_source_refs, replacement_session_id, replaced_at)
+        VALUES (?,?,?,?,?,?,?,?)`)
+                .run(ex.id, ex.description, ex.content, JSON.stringify(ex.temporal), ex.validatedCount, JSON.stringify(previousSourceRefs), sessionId, Date.now());
+            // The active node must cite only evidence for its current claim. Older
+            // provenance remains auditable in gm_node_revisions.
+            db.prepare("DELETE FROM gm_node_sources WHERE node_id=?").run(ex.id);
+        }
+        db.prepare(`UPDATE gm_nodes SET content=?, description=?, temporal_json=?, status='active', validated_count=?,
       source_sessions=?, updated_at=? WHERE id=?`)
-            .run(content, desc, count, sessions, Date.now(), ex.id);
+            .run(content, desc, JSON.stringify(temporal), count, sessions, Date.now(), ex.id);
         saveNodeSources(db, ex.id, sessionId, sources);
-        return { node: { ...ex, content, description: desc, validatedCount: count }, isNew: false };
+        return { node: { ...ex, content, description: desc, temporal, status: "active", validatedCount: count }, isNew: false };
     }
     const id = uid("n");
     db.prepare(`INSERT INTO gm_nodes
-    (id, type, name, description, content, status, validated_count, source_sessions, created_at, updated_at)
-    VALUES (?,?,?,?,?,'active',1,?,?,?)`)
-        .run(id, c.type, name, c.description, c.content, JSON.stringify([sessionId]), Date.now(), Date.now());
+    (id, type, name, description, content, temporal_json, status, validated_count, source_sessions, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,'active',1,?,?,?)`)
+        .run(id, c.type, name, c.description, c.content, JSON.stringify(c.temporal ?? {}), JSON.stringify([sessionId]), Date.now(), Date.now());
     const node = findByName(db, name);
     saveNodeSources(db, node.id, sessionId, sources);
     return { node, isNew: true };
@@ -83,6 +111,23 @@ export function saveNodeSources(db, nodeId, sessionId, sources) {
         insert.run(nodeId, sessionId, source.messageId);
     }
 }
+/** Read exact provenance refs without loading or truncating message content. */
+export function getNodeSources(db, nodeIds) {
+    if (!nodeIds.length)
+        return [];
+    const placeholders = nodeIds.map(() => "?").join(",");
+    return db.prepare(`
+    SELECT node_id, session_id, message_id, turn_index
+    FROM gm_node_sources
+    WHERE node_id IN (${placeholders})
+    ORDER BY node_id, turn_index, message_id
+  `).all(...nodeIds).map(row => ({
+        nodeId: String(row.node_id),
+        sessionId: String(row.session_id),
+        messageId: String(row.message_id),
+        turnIndex: Number(row.turn_index),
+    }));
+}
 /** 按 name 精确更新 description / content；找不到返回 null（调用方决定报错语义） */
 export function updateNode(db, name, patch) {
     const ex = findByName(db, name);
@@ -95,36 +140,13 @@ export function updateNode(db, name, patch) {
         .run(description, content, now, ex.id);
     return { ...ex, description, content, updatedAt: now };
 }
-export function deprecate(db, nodeId) {
-    db.prepare("UPDATE gm_nodes SET status='deprecated', updated_at=? WHERE id=?")
-        .run(Date.now(), nodeId);
-}
-/** 合并两个节点：keepId 保留，mergeId 标记 deprecated，边迁移 */
-export function mergeNodes(db, keepId, mergeId) {
-    const keep = findById(db, keepId);
-    const merge = findById(db, mergeId);
-    if (!keep || !merge)
+export function deprecate(db, nodeId, temporalState = "historical") {
+    const node = findById(db, nodeId);
+    if (!node)
         return;
-    // 合并 validatedCount + sourceSessions
-    const sessions = JSON.stringify(Array.from(new Set([...keep.sourceSessions, ...merge.sourceSessions])));
-    const count = keep.validatedCount + merge.validatedCount;
-    const content = keep.content.length >= merge.content.length ? keep.content : merge.content;
-    const desc = keep.description.length >= merge.description.length ? keep.description : merge.description;
-    db.prepare(`UPDATE gm_nodes SET content=?, description=?, validated_count=?,
-    source_sessions=?, updated_at=? WHERE id=?`)
-        .run(content, desc, count, sessions, Date.now(), keepId);
-    // 迁移边：mergeId 的边指向 keepId
-    db.prepare("UPDATE gm_edges SET from_id=? WHERE from_id=?").run(keepId, mergeId);
-    db.prepare("UPDATE gm_edges SET to_id=? WHERE to_id=?").run(keepId, mergeId);
-    // 删除自环（合并后可能出现 keepId → keepId）
-    db.prepare("DELETE FROM gm_edges WHERE from_id = to_id").run();
-    // 删除重复边（同 from+to+type 只保留一条）
-    db.prepare(`
-    DELETE FROM gm_edges WHERE id NOT IN (
-      SELECT MIN(id) FROM gm_edges GROUP BY from_id, to_id, type
-    )
-  `).run();
-    deprecate(db, mergeId);
+    const temporal = { ...node.temporal, state: temporalState };
+    db.prepare("UPDATE gm_nodes SET status='deprecated', temporal_json=?, updated_at=? WHERE id=?")
+        .run(JSON.stringify(temporal), Date.now(), nodeId);
 }
 /** 批量更新 PageRank 分数 */
 export function updatePageranks(db, scores) {
@@ -161,8 +183,8 @@ export function upsertEdge(db, e) {
     const ex = db.prepare("SELECT id FROM gm_edges WHERE from_id=? AND to_id=? AND type=?")
         .get(e.fromId, e.toId, e.type);
     if (ex) {
-        db.prepare("UPDATE gm_edges SET instruction=? WHERE id=?")
-            .run(e.instruction, ex.id);
+        db.prepare("UPDATE gm_edges SET instruction=?, condition=?, session_id=? WHERE id=?")
+            .run(e.instruction, e.condition ?? null, e.sessionId, ex.id);
         return;
     }
     db.prepare(`INSERT INTO gm_edges (id, from_id, to_id, type, instruction, condition, session_id, created_at)
@@ -195,7 +217,7 @@ function fts5Available(db) {
     }
 }
 export function searchNodes(db, query, limit = 6) {
-    const terms = query.trim().split(/\s+/).filter(Boolean).slice(0, 8);
+    const terms = Array.from(new Set(query.trim().split(/\s+/).filter(Boolean)));
     if (!terms.length)
         return topNodes(db, limit);
     if (fts5Available(db)) {
@@ -263,11 +285,29 @@ export function getBySession(db, sessionId) {
     WHERE j.value = ? AND n.status = 'active'
   `).all(sessionId).map(toNode);
 }
+/**
+ * Nodes supported by the current session's recent completed turns.
+ * The turn window follows the host's visible-history policy; it is not a
+ * second node-count cap and therefore keeps every concept extracted per turn.
+ */
+export function getRecentBySession(db, sessionId, currentTurn, turnCount) {
+    const firstTurn = Math.max(0, currentTurn - turnCount);
+    return db.prepare(`
+    SELECT DISTINCT n.*
+    FROM gm_nodes n
+    JOIN gm_node_sources s ON s.node_id=n.id
+    WHERE n.status='active' AND s.session_id=?
+      AND s.turn_index>=? AND s.turn_index<?
+    ORDER BY n.updated_at DESC
+  `).all(sessionId, firstTurn, currentTurn).map(toNode);
+}
 // ─── 消息 CRUD ───────────────────────────────────────────────
 export function saveMessage(db, sid, turn, role, content) {
+    const id = uid("m");
     db.prepare(`INSERT OR IGNORE INTO gm_messages (id, session_id, turn_index, role, content, created_at)
     VALUES (?,?,?,?,?,?)`)
-        .run(uid("m"), sid, turn, role, JSON.stringify(content), Date.now());
+        .run(id, sid, turn, role, JSON.stringify(content), Date.now());
+    return id;
 }
 /**
  * Persist one host event exactly once.
@@ -283,29 +323,43 @@ export function saveMessageOnce(db, eventId, sid, turn, role, content) {
         .run(eventId, sid, turn, role, JSON.stringify(content), Date.now());
     return result.changes > 0;
 }
-export function getMessages(db, sid, limit) {
-    if (limit) {
-        return db.prepare("SELECT * FROM gm_messages WHERE session_id=? ORDER BY turn_index DESC LIMIT ?")
-            .all(sid, limit);
-    }
-    return db.prepare("SELECT * FROM gm_messages WHERE session_id=? ORDER BY turn_index")
-        .all(sid);
-}
-export function getUnextracted(db, sid, limit) {
+/**
+ * Read the oldest pending completed turn as one semantic extraction job.
+ * No character/message batching is involved: the DSH adapter persists exactly
+ * one user question and one final assistant answer for each completed turn.
+ */
+export function getNextUnextractedTurn(db, sid, completedTurn) {
+    const next = db.prepare(`
+    SELECT MIN(turn_index) AS turn_index
+    FROM gm_messages
+    WHERE session_id=? AND extracted=0 AND extraction_state='pending'
+      AND turn_index<=?
+  `).get(sid, completedTurn);
+    if (next?.turn_index === null || next?.turn_index === undefined)
+        return [];
     return db.prepare(`
     SELECT * FROM gm_messages
-    WHERE session_id=? AND extracted=0 AND extraction_state='pending'
-      AND (extraction_next_retry_at IS NULL OR extraction_next_retry_at<=?)
-    ORDER BY turn_index, id LIMIT ?
-  `).all(sid, Date.now(), limit);
+    WHERE session_id=? AND turn_index=? AND extracted=0 AND extraction_state='pending'
+    ORDER BY rowid
+  `).all(sid, Number(next.turn_index));
 }
-export function markExtracted(db, sid, upToTurn) {
+/** Persist the highest DSH/OpenClaw turn known to be complete. */
+export function markExtractionTurnCompleted(db, sid, completedTurn) {
+    if (!Number.isFinite(completedTurn))
+        return;
     db.prepare(`
-    UPDATE gm_messages
-    SET extracted=1, extraction_state='succeeded', extraction_error=NULL,
-        extraction_next_retry_at=NULL, extraction_updated_at=?
-    WHERE session_id=? AND turn_index<=? AND extraction_state='pending'
-  `).run(Date.now(), sid, upToTurn);
+    INSERT INTO gm_extraction_sessions (session_id, completed_turn, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET
+      completed_turn=MAX(completed_turn, excluded.completed_turn),
+      updated_at=excluded.updated_at
+  `).run(sid, completedTurn, Date.now());
+}
+export function getExtractionCompletedTurn(db, sid) {
+    const row = db.prepare(`
+    SELECT completed_turn FROM gm_extraction_sessions WHERE session_id=?
+  `).get(sid);
+    return row?.completed_turn === undefined ? null : Number(row.completed_turn);
 }
 function messageIdPlaceholders(ids) {
     return ids.map(() => "?").join(",");
@@ -349,13 +403,13 @@ export function requeueQuarantined(db, sid) {
     const result = sid
         ? db.prepare(`
         UPDATE gm_messages
-        SET extraction_state='pending', extraction_error=NULL,
+        SET extraction_state='pending', extraction_attempts=0, extraction_error=NULL,
             extraction_next_retry_at=NULL, extraction_updated_at=?
         WHERE extraction_state='quarantined' AND session_id=?
       `).run(Date.now(), sid)
         : db.prepare(`
         UPDATE gm_messages
-        SET extraction_state='pending', extraction_error=NULL,
+        SET extraction_state='pending', extraction_attempts=0, extraction_error=NULL,
             extraction_next_retry_at=NULL, extraction_updated_at=?
         WHERE extraction_state='quarantined'
       `).run(Date.now());
@@ -382,71 +436,19 @@ export function getPendingSessionIds(db, limit = 100) {
     GROUP BY session_id ORDER BY first_turn, session_id LIMIT ?
   `).all(Date.now(), limit).map(row => row.session_id);
 }
-/**
- * 溯源选拉：按 session 拉取 user/assistant 核心对话（跳过 tool/toolResult）
- * 用于 assemble 时补充三元组的原始上下文
- *
- * @param nearTime  优先取时间最接近的消息（节点的 updatedAt）
- * @param maxChars  总字符上限
- */
-export function getEpisodicMessages(db, sessionIds, nearTime, maxChars = 1500) {
-    if (!sessionIds.length)
-        return [];
-    const results = [];
-    let usedChars = 0;
-    // 按 session 逐个拉，优先最近的 session
-    for (const sid of sessionIds) {
-        if (usedChars >= maxChars)
-            break;
-        // 只拉 user 和 assistant，按时间距离 nearTime 最近排序
-        const rows = db.prepare(`
-      SELECT turn_index, role, content, created_at FROM gm_messages
-      WHERE session_id = ? AND role IN ('user', 'assistant')
-      ORDER BY ABS(created_at - ?) ASC
-      LIMIT 6
-    `).all(sid, nearTime);
-        for (const r of rows) {
-            if (usedChars >= maxChars)
-                break;
-            let text = "";
-            try {
-                const parsed = JSON.parse(r.content);
-                text = extractStoredText(parsed);
-            }
-            catch {
-                text = String(r.content).slice(0, 300);
-            }
-            if (!text.trim())
-                continue;
-            const truncated = text.slice(0, Math.min(text.length, maxChars - usedChars));
-            results.push({
-                sessionId: sid,
-                turnIndex: r.turn_index,
-                role: r.role,
-                text: truncated,
-                createdAt: r.created_at,
-            });
-            usedChars += truncated.length;
-        }
-    }
-    return results;
-}
 /** Read exact durable message evidence for one node, in source order. */
-export function getNodeSourceMessages(db, nodeId, maxChars) {
-    if (maxChars <= 0)
-        return [];
+export function getNodeSourceMessages(db, nodeId, excludedMessageIds = new Set()) {
     const rows = db.prepare(`
-    SELECT s.session_id, s.turn_index, m.role, m.content, m.created_at
+    SELECT s.message_id, s.session_id, s.turn_index, m.role, m.content, m.created_at
     FROM gm_node_sources s
     JOIN gm_messages m ON m.id=s.message_id
     WHERE s.node_id=?
     ORDER BY s.turn_index, m.created_at
   `).all(nodeId);
     const results = [];
-    let usedChars = 0;
     for (const row of rows) {
-        if (usedChars >= maxChars)
-            break;
+        if (excludedMessageIds.has(String(row.message_id)))
+            continue;
         let text = "";
         try {
             text = extractStoredText(JSON.parse(row.content));
@@ -456,16 +458,13 @@ export function getNodeSourceMessages(db, nodeId, maxChars) {
         }
         if (!text.trim())
             continue;
-        const remaining = maxChars - usedChars;
-        const selected = text.length <= remaining ? text : text.slice(0, remaining);
         results.push({
             sessionId: row.session_id,
             turnIndex: row.turn_index,
             role: row.role,
-            text: selected,
+            text,
             createdAt: row.created_at,
         });
-        usedChars += selected.length;
     }
     return results;
 }
@@ -478,28 +477,18 @@ export function extractStoredText(value) {
     if (!value || typeof value !== "object")
         return "";
     const record = value;
-    if ((record.type === "text" || record.type === "reasoning") && typeof record.text === "string") {
+    if (record.type === "text" && typeof record.text === "string") {
         return record.text;
     }
+    // Typed non-text blocks are reasoning/tool protocol data, not user-visible
+    // evidence. Do not recurse into their payloads.
+    if (typeof record.type === "string")
+        return "";
     if (record.content !== undefined)
         return extractStoredText(record.content);
     if (record.message !== undefined)
         return extractStoredText(record.message);
     return "";
-}
-// ─── 信号 CRUD ───────────────────────────────────────────────
-export function saveSignal(db, sid, s) {
-    db.prepare(`INSERT INTO gm_signals (id, session_id, turn_index, type, data, created_at)
-    VALUES (?,?,?,?,?,?)`)
-        .run(uid("s"), sid, s.turnIndex, s.type, JSON.stringify(s.data), Date.now());
-}
-export function pendingSignals(db, sid) {
-    return db.prepare("SELECT * FROM gm_signals WHERE session_id=? AND processed=0 ORDER BY turn_index")
-        .all(sid)
-        .map(r => ({ type: r.type, turnIndex: r.turn_index, data: JSON.parse(r.data) }));
-}
-export function markSignalsDone(db, sid) {
-    db.prepare("UPDATE gm_signals SET processed=1 WHERE session_id=?").run(sid);
 }
 // ─── 统计 ────────────────────────────────────────────────────
 export function getStats(db) {
@@ -534,21 +523,7 @@ export function getVectorStats(db) {
     const dimensions = [...new Set(rows.map((row) => row.embedding.byteLength / 4))].sort((a, b) => a - b);
     return { count, dimensions };
 }
-/** 获取所有向量（供去重/聚类用） */
-export function getAllVectors(db) {
-    const rows = db.prepare(`
-    SELECT v.node_id, v.embedding FROM gm_vectors v
-    JOIN gm_nodes n ON n.id = v.node_id WHERE n.status = 'active'
-  `).all();
-    return rows.map(r => {
-        const raw = r.embedding;
-        return {
-            nodeId: r.node_id,
-            embedding: new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4),
-        };
-    });
-}
-export function vectorSearchWithScore(db, queryVec, limit, minScore = 0.35) {
+export function vectorSearchWithScore(db, queryVec, limit, minScore) {
     const rows = db.prepare(`
     SELECT v.node_id, v.embedding, n.*
     FROM gm_vectors v JOIN gm_nodes n ON n.id = v.node_id
@@ -573,12 +548,12 @@ export function vectorSearchWithScore(db, queryVec, limit, minScore = 0.35) {
         }
         return { score: dot / (Math.sqrt(vNorm) * qNorm + 1e-9), node: toNode(row) };
     })
-        .filter(s => s.score > minScore)
+        .filter(s => minScore === undefined || s.score >= minScore)
         .sort((a, b) => b.score - a.score)
         .slice(0, limit);
 }
 /** 兼容旧接口 */
-export function vectorSearch(db, queryVec, limit, minScore = 0.35) {
+export function vectorSearch(db, queryVec, limit, minScore) {
     return vectorSearchWithScore(db, queryVec, limit, minScore).map(s => s.node);
 }
 /**
@@ -613,138 +588,4 @@ export function communityRepresentatives(db, perCommunity = 2) {
         result.push(...nodes);
     }
     return result;
-}
-export function upsertCommunitySummary(db, id, summary, nodeCount, embedding, memberSignature) {
-    const now = Date.now();
-    const blob = embedding
-        ? embedding instanceof Uint8Array
-            ? embedding
-            : new Uint8Array(new Float32Array(embedding).buffer)
-        : null;
-    const ex = db.prepare("SELECT id FROM gm_communities WHERE id=?").get(id);
-    if (ex) {
-        // A summary/member change invalidates the previous embedding. Persist null
-        // when regeneration is unavailable instead of retaining a stale vector.
-        db.prepare("UPDATE gm_communities SET summary=?, node_count=?, embedding=?, member_signature=?, updated_at=? WHERE id=?")
-            .run(summary, nodeCount, blob, memberSignature ?? null, now, id);
-    }
-    else {
-        db.prepare("INSERT INTO gm_communities (id, summary, node_count, embedding, member_signature, created_at, updated_at) VALUES (?,?,?,?,?,?,?)")
-            .run(id, summary, nodeCount, blob, memberSignature ?? null, now, now);
-    }
-}
-export function getCommunitySummary(db, id) {
-    const r = db.prepare("SELECT * FROM gm_communities WHERE id=?").get(id);
-    if (!r)
-        return null;
-    return {
-        id: r.id,
-        summary: r.summary,
-        nodeCount: r.node_count,
-        memberSignature: r.member_signature ?? null,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-    };
-}
-export function getCommunitySummaryBySignature(db, memberSignature) {
-    const r = db.prepare(`
-    SELECT * FROM gm_communities
-    WHERE member_signature=?
-    ORDER BY updated_at DESC
-    LIMIT 1
-  `).get(memberSignature);
-    if (!r)
-        return null;
-    return {
-        id: r.id,
-        summary: r.summary,
-        nodeCount: r.node_count,
-        memberSignature: r.member_signature ?? null,
-        embedding: r.embedding ? r.embedding : undefined,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-    };
-}
-export function getAllCommunitySummaries(db) {
-    return db.prepare("SELECT * FROM gm_communities ORDER BY node_count DESC").all()
-        .map(r => ({
-        id: r.id,
-        summary: r.summary,
-        nodeCount: r.node_count,
-        memberSignature: r.member_signature ?? null,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-    }));
-}
-/**
- * 社区向量搜索：用 query 向量匹配社区 embedding，返回按相似度排序的社区
- */
-export function communityVectorSearch(db, queryVec, minScore = 0.15) {
-    const rows = db.prepare("SELECT id, summary, node_count, embedding FROM gm_communities WHERE embedding IS NOT NULL").all();
-    if (!rows.length)
-        return [];
-    const q = new Float32Array(queryVec);
-    const qNorm = Math.sqrt(q.reduce((s, x) => s + x * x, 0));
-    if (qNorm === 0)
-        return [];
-    return rows
-        .map(r => {
-        const raw = r.embedding;
-        const v = new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4);
-        if (v.length !== q.length) {
-            return { id: r.id, summary: r.summary, score: Number.NEGATIVE_INFINITY, nodeCount: r.node_count };
-        }
-        let dot = 0, vNorm = 0;
-        for (let i = 0; i < q.length; i++) {
-            dot += v[i] * q[i];
-            vNorm += v[i] * v[i];
-        }
-        return {
-            id: r.id,
-            summary: r.summary,
-            score: dot / (Math.sqrt(vNorm) * qNorm + 1e-9),
-            nodeCount: r.node_count,
-        };
-    })
-        .filter(s => s.score > minScore)
-        .sort((a, b) => b.score - a.score);
-}
-/**
- * 按社区 ID 列表获取成员节点（按时间倒序）
- */
-export function nodesByCommunityIds(db, communityIds, perCommunity = 3) {
-    if (!communityIds.length)
-        return [];
-    const placeholders = communityIds.map(() => "?").join(",");
-    const rows = db.prepare(`
-    SELECT * FROM gm_nodes
-    WHERE community_id IN (${placeholders}) AND status='active'
-    ORDER BY community_id, updated_at DESC
-  `).all(...communityIds);
-    const byCommunity = new Map();
-    for (const r of rows) {
-        const node = toNode(r);
-        const cid = r.community_id;
-        if (!byCommunity.has(cid))
-            byCommunity.set(cid, []);
-        const list = byCommunity.get(cid);
-        if (list.length < perCommunity)
-            list.push(node);
-    }
-    const result = [];
-    for (const cid of communityIds) {
-        const members = byCommunity.get(cid);
-        if (members)
-            result.push(...members);
-    }
-    return result;
-}
-/** 清除已不存在的社区描述 */
-export function pruneCommunitySummaries(db) {
-    const result = db.prepare(`
-    DELETE FROM gm_communities WHERE id NOT IN (
-      SELECT DISTINCT community_id FROM gm_nodes WHERE community_id IS NOT NULL AND status='active'
-    )
-  `).run();
-    return Number(result.changes);
 }

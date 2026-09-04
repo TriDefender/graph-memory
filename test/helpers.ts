@@ -26,6 +26,7 @@ export function createTestDb(): DatabaseSyncInstance {
       name            TEXT NOT NULL,
       description     TEXT NOT NULL DEFAULT '',
       content         TEXT NOT NULL,
+      temporal_json   TEXT NOT NULL DEFAULT '{}',
       status          TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deprecated')),
       validated_count INTEGER NOT NULL DEFAULT 1,
       source_sessions TEXT NOT NULL DEFAULT '[]',
@@ -42,7 +43,7 @@ export function createTestDb(): DatabaseSyncInstance {
       id          TEXT PRIMARY KEY,
       from_id     TEXT NOT NULL REFERENCES gm_nodes(id),
       to_id       TEXT NOT NULL REFERENCES gm_nodes(id),
-      type        TEXT NOT NULL CHECK(type IN ('USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
+      type        TEXT NOT NULL CHECK(type IN ('RELATES','SUPERSEDES','USED_SKILL','SOLVED_BY','REQUIRES','PATCHES','CONFLICTS_WITH')),
       instruction TEXT NOT NULL,
       condition   TEXT,
       session_id  TEXT NOT NULL,
@@ -50,6 +51,18 @@ export function createTestDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS ix_gm_edges_from ON gm_edges(from_id);
     CREATE INDEX IF NOT EXISTS ix_gm_edges_to   ON gm_edges(to_id);
+
+    CREATE TABLE IF NOT EXISTS gm_node_revisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      node_id TEXT NOT NULL REFERENCES gm_nodes(id) ON DELETE CASCADE,
+      previous_description TEXT NOT NULL,
+      previous_content TEXT NOT NULL,
+      previous_temporal_json TEXT NOT NULL DEFAULT '{}',
+      previous_validated_count INTEGER NOT NULL,
+      previous_source_refs TEXT NOT NULL DEFAULT '[]',
+      replacement_session_id TEXT NOT NULL,
+      replaced_at INTEGER NOT NULL
+    );
   `);
 
   // m2: 消息
@@ -74,6 +87,11 @@ export function createTestDb(): DatabaseSyncInstance {
       ON gm_messages(extracted, created_at, session_id, turn_index);
     CREATE INDEX IF NOT EXISTS ix_gm_msg_extraction_queue
       ON gm_messages(extraction_state, extraction_next_retry_at, session_id, turn_index);
+    CREATE TABLE IF NOT EXISTS gm_extraction_sessions (
+      session_id TEXT PRIMARY KEY,
+      completed_turn INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   // m3: 信号

@@ -51,7 +51,7 @@ function loadGraph(db) {
     _cached = { nodeIds, adj, N: nodeIds.size, cachedAt: Date.now() };
     return _cached;
 }
-/** 图结构变化时清除缓存（compact/finalize 后调用） */
+/** 图结构变化后清除缓存。 */
 export function invalidateGraphCache() {
     _cached = null;
 }

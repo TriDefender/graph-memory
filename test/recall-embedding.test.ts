@@ -4,7 +4,7 @@ import type { DatabaseSyncInstance } from "../src/store/sqlite.ts";
 import { Recaller } from "../src/recaller/recall.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 import { createTestDb } from "./helpers.ts";
-import { getVectorHash, saveVector, updateNode, upsertNode } from "../src/store/store.ts";
+import { getVectorHash, saveVector, updateNode, upsertEdge, upsertNode } from "../src/store/store.ts";
 
 let db: DatabaseSyncInstance;
 
@@ -39,7 +39,7 @@ describe("Recaller.syncEmbed", () => {
     expect(getVectorHash(db, node.id)).not.toBe(firstHash);
   });
 
-  it("keeps semantic relevance through graph ranking and embeds a query once", async () => {
+  it("preserves semantic relevance without graph-centrality reranking and embeds a query once", async () => {
     const strong = upsertNode(db, {
       type: "EVENT",
       name: "semantic-match",
@@ -68,7 +68,37 @@ describe("Recaller.syncEmbed", () => {
     expect(result.nodes[0]?.id).toBe(strong.id);
   });
 
-  it("supports a high-precision automatic mode without broad fallback", async () => {
+  it("never lets a connected graph hub displace the semantic top match", async () => {
+    const answer = upsertNode(db, {
+      type: "EVENT", name: "exact-answer", description: "specific answer", content: "specific",
+    }, "s1").node;
+    const hub = upsertNode(db, {
+      type: "EVENT", name: "generic-hub", description: "generic API", content: "generic",
+    }, "s1").node;
+    saveVector(db, answer.id, "answer", [1, 0]);
+    saveVector(db, hub.id, "hub", [0.6, 0.8]);
+    for (let index = 0; index < 8; index += 1) {
+      const neighbor = upsertNode(db, {
+        type: "EVENT", name: `hub-neighbor-${index}`, description: "generic", content: "generic",
+      }, "s1").node;
+      saveVector(db, neighbor.id, `neighbor-${index}`, [0, 1]);
+      upsertEdge(db, {
+        fromId: hub.id,
+        toId: neighbor.id,
+        type: "RELATES",
+        instruction: "generic connection",
+        sessionId: "s1",
+      });
+    }
+
+    const recaller = new Recaller(db, { ...DEFAULT_CONFIG, recallMaxNodes: 2 });
+    recaller.setEmbedFn(async () => [1, 0]);
+    const result = await recaller.recall("specific current question");
+
+    expect(result.nodes.map(node => node.name)).toEqual(["exact-answer", "generic-hub"]);
+  });
+
+  it("uses one optional semantic threshold for every recall path", async () => {
     const weak = upsertNode(db, {
       type: "EVENT",
       name: "weak-neighbor",
@@ -77,12 +107,9 @@ describe("Recaller.syncEmbed", () => {
     }, "old-session").node;
     saveVector(db, weak.id, "weak", [0.55, Math.sqrt(1 - 0.55 ** 2)]);
 
-    const recaller = new Recaller(db, DEFAULT_CONFIG);
+    const recaller = new Recaller(db, { ...DEFAULT_CONFIG, semanticScoreThreshold: 0.6 });
     recaller.setEmbedFn(async () => [1, 0]);
-    const result = await recaller.recall("unrelated current request", {
-      minSemanticScore: 0.6,
-      allowBroadFallback: false,
-    });
+    const result = await recaller.recall("unrelated current request");
 
     expect(result.nodes).toEqual([]);
   });

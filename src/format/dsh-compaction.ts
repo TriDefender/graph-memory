@@ -2,9 +2,9 @@
  * Pure DeepSeek Harness surface selection for Graph Memory rolling compaction.
  *
  * DSH keeps the durable event log intact and exposes a replaceable model-facing
- * surface. Graph Memory selects only a complete prefix of that surface; the
- * host compaction service owns the actual summary transaction and tool-pairing
- * validation.
+ * surface. Graph Memory owns the historical projection: it replaces a complete
+ * old prefix with a constant-size archive marker and retrieves relevant facts
+ * from the durable memory store. No summarizer model call is involved.
  */
 
 interface DshSurfaceEvent {
@@ -15,8 +15,25 @@ interface DshSurfaceEvent {
 }
 
 interface DshSurfaceSession {
+  id?: unknown;
+  /** Current DSH public immutable-log snapshot API. */
+  snapshotEvents?(): Array<DshSurfaceEvent>;
+  /** Compatibility with older DSH releases and lightweight test doubles. */
   events?: Array<DshSurfaceEvent | undefined>;
   surface?: { nodes?: number[] };
+  append?(type: string, data: unknown, options?: Record<string, unknown>): { seq: number };
+}
+
+/** Read the immutable log through DSH's public API, with legacy compatibility. */
+function sessionEvents(session: DshSurfaceSession): Array<DshSurfaceEvent | undefined> | undefined {
+  if (typeof session.snapshotEvents === "function") return session.snapshotEvents();
+  return Array.isArray(session.events) ? session.events : undefined;
+}
+
+interface DshTokenMeter {
+  measure(session: unknown): {
+    nodes: ReadonlyArray<{ seq: number; heuristicTokens: number }>;
+  };
 }
 
 export interface DshCompactionRange {
@@ -25,6 +42,20 @@ export interface DshCompactionRange {
   shadowedSeqs: number[];
   retainedUserTurns: number;
 }
+
+export interface DshArchiveReplacement {
+  replacementSeq: number;
+  shadowedSeqs: number[];
+  shadowedTokenCount: number;
+}
+
+export const DSH_ARCHIVE_MARKER = [
+  "<graph-memory-archive>",
+  "Older conversation is stored losslessly by Graph Memory and is not replayed here.",
+  "Query-relevant same-session and cross-session memory is supplied separately.",
+  "This marker is context metadata, not a user instruction.",
+  "</graph-memory-archive>",
+].join("\n");
 
 /** Whether one surface event is a real user prompt that starts a logical turn. */
 export function isDshUserTurn(event: DshSurfaceEvent | undefined): boolean {
@@ -39,29 +70,25 @@ export function isDshUserTurn(event: DshSurfaceEvent | undefined): boolean {
 export function selectDshRollingCompactionRange(
   session: DshSurfaceSession,
   freshTurnCount: number,
-  incomingUserTurns = 0,
+  currentUserAlreadyOnSurface = false,
 ): DshCompactionRange | null {
   if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {
     throw new TypeError(`freshTurnCount must be a positive integer, received ${freshTurnCount}`);
   }
-  if (!Number.isInteger(incomingUserTurns) || incomingUserTurns < 0) {
-    throw new TypeError(`incomingUserTurns must be a non-negative integer, received ${incomingUserTurns}`);
-  }
-
   const surface = session.surface?.nodes;
-  const events = session.events;
+  const events = sessionEvents(session);
   if (!Array.isArray(surface) || !Array.isArray(events) || surface.length < 2) return null;
 
   const userPositions: number[] = [];
   for (let index = 0; index < surface.length; index += 1) {
     if (isDshUserTurn(events[surface[index]])) userPositions.push(index);
   }
-  if (userPositions.length + incomingUserTurns <= freshTurnCount) return null;
+  const retainOnSurface = freshTurnCount + (currentUserAlreadyOnSurface ? 1 : 0);
+  if (userPositions.length <= retainOnSurface) return null;
 
-  const retainOnSurface = Math.max(0, freshTurnCount - incomingUserTurns);
-  const keepFromPosition = retainOnSurface === 0
-    ? surface.length
-    : userPositions[userPositions.length - retainOnSurface];
+  // pre-step runs before DSH appends the newly claimed prompt. Retain N
+  // completed previous user turns; the current prompt is appended afterwards.
+  const keepFromPosition = userPositions[userPositions.length - retainOnSurface];
   if (keepFromPosition <= 0) return null;
   const shadowedSeqs = surface.slice(0, keepFromPosition);
   if (!shadowedSeqs.length) return null;
@@ -70,6 +97,56 @@ export function selectDshRollingCompactionRange(
     start: shadowedSeqs[0],
     end: shadowedSeqs[shadowedSeqs.length - 1],
     shadowedSeqs,
-    retainedUserTurns: freshTurnCount,
+    retainedUserTurns: retainOnSurface,
+  };
+}
+
+/**
+ * Replace an archived surface prefix without invoking DSH's LLM compactor.
+ *
+ * The adjacent compaction/prune event is DSH's public shadow-price protocol:
+ * it lets token-meter subtract the exact heuristic price of the replaced
+ * surface while the immutable source events remain available for provenance.
+ */
+export function replaceDshArchivedPrefix(
+  session: DshSurfaceSession,
+  tokenMeter: DshTokenMeter,
+  range: DshCompactionRange,
+): DshArchiveReplacement {
+  if (typeof session.append !== "function") {
+    throw new Error("DSH session.append is unavailable; Graph Memory cannot own the model surface");
+  }
+  const measured = tokenMeter?.measure?.(session);
+  if (!measured || !Array.isArray(measured.nodes)) {
+    throw new Error("DSH tokenMeter is unavailable; Graph Memory cannot price a safe surface replacement");
+  }
+  const prices = new Map(measured.nodes.map(node => [node.seq, node.heuristicTokens]));
+  let shadowedTokenCount = 0;
+  for (const seq of range.shadowedSeqs) {
+    const price = prices.get(seq);
+    if (!Number.isFinite(price)) {
+      throw new Error(`DSH tokenMeter did not price shadowed surface seq ${seq}`);
+    }
+    shadowedTokenCount += Number(price);
+  }
+
+  const prune = session.append("compaction/prune", {
+    shadowedRange: { start: range.start, end: range.end },
+    shadowedSeqs: [...range.shadowedSeqs],
+    shadowedTokenCount,
+  });
+  const replacement = session.append("user/message", {
+    id: `graph-memory-archive:${String(session.id ?? "session")}:${range.start}-${range.end}`,
+    role: "user",
+    source: { kind: "plugin", plugin: "graph-memory" },
+    content: [{ type: "text", text: DSH_ARCHIVE_MARKER }],
+  }, {
+    surfaceOp: { op: "replace", start: range.start, end: range.end },
+    sourceEventSeqs: [prune.seq, ...range.shadowedSeqs],
+  });
+  return {
+    replacementSeq: replacement.seq,
+    shadowedSeqs: [...range.shadowedSeqs],
+    shadowedTokenCount,
   };
 }

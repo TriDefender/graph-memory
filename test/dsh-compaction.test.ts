@@ -54,7 +54,20 @@ describe("DSH rolling compaction selection", () => {
     expect(selectDshRollingCompactionRange(
       { events, surface: { nodes: events.map((_, index) => index) } },
       5,
-      1,
+    )).toBeNull();
+  });
+
+  it("retains the current user plus the configured previous tail on tool continuations", () => {
+    const events = [
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+      user(), { type: "assistant/message" },
+    ];
+    expect(selectDshRollingCompactionRange(
+      { events, surface: { nodes: events.map((_, index) => index) } },
+      2,
+      true,
     )).toMatchObject({ start: 0, end: 1, shadowedSeqs: [0, 1] });
   });
 
@@ -75,7 +88,6 @@ describe("DSH rolling compaction selection", () => {
 
   it("rejects invalid retention instead of silently changing policy", () => {
     expect(() => selectDshRollingCompactionRange({}, 0)).toThrow(/positive integer/);
-    expect(() => selectDshRollingCompactionRange({}, 5, -1)).toThrow(/non-negative integer/);
   });
 
   it("recognizes only durable user-origin prompts", () => {

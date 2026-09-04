@@ -1,10 +1,17 @@
 # Graph Memory
 
-![DeepSeek Harness + OpenClaw → Graph Memory](docs/images/brand/graph-memory-hosts-banner.png)
+<p align="center">
+  <img src="docs/images/deepseek-harness-wordmark.svg" alt="DeepSeek Harness" width="310">
+</p>
 
 <p align="center">
-  <strong>为 AI Agent 提供可检索、可追溯、跨会话的长期记忆</strong><br>
-  一个宿主无关的图记忆内核，原生接入 DeepSeek Harness，并继续兼容 OpenClaw。
+  <strong>接管模型可见历史，让上下文停止膨胀，让记忆继续生长。</strong><br>
+  Graph Memory 原生接入 DeepSeek Harness：最近轮次留在上下文，旧历史进入可检索图记忆；同时继续兼容 OpenClaw。
+</p>
+
+<p align="center">
+  <img src="docs/images/brand/openclaw-wordmark.svg" alt="Compatible with OpenClaw" width="118"><br>
+  <sub>同一记忆内核 · OpenClaw Context Engine 入口继续维护</sub>
 </p>
 
 <p align="center">
@@ -23,6 +30,18 @@
 
 Graph Memory 不是聊天记录归档器，也不是把所有历史重新塞回上下文。它把对话中的任务、技能、事件和因果关系沉淀为类型化知识图谱，在新问题出现时只召回相关的局部子图。
 
+| 用户最先需要知道的事 | Graph Memory 的做法 |
+|---|---|
+| 当前长对话会不会继续爆炸？ | 默认只保留最近 5 个已完成用户轮次；更早模型表面被固定归档标记替换。 |
+| 旧事实会不会跟着丢失？ | 不会删除原始事件；按当前问题召回图节点及其精确来源问答。 |
+| 是否要修改 DSH？ | 不需要。它通过 Cordis 插件生命周期和 DSH 公共上下文协议接入。 |
+
+<p align="center">
+  <img src="docs/images/dsh-context-takeover-chart.svg" alt="DSH 20 轮首请求上下文 Token 对比" width="96%">
+</p>
+
+> 真实 20 轮工程任务中，T20 首请求从 56,998 降至 16,769 Token（−70.58%），消息数从 171 降至 24。20 轮首请求累计下降 51.61%；计入主 Agent 的随机工具循环、Graph Memory 维护和 Embedding 后，总量下降 3.47%。[查看完整口径与限制](docs/GRAPH_MEMORY_README_REPORT.html) · [复跑脱敏基准](benchmarks/dsh-context-takeover/README.md)
+
 ## 核心优势
 
 ### 一套内核，两个原生宿主入口
@@ -35,18 +54,19 @@ Graph Memory 不是聊天记录归档器，也不是把所有历史重新塞回�
 
 - 跨 Session 召回，宿主重启后仍然保留。
 - `TASK`、`SKILL`、`EVENT` 三类节点表达目标、方法、结果、错误与决策。
-- `USED_SKILL`、`SOLVED_BY`、`REQUIRES`、`PATCHES`、`CONFLICTS_WITH` 五类关系保留因果和依赖。
+- 通用 `RELATES` 边以对话中抽取的自然语言谓词连接主题概念；旧的 `USED_SKILL`、`SOLVED_BY` 等关系继续兼容已有 Agent 记忆。
 - 节点关联原始会话证据，能够解释“这条记忆从哪里来、为什么被召回”。
 
 ### 只把相关知识送进上下文
 
-- 默认原样保留最近 5 个真实用户轮次，可通过 `freshTurnCount` 配置。
-- 通过每个 Agent 的 DSH 公共 CompactionEngine，把更早的模型表面历史替换为滚动 checkpoint；持久化原始事件不删除。
-- checkpoint、知识节点与精确原消息来源建立关联，召回时可以回溯原文。
-- 精确路径：向量 / FTS5 → 社区扩展 → 图遍历 → 个性化 PageRank。
-- 泛化路径：查询向量 → 社区摘要 → 社区成员 → 图排序。
-- 只注入与本轮问题相关的跨会话局部图，并受 `recallTokenBudget`（默认 4096）约束。
-- 自动注入使用高精度语义门槛（`autoRecallMinScore`，默认 0.6），且不会在无关查询下退化为任意社区代表节点；显式 `gm_search` 仍保留宽召回。
+- 默认保留前序最近 5 个已完成轮次的原始问题与最终可见回答，再加入当前问题；可通过 `freshTurnCount` 配置。
+- 通过 DSH 公共 surface replacement 与 token-meter shadow-price 协议，把更早历史替换为固定大小的归档标记；不调用 DSH 压缩模型，持久化原始事件不删除。
+- 知识节点与精确原消息来源建立关联；按当前问题同时召回同 Session 已归档记忆和跨 Session 记忆。
+- 查询路径：向量按当前问题排序；Embedding 不可用时使用 FTS5。
+- 只保留 Top-K 直接命中节点及它们之间已有的边，不用社区中心度改写相关性顺序。
+- 只注入按本轮问题排序后的同会话旧记忆/跨会话记忆；原始问答作为不可截断的完整证据加载，Token 计量交给宿主和模型服务。
+- 自动注入与 `gm_search` 共享同一套向量/FTS 排序。余弦分数会随 embedding 模型变化，因此 `semanticScoreThreshold` 只作为可选、需校准的统一阈值；默认按 Top-K 返回。
+- 查询阶段不再用 PageRank 重排语义命中，避免图中心节点挤掉最相关记忆；PageRank 仅保留为离线图维护统计。
 - 召回内容被标记为不可信参考材料，不能覆盖当前用户指令。
 
 ### 本地优先，向量能力可选
@@ -78,7 +98,7 @@ Graph Memory 的方向没有因为新宿主而推倒重来。项目正在从“O
 
 | 阶段 | 交付内容 | 状态 |
 |---|---|---|
-| OpenClaw 起点 | Context Engine、跨会话图记忆、双路径召回 | 保持兼容 |
+| OpenClaw 起点 | Context Engine、跨会话图记忆、向量/FTS5 召回 | 保持兼容 |
 | Community 图引擎 | SQLite、FTS5、向量、图排序、溯源 | 可使用 |
 | DeepSeek Harness | Cordis 适配器、原生工具、自动召回、Credentials | 已完成并实测 |
 | Graph Memory Pro | 可视化图工作台、受控拖拽、Neo4j 可选适配器 | Pro Lite 只读 Host + Client 已实现；2D/3D 与拖拽待实现 |
@@ -118,22 +138,21 @@ SKILL  ──CONFLICTS_WITH──▶ SKILL
 - **EVENT**：错误、修复、决策、变化和关键事实。
 - **Episodic provenance**：图节点关联原始 user / assistant 片段，保留形成知识时的语境。
 
-### 双路径召回
+### 查询优先召回
 
 ```mermaid
 flowchart LR
-  Q[当前问题] --> EXACT[精确路径]
-  Q --> GENERAL[泛化路径]
-  EXACT --> SEARCH[向量 / FTS5]
-  SEARCH --> EXPAND[社区扩展 + 图遍历]
-  GENERAL --> SUMMARY[社区摘要匹配]
-  SUMMARY --> MEMBERS[社区成员]
-  EXPAND --> PPR[个性化 PageRank]
-  MEMBERS --> PPR
-  PPR --> CONTEXT[去重后的局部知识上下文]
+  Q[当前问题] --> VECTOR[向量排序]
+  Q --> FTS[FTS5 降级]
+  VECTOR --> TOPK[相关 Top-K 节点]
+  FTS --> TOPK
+  TOPK --> EDGES[选中节点之间的边]
+  TOPK --> SOURCE[精确来源问答]
+  EDGES --> CONTEXT[原子记忆包]
+  SOURCE --> CONTEXT
 ```
 
-同一张图会根据当前问题产生不同排名。查询 Docker 时，Docker 相关技能靠前；查询 Conda 时，环境管理相关技能靠前。对几千节点规模的图，图排序可以在本地完成。
+同一张图会根据当前问题产生不同的向量排序。查询 Docker 时，Docker 相关记忆靠前；查询 Conda 时，环境管理相关记忆靠前。PageRank 和社区仍用于离线维护与观察，不再覆盖查询相关性。
 
 ### 宿主数据流
 
@@ -145,8 +164,7 @@ flowchart LR
   EXTRACT --> GRAPH[(SQLite / FTS5 / Vectors)]
   USER --> RECALL[语义 + 全文召回]
   GRAPH --> RECALL
-  RECALL --> RANK[社区扩展 + PPR]
-  RANK --> PROMPT[Prompt Assembly]
+  RECALL --> PROMPT[图谱 + 精确来源问答]
   PROMPT --> LOOP[Agent Loop]
   CREDS[Host Credentials] --> ADAPTER
   TOOLS[gm_* Tools] --> ADAPTER
@@ -159,8 +177,8 @@ graph-memory/
 ├── cordis.patch.yml       # DSH Bundle 安装入口
 └── src/
     ├── extractor/         # 对话 → TASK / SKILL / EVENT
-    ├── recaller/          # 向量、FTS5、社区扩展与召回
-    ├── graph/             # PageRank、社区检测、去重
+    ├── recaller/          # 查询优先的向量 / FTS5 召回
+    ├── graph/             # 离线 PageRank 与社区检测
     ├── store/             # SQLite schema 与查询
     ├── format/            # 安全上下文组装
     └── engine/            # LLM / Embedding provider
@@ -171,14 +189,14 @@ graph-memory/
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | Cordis 原生加载 | **已完成** | 使用插件生命周期，无需 fork DSH |
-| 滚动上下文接管 | **已完成** | 最近 N 轮可配置，更早表面历史替换为 checkpoint |
-| 跨会话自动召回 | **已完成** | 在 Prompt Assembly 阶段注入相关记忆 |
+| 滚动上下文接管 | **已完成** | 最近 N 轮可配置，更早表面历史替换为 archive marker |
+| 跨会话自动召回 | **已完成** | 首次模型请求前注入，并等待 Embedding 初始化完成 |
 | 显式记录与搜索 | **已完成** | `gm_record`、`gm_search` |
 | 向量回填与模型迁移 | **已完成** | 追踪模型、维度与 fingerprint |
 | 插件状态可见 | **已完成** | 设置页 Plugin Inventory 显示 active |
 | Pro 可视化工作台 | **实验版可用** | 独立 DSH Client Plugin，当前为只读卡片式快照 |
 
-当前 beta：`1.6.0-beta.11`。完整功能验收宿主为 DeepSeek Harness `0.1.0-rc.8`；随后又在 `0.1.1-rc.2` 上复验了无脚本 Git 安装与 profile 配置组合。验收已覆盖无安装脚本的 Git 与 tarball 安装、Web / Headless profile 原生加载、通过 Agent 公共 compaction 服务执行的可配置最近 5 轮滚动压缩、精确原文溯源、无损有界抽取队列、失败隔离与恢复、有界原始消息保留策略、token 预算、高精度自动召回、FTS5 降级，以及 Pro Lite Host、Typed Remote 和 Client bundle 边界；149 项自动化测试通过。真实模型验收还完成了滚动 checkpoint 替换、`text-embedding-v4` 1024 维向量写入，以及不调用记忆工具的跨项目自动召回。
+当前 beta：`1.6.0-beta.12`。当前候选通过 20 个测试文件中的 123 项自动化测试、两套 TypeScript 构建和 npm dry-run 打包；另在最新官方 DSH `0.1.3-alpha.1`（`d347e70390`）完成全新 profile 的 tarball 安装、配置展开和实际启动。GLM-5.2 的真实 20 轮运行验证了可配置最近 5 轮上下文接管、每轮工具轨迹投影、精确来源绑定、查询优先的向量/FTS 召回、失败隔离，以及无需显式记忆工具的跨会话召回。20 轮首请求上下文累计从 532,451 降至 257,656 Token（下降 51.61%），T20 从 56,998 降至 16,769（下降 70.58%）。20 次结构化抽取中 19 次成功；失败轮次被隔离，没有修补或写入坏数据。完整证据与限制见 [`docs/GRAPH_MEMORY_README_REPORT.html`](docs/GRAPH_MEMORY_README_REPORT.html)。
 
 <p align="center">
   <strong>插件已启用：graph-memory/dsh 在 DSH 插件列表中处于 active</strong><br>
@@ -208,7 +226,7 @@ cd graph-memory
 npm install
 npm test
 npm pack
-npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.10.tgz
+npx @deepseek-ai/dsh plugin --profile web add /absolute/path/to/graph-memory-1.6.0-beta.12.tgz
 ```
 
 安装后，在 **设置 → 插件 → 插件列表 → graph-memory/dsh** 中确认状态为“已启用”。默认数据库路径：
@@ -262,6 +280,8 @@ messageRetention:
 
 ### DSH 原生工具
 
+默认 `assistantTools: none` 不增加任何模型工具 schema，自动召回不依赖工具调用。需要主动深搜时设置 `search` 暴露 `gm_search`；维护时可临时设置 `all` 暴露下表全部工具。
+
 | 工具 | 作用 |
 |---|---|
 | `gm_status` | 查看插件、数据库、抽取、召回、向量和保留策略状态 |
@@ -271,7 +291,14 @@ messageRetention:
 | `gm_maintain` | 执行一次有界图维护与已配置的消息保留批次 |
 | `gm_retry_extraction` | 将隔离的抽取失败消息重新入队，不删除或截断原始对话 |
 
-抽取队列默认按 8,000 个字符和 15 条消息限制单次临时投影。超长的单条消息会按语义边界分段抽取，SQLite 中的原始事件保持完整；连续失败的消息进入 `quarantined`，不会伪装成已抽取，也不会被消息保留策略删除。`gm_status` / `gm_stats` 会分别显示 pending、succeeded 和 quarantined 数量。参数统一位于 `extractionDrain`，默认值见 `cordis.patch.yml`。
+DSH 每个已完成轮次只产生一个抽取任务，输入严格为该轮的用户原始问题和最终可见回答。推理、工具调用和工具结果不会进入抽取模型，也不会按字符或消息数量拆分。适配器不设置默认输出 Token 上限、不自动重试；不完整或失败的结果进入 `quarantined`，由 `gm_retry_extraction` 显式恢复。
+
+抽取是独立的后台负载，可以使用专用 DSH 模型路由。设置
+`GRAPH_MEMORY_LLM_PROVIDER` 与 `GRAPH_MEMORY_LLM_MODEL` 后，该路由优先于前台
+Agent 模型。所选 DSH provider/model 明确声明支持时，可设置
+`GRAPH_MEMORY_LLM_REASONING_EFFORT=off`；需要显式响应上限时可设置
+`GRAPH_MEMORY_LLM_MAX_TOKENS`。不支持的 reasoning 控制会明确失败，不会静默改变
+provider 行为。
 
 自动召回不要求模型主动调用 `gm_search`；适配器会在 Prompt Assembly 阶段检索并注入相关记忆。
 
