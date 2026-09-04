@@ -49,7 +49,8 @@ Graph Memory combines context takeover with durable, source-backed recall. It is
 - `docs/images/brand/graph-memory-hosts-banner.png`
 - `docs/images/deepseek-harness-wordmark.svg`
 - `docs/images/brand/openclaw-wordmark.svg`
-- `docs/GRAPH_MEMORY_README_REPORT.html`
+- `README.md` and `README_CN.md`
+- `benchmarks/dsh-context-takeover/README.md`
 - V72 20-turn manifest and three cross-session recall probe results in the benchmark job directory.
 - Local automated verification: 20 test files, 123 passing tests, both TypeScript builds, npm dry-run package.
 

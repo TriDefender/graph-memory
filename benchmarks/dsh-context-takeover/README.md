@@ -1,5 +1,9 @@
 # DSH context-takeover benchmark
 
+<p align="center">
+  <img src="../../docs/images/dsh-context-takeover-chart.svg" alt="Native DSH and Graph Memory context growth across 20 turns" width="100%">
+</p>
+
 This public benchmark measures two different questions separately:
 
 1. **Context ownership:** how many tokens and messages reach the first main-model request of each turn?
@@ -28,6 +32,10 @@ Memory checks from the same candidate:
 - A fresh session recalled the final owner, port, rollback window, incident, batch, repair command, and revoked values without an explicit memory tool call.
 
 The complete, de-identified aggregates are in [`results/v72-summary.json`](results/v72-summary.json).
+
+<p align="center">
+  <img src="../../docs/images/dsh/vector-cross-session-recall.png" alt="Cross-session source-backed recall in a fresh DSH session" width="88%">
+</p>
 
 ## Files
 

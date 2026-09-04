@@ -32,13 +32,13 @@ colors:
   query-sky: "#92bbff"
 typography:
   display:
-    fontFamily: "GM Noto Serif SC, Noto Serif CJK SC, Songti SC, Georgia, serif"
+    fontFamily: "GitHub UI sans-serif"
     fontSize: "clamp(46px, 6.7vw, 92px)"
     fontWeight: 700
     lineHeight: 0.99
     letterSpacing: "-0.035em"
   headline:
-    fontFamily: "GM Noto Serif SC, Noto Serif CJK SC, Songti SC, Georgia, serif"
+    fontFamily: "GitHub UI sans-serif"
     fontSize: "clamp(34px, 4.8vw, 64px)"
     fontWeight: 700
     lineHeight: 1.06
@@ -200,7 +200,7 @@ The palette is a cool paper-and-ink neutral system with one authoritative DSH bl
 
 ## Typography
 
-**Display Font:** GM Noto Serif SC (with Noto Serif CJK SC, Songti SC, Georgia, serif fallbacks)
+**Display Font:** GitHub's native UI sans-serif
 **Body Font:** Source Han Sans SC (with Noto Sans CJK SC, Microsoft YaHei, sans-serif fallbacks)
 **Label/Mono Font:** IBM Plex Mono (with SFMono-Regular, Consolas, monospace fallbacks)
 
