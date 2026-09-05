@@ -514,6 +514,47 @@ describe("DSH completed-turn memory extraction", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("never blocks a committed turn/end on a stalled extraction stream", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gm-background-extraction-"));
+    const dbPath = join(dir, "graph-memory.db");
+    let markExtractionStarted!: () => void;
+    const extractionStarted = new Promise<void>((resolve) => {
+      markExtractionStarted = resolve;
+    });
+    const { context, listeners, cleanups } = adapterContext(async function* (options: any) {
+      markExtractionStarted();
+      await new Promise<void>((resolve) => {
+        options.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw options.signal.reason ?? new Error("extraction aborted");
+    });
+    apply(context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "rate-limited-provider",
+      llmModel: "rate-limited-model",
+    });
+
+    const session: any = { id: "stalled-extraction", events: [
+      { type: "turn/start", seq: 0, data: { turn: 1 } },
+      userMsg(1, "This turn must still close."),
+      { type: "assistant/message", seq: 2, data: { turn: 1, message: { content: [
+        { type: "text", text: "The foreground answer is complete." },
+      ] } } },
+      { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+    ] };
+
+    const returned = listeners.get("session/event")![0](session, session.events[3]);
+    expect(returned).toBeUndefined();
+    expect(session.events.at(-1)?.type).toBe("turn/end");
+    await extractionStarted;
+    expect(countState(dbPath, "pending")).toBe(2);
+
+    await Promise.all(cleanups.map(cleanup => cleanup()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it("prefers the configured extraction route over the foreground Agent route", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gm-extraction-route-"));
     const dbPath = join(dir, "graph-memory.db");
