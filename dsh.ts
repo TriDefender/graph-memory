@@ -501,6 +501,15 @@ export function apply(ctx: DshContext, input: Config = {}): void {
       await extractOnce(sessionId, sid, messages);
       markMessagesExtracted(db, ids);
     } catch (cause) {
+      // A one-shot/headless host may dispose immediately after turn/end. The
+      // plugin then aborts its own background stream so shutdown can finish.
+      // That is lifecycle backpressure, not malformed memory: leave the
+      // durable pair pending for the existing startup recovery path instead
+      // of turning every short-lived session into a permanent quarantine.
+      if (closing || abortingExtraction) {
+        ctx.logger.info(`[graph-memory] DSH extraction deferred at shutdown for turn=${rows[0].turn_index}`);
+        return;
+      }
       const error = cause instanceof Error ? cause : new Error(String(cause));
       recordExtractionFailure(db, ids, error.message, null);
       quarantineMessages(db, ids, error.message);
@@ -753,11 +762,10 @@ export function apply(ctx: DshContext, input: Config = {}): void {
         },
         content: [{ type: "text", text }],
       };
-      // Keep the recall snapshot inside this turn's question→answer span. The
-      // completed-turn projector will retire it together with tool traffic, so
-      // dynamic recall cannot accumulate across the five-turn hot window.
       // Historical memory is context for the live request, never a newer
       // instruction. Keep the direct user's message after the recall snapshot.
+      // The snapshot remains bounded by the same rolling window as its user
+      // turn; it is not part of the post-question tool-trace projection.
       const entered = insertDshRecallBeforeCurrentUser(
         Array.isArray(decision.messages) ? decision.messages : [],
         recalledMessage,
@@ -951,7 +959,8 @@ export function apply(ctx: DshContext, input: Config = {}): void {
     closing = true;
     abortingExtraction = true;
     // Shutdown never starts maintenance requests. Pending turns remain durable
-    // and can be retried explicitly with gm_retry_extraction.
+    // for startup recovery when a fixed extraction route exists, or an explicit
+    // gm_retry_extraction call when the route is inherited from a live Agent.
     for (const controller of activeExtractionControllers) {
       controller.abort(new Error("[graph-memory] extraction stopped with the DSH plugin"));
     }

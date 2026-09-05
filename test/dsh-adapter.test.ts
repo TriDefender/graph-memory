@@ -514,7 +514,7 @@ describe("DSH completed-turn memory extraction", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("never blocks a committed turn/end on a stalled extraction stream", async () => {
+  it("never blocks turn/end and recovers a shutdown-deferred extraction on startup", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gm-background-extraction-"));
     const dbPath = join(dir, "graph-memory.db");
     let markExtractionStarted!: () => void;
@@ -552,6 +552,26 @@ describe("DSH completed-turn memory extraction", () => {
     expect(countState(dbPath, "pending")).toBe(2);
 
     await Promise.all(cleanups.map(cleanup => cleanup()));
+    expect(countState(dbPath, "pending")).toBe(2);
+    expect(countState(dbPath, "quarantined")).toBe(0);
+
+    const recoveredRequests: any[] = [];
+    const recovered = adapterContext(async function* (options: any) {
+      recoveredRequests.push(options);
+      yield structuredExtraction(EMPTY_EXTRACTION);
+      yield { type: "finish", reason: { kind: "tool-calls" } };
+    });
+    apply(recovered.context, {
+      dbPath,
+      extractionEnabled: true,
+      recallEnabled: false,
+      llmProvider: "recovery-provider",
+      llmModel: "recovery-model",
+    });
+    await waitFor(() => countState(dbPath, "succeeded") === 2);
+    expect(recoveredRequests).toHaveLength(1);
+    expect(recoveredRequests[0].messages[0].content[0].text).toContain("This turn must still close.");
+    await Promise.all(recovered.cleanups.map(cleanup => cleanup()));
     rmSync(dir, { recursive: true, force: true });
   });
 
