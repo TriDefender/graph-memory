@@ -24,9 +24,10 @@ export function isDshUserTurn(event) {
     return event?.type === "user/message" && event.data?.source?.kind === "user";
 }
 /**
- * Select the oldest complete surface prefix while retaining the newest N user
- * turns verbatim. Plugin-owned user messages (prompt snapshots, skill catalogs,
- * compaction checkpoints) do not count as user turns.
+ * Select the oldest complete surface prefix while retaining the newest N real
+ * user turns. Their question/final-answer endpoints remain native; completed
+ * intermediate traces may already have been projected separately. Plugin-owned
+ * snapshots, skill catalogs and compaction checkpoints do not count as turns.
  */
 export function selectDshRollingCompactionRange(session, freshTurnCount, currentUserAlreadyOnSurface = false) {
     if (!Number.isInteger(freshTurnCount) || freshTurnCount < 1) {

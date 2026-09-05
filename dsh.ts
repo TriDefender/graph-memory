@@ -81,7 +81,7 @@ export interface Config {
   maintenanceInterval?: number;
   /** Durable raw-message retention. Defaults to keep=all (no deletion). */
   messageRetention?: MessageRetentionConfig;
-  /** Keep this many newest real user turns verbatim on the DSH model surface. */
+  /** Keep this many newest real user turns as native question/final-answer endpoints on the DSH model surface. */
   freshTurnCount?: number;
   /** Let Graph Memory replace older model-surface history without an LLM call. */
   contextCompactionEnabled?: boolean;

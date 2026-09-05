@@ -119,7 +119,7 @@ export interface GmConfig {
   recallMaxNodes: number;
   /** Optional provider-calibrated cosine floor. Unset means ranked top-k only. */
   semanticScoreThreshold?: number;
-  /** Number of recent user turns kept verbatim on the host context surface. */
+  /** Number of recent user turns kept as native question/final-answer endpoints on the host context surface. */
   freshTurnCount: number;
   embedding?: EmbeddingConfig;
   llm?: {
