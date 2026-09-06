@@ -76,7 +76,9 @@ export async function initSchema(driver: Driver, embedding?: EmbeddingConfig): P
       : 1024;
 
     // The search code queries one index across all knowledge labels.
-    await session.run("MATCH (n:Task|Skill|Event) SET n:MemoryNode");
+    // 补标守卫：仅给缺失 MemoryNode 标签的节点补标 —— 常规启动退化为纯读扫描，
+    // 避免每次启动对全库做无谓写（属性/标签写会触发事务与日志）；首启/迁移兜底语义不变。
+    await session.run("MATCH (n:Task|Skill|Event) WHERE NOT n:MemoryNode SET n:MemoryNode");
 
     // 存量 deprecated 节点补写 deprecatedAt（幂等，等效一次性迁移）：purge 时钟基准是
     // deprecatedAt、缺失时回退 updatedAt——但 upsertNode 对 manual/merge 弃用节点只 bump

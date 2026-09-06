@@ -1224,7 +1224,6 @@ export async function getUnextracted(driver: Driver, sid: string, limit: number)
       return {
         role: m.role,
         content: JSON.parse(m.content),
-        turnIndex: toInt(m.turnIndex),
         turn_index: toInt(m.turnIndex),
       };
     });

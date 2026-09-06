@@ -8,7 +8,7 @@
 import type { ExtractionResult, FinalizeResult } from "../types.ts";
 import { EDGE_TYPES, isValidEdgeDirection } from "../types.ts";
 import type { GmNode } from "../types.ts";
-import type { CompleteFn } from "../engine/llm.ts";
+import { stripThinkTags, type CompleteFn } from "../engine/llm.ts";
 import { normalizeName } from "../store/store.ts";
 
 // ─── 节点/边合法值 ──────────────────────────────────────────────
@@ -315,9 +315,8 @@ export class Extractor {
 
 function extractJson(raw: string): string {
   let s = raw.trim();
-  // 清理 <think>...</think> 思维链标签（兼容 MiniMax 等模型）
-  s = s.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  s = s.replace(/<think>[\s\S]*/gi, "");  // 未闭合的 <think>
+  // 清理 <think>...</think> 思维链标签（兼容 MiniMax 等模型）——单一来源 stripThinkTags
+  s = stripThinkTags(s);
   s = s.replace(/^```(?:json)?\s*\n?/i, "").replace(/\n?\s*```\s*$/i, "");
   s = s.trim();
   if (s.startsWith("{") && s.endsWith("}")) return s;

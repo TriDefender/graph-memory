@@ -42,7 +42,6 @@ vi.mock("../src/engine/llm.ts", async (importActual) => {
 });
 
 vi.mock("../src/engine/embed.ts", () => ({
-  createEmbedFn: async () => null,
     createEmbedder: async () => null,
 }));
 

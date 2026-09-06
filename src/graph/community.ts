@@ -18,6 +18,7 @@ import {
   pruneCommunitySummaries,
 } from "../store/store.ts";
 import { getExistingActiveRelTypes, projectActiveGraph } from "./projection.ts";
+import { stripThinkTags } from "../engine/llm.ts";
 
 export interface CommunityResult {
   labels: Map<string, string>;
@@ -251,9 +252,7 @@ export async function summarizeCommunities(
         `社区成员：\n${memberText}`,
       );
 
-      const cleaned = summary.trim()
-        .replace(/<think>[\s\S]*?<\/think>/gi, "")
-        .replace(/<think>[\s\S]*/gi, "")
+      const cleaned = stripThinkTags(summary.trim())
         .replace(/^["'「」]|["'「」]$/g, "")
         .replace(/\n/g, " ")
         .replace(/\s{2,}/g, " ")

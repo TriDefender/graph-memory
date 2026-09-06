@@ -64,6 +64,16 @@ interface LlmConfig {
 
 export type CompleteFn = (system: string, user: string) => Promise<string>;
 
+/**
+ * 剥离推理模型输出的 <think>...</think> 思维链标签（兼容 MiniMax 等），
+ * 含未闭合 <think> 兜底。LLM 输出清洗的单一来源——extractor 与社区摘要共用。
+ */
+export function stripThinkTags(raw: string): string {
+  return raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<think>[\s\S]*/gi, "");
+}
+
 const DEFAULT_LLM_TIMEOUT_MS = 60_000;
 const DEFAULT_LLM_MAX_TOKENS = 4_000;
 const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";

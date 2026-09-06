@@ -14,9 +14,6 @@
  * Neo4j driver / schema / embedder 的初始化，并在 finally 中 closeDriver。
  */
 
-import readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
-
 import type { Driver } from "neo4j-driver";
 import type { GmConfig } from "./types.ts";
 import { getDriver, initSchema, closeDriver } from "./store/db.ts";
@@ -33,6 +30,7 @@ import {
 import { createEmbedder, type Embedder } from "./engine/embed.ts";
 import { buildNodeEmbeddingText } from "./recaller/recall.ts";
 import { isAffirmative } from "./cli-extract.ts";
+import { defaultLog, makeDefaultPrompt } from "./cli-io.ts";
 
 export const DEFAULT_REEMBED_BATCH = 32;
 const MAX_REEMBED_BATCH = 256;
@@ -106,22 +104,6 @@ export function planReembed(params: {
 function clampBatch(batch: number | undefined): number {
   if (!batch || !Number.isFinite(batch) || batch < 1) return DEFAULT_REEMBED_BATCH;
   return Math.min(Math.floor(batch), MAX_REEMBED_BATCH);
-}
-
-function defaultLog(msg: string): void {
-  console.log(msg);
-}
-
-async function defaultPrompt(question: string): Promise<string> {
-  if (!process.stdin.isTTY && process.env.GRAPH_MEMORY_REEMBED_CONFIRM === undefined) {
-    return "";
-  }
-  const rl = readline.createInterface({ input, output });
-  try {
-    return await rl.question(question);
-  } finally {
-    rl.close();
-  }
 }
 
 /** 单批嵌入：优先批量调用，失败退化为逐条请求（兼容批量响应结构未知的 provider） */
@@ -231,7 +213,7 @@ export async function runReembed(params: ReembedParams): Promise<ReembedResult> 
     }
 
     if (!opts.yes) {
-      const prompt = params.prompt ?? ((q: string) => defaultPrompt(q));
+      const prompt = params.prompt ?? makeDefaultPrompt("GRAPH_MEMORY_REEMBED_CONFIRM");
       const answer = await prompt(
         `\n将清除现有节点/社区向量并用当前模型重建（每批 ${batch} 条），继续？[y/N] `,
       );

@@ -29,7 +29,7 @@ import { assembleContext } from "./src/format/assemble.ts";
 import { sanitizeToolUseResultPairing } from "./src/format/transcript-repair.ts";
 import { runMaintenance } from "./src/graph/maintenance.ts";
 import { normalizeMessageRetentionPolicy } from "./src/store/retention.ts";
-import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, EDGE_TYPES, type GmConfig, type RecallResult, type EdgeType } from "./src/types.ts";
+import { DEFAULT_CONFIG, DEFAULT_CRON_CONFIG, isCronSessionKey, EDGE_TYPES, type GmConfig, type RecallResult, type EdgeType, type ExtractionResult } from "./src/types.ts";
 import { registerCrudRoutes } from "./src/routes/crud.ts";
 import { createGraphMemoryCli } from "./src/cli.ts";
 
@@ -90,15 +90,28 @@ export function readDefaultModel(apiConfig: unknown): string {
   return raw;
 }
 
-function throwNodeNotFound(name: string): never {
-  throw new Error(
+/** 节点未找到报错文案的单源（throwNodeNotFound / gm_update notFoundHint 共用）。 */
+function nodeNotFoundMessage(
+  name: string,
+  tail: string = "或使用 gm_search 搜索已有节点。",
+): string {
+  return (
     `[graph-memory-pro] 未找到名称为 "${name}" 的节点。` +
     `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
-    `或使用 gm_search 搜索已有节点。`,
+    tail
   );
 }
 
+function throwNodeNotFound(name: string, tail?: string): never {
+  throw new Error(nodeNotFoundMessage(name, tail));
+}
+
 // ─── 清洗 OpenClaw metadata 包装 ─────────────────────────────
+
+/** 剥离 OpenClaw 注入的命令前缀与时间戳标记（cleanPrompt / extractUserText 共用，逐字等价）。 */
+function stripCommandAndTimestampPrefix(s: string): string {
+  return s.replace(/^\/\w+\s+/, "").trim().replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
+}
 
 export function cleanPrompt(raw: string): string {
   let prompt = raw.trim();
@@ -113,9 +126,7 @@ export function cleanPrompt(raw: string): string {
       prompt = lines.join("\n").trim();
     }
   }
-  prompt = prompt.replace(/^\/\w+\s+/, "").trim();
-  prompt = prompt.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
-  return prompt;
+  return stripCommandAndTimestampPrefix(prompt);
 }
 
 // ─── 规范化消息 content，防 OpenClaw content.filter() 崩溃 ────
@@ -195,9 +206,7 @@ export function extractUserText(msg: any): string {
   if (fenceEnd >= 0 && raw.includes("Sender")) {
     raw = raw.slice(fenceEnd + 3).trim();
   }
-  raw = raw.replace(/^\/\w+\s+/, "").trim();
-  raw = raw.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
-  return raw;
+  return stripCommandAndTimestampPrefix(raw);
 }
 
 /**
@@ -1258,24 +1267,25 @@ const graphMemoryProPlugin = {
 
             const fin = await extractor.finalize({ sessionNodes: nodes, graphSummary: summary });
 
-            for (const nc of fin.promotedSkills) {
-              if (nc.name && nc.content) {
-                await upsertNode(driver, {
-                  type: "SKILL", name: nc.name,
-                  description: nc.description ?? "", content: nc.content,
-                }, sid);
-              }
-            }
-            for (const ec of fin.newEdges) {
-              const fromNode = await findByName(driver, ec.from);
-              const toNode = await findByName(driver, ec.to);
-              if (fromNode && toNode) {
-                await upsertEdge(driver, {
-                  fromId: fromNode.id, toId: toNode.id, type: ec.type,
-                  instruction: ec.instruction, sessionId: sid,
-                });
-              }
-            }
+            // promotedSkills + newEdges 收敛进 persistExtractionResult（单一来源）：
+            // 旧内联循环是全库唯一不做向量同步的节点写路径 —— 晋升 SKILL 无 embedding，
+            // 精确召回不可见且无自动补向量机制；边端点解析也未复用 nameToId 零往返模式。
+            // 收敛后 upsert → syncEmbedBatch → 建边与 per-turn/compact/CLI 路径完全同源。
+            // persistExtractionResult 不做 markExtracted（finalize 无消息语义），无需补。
+            const finResult: ExtractionResult = {
+              nodes: fin.promotedSkills
+                // parseFinalize 已过滤 name/content，这里保留双保险（与原内联循环一致）
+                .filter((nc) => nc.name && nc.content)
+                .map((nc) => ({
+                  type: "SKILL",
+                  name: nc.name,
+                  description: nc.description ?? "",
+                  content: nc.content,
+                })),
+              edges: fin.newEdges,
+            };
+            await persistExtractionResult(driver, recaller, finResult, { sessionId: sid });
+
             for (const id of fin.invalidations) await deprecateNodeAndDisconnectById(driver, id);
           });
         } else if (nodes.length) {
@@ -1440,10 +1450,10 @@ const graphMemoryProPlugin = {
           },
         ) {
           const mode = p.mode ?? "update";
-          const notFoundHint =
-            `[graph-memory-pro] 未找到名称为 "${p.name}" 的节点。` +
-            `请检查节点名称是否精确（名称标准化规则：全小写、空格/下划线转连字符、移除非字母数字字符），` +
-            `或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。`;
+          const notFoundHint = nodeNotFoundMessage(
+            p.name,
+            "或使用 gm_record 创建新节点，也可用 gm_search 搜索已有节点。",
+          );
 
           // mode=delete 已移除（断联弃用等效删除）——为旧调用方保留明确报错而非静默降级为 update
           if ((mode as string) === "delete") {

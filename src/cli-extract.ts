@@ -9,9 +9,6 @@
  * 完成 Neo4j driver / schema / LLM / embedder / Extractor / Recaller 的初始化。
  */
 
-import readline from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
-
 import type { Driver } from "neo4j-driver";
 import type { GmConfig } from "./types.ts";
 import { getDriver, initSchema, closeDriver } from "./store/db.ts";
@@ -27,6 +24,7 @@ import { createEmbedder } from "./engine/embed.ts";
 import { Recaller } from "./recaller/recall.ts";
 import { Extractor } from "./extractor/extract.ts";
 import { persistExtractionResult } from "./extractor/persist.ts";
+import { defaultLog, makeDefaultPrompt } from "./cli-io.ts";
 
 const AFFIRMATIVE = new Set(["y", "yes", "yeah", "yep", "ok", "okay", "true", "1", "confirm"]);
 
@@ -60,10 +58,6 @@ export interface BackfillExtractResult {
 }
 
 const DEFAULT_BATCH_LIMIT_MULTIPLIER = 3;
-
-function defaultLog(msg: string): void {
-  console.log(msg);
-}
 
 function formatSessionLine(info: UnextractedSessionInfo, index: number): string {
   const created = info.minCreatedAt > 0
@@ -163,7 +157,7 @@ export async function runBackfillExtraction(
     }
 
     if (!opts.yes) {
-      const prompt = params.prompt ?? ((q: string) => defaultPrompt(q));
+      const prompt = params.prompt ?? makeDefaultPrompt("GRAPH_MEMORY_EXTRACT_CONFIRM");
       const answer = await prompt(`\n将对以上 ${sessions.length} 个会话发起 LLM 提取，继续？[y/N] `);
       if (!isAffirmative(answer)) {
         log("[graph-memory-pro] 已取消。");
@@ -259,17 +253,4 @@ async function extractSessionLoop(
   }
 
   return stats;
-}
-
-async function defaultPrompt(question: string): Promise<string> {
-  if (!process.stdin.isTTY && process.env.GRAPH_MEMORY_EXTRACT_CONFIRM === undefined) {
-    return "";
-  }
-  const rl = readline.createInterface({ input, output });
-  try {
-    const answer = await rl.question(question);
-    return answer;
-  } finally {
-    rl.close();
-  }
 }

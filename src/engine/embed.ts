@@ -180,9 +180,3 @@ export async function createEmbedder(cfg: EmbeddingConfig | undefined): Promise<
     return null;
   }
 }
-
-/** 兼容包装：只需单发 embed 的调用方（index.ts / cli-extract.ts） */
-export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<EmbedFn | null> {
-  const embedder = await createEmbedder(cfg);
-  return embedder?.embed ?? null;
-}
